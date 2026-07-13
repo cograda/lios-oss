@@ -314,6 +314,21 @@ Comar is built for a specific household but the architecture is generic:
 4. **Location-specific**: weather coordinates (`HOME_WEATHER_LATITUDE`/`HOME_WEATHER_LONGITUDE`) and rail station (`HOME_RAIL_STATION_CODE`/`HOME_RAIL_STATION_NAME`) are set via `.env`, with sensible defaults baked in
 5. **Calendar filtering**: `calendar_visibility` in `config.py` per Google account — `"full"`, `"busy"`, or `"hidden"`
 
+## Legal
+
+This is a self-hosted personal project, shared as-is under the MIT license (see below) with no warranty. It hasn't been audited for multi-tenant or production use — the auth model assumes a single trusted household running it on their own network, not a public-facing service.
+
+A few things worth knowing before you deploy it:
+
+- **Third-party trademarks**: comar integrates with Google Calendar, Gmail, Apple Reminders/Health, Home Assistant, Last.fm, Irish Rail, WhatsApp, and Anthropic's Claude. These names are used only to describe what the integrations connect to — comar isn't affiliated with, endorsed by, or sponsored by any of these companies.
+- **WhatsApp bridge**: the `whatsapp-bridge` service uses [Baileys](https://github.com/WhiskeySockets/Baileys), an unofficial, reverse-engineered client for the WhatsApp Web protocol. WhatsApp's Terms of Service prohibit unofficial/automated clients, and using this bridge carries a real risk of account restriction or ban. That's a risk you take on by running it, not something comar can mitigate.
+- **Financial and personal data**: the finance integration parses your own bank CSV exports (AIB, Revolut formats out of the box) and stores transactions in your own database. Nothing is sent anywhere except the APIs you explicitly configure. You're responsible for securing your deployment (tokens, network exposure, backups) — see the security notes throughout `server/CLAUDE.md` and keep `HOME_UI_TOKEN`/`HOME_OAUTH_ENCRYPTION_KEY` set.
+- **Dependencies**: everything in the dependency tree is MIT/BSD/Apache-2.0/ISC licensed and compatible with distributing this project under MIT, with one LGPL-3.0 dependency (`psycopg2-binary`) used in the standard "consumed via its API" way that doesn't create any relicensing obligation.
+
+## Contributing
+
+Issues and PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for what to expect and how to submit one.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). `server/coglib/` is vendored from a separate private repo but is the same author's original code and covered by this repository's license.

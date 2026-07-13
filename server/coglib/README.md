@@ -2,6 +2,8 @@
 
 Shared Python package for COG's projects. Provides base config (Pydantic), database (SQLAlchemy), logging, and utilities.
 
+Part of [comar-oss](https://github.com/cograda/comar-oss), MIT licensed — see the repository root [LICENSE](../../LICENSE).
+
 ## Install
 
 ```bash
