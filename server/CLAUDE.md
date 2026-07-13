@@ -375,7 +375,7 @@ make db-current       # Show current migration revision
 
 **CI deploy** (`make deploy-pull` — the default; root `make deploy` delegates here):
 1. Push to `main` triggers GitHub Actions (`.github/workflows/deploy.yml`)
-2. CI builds frontend, builds Docker images, pushes to `ghcr.io/cograda/comar-app` and `ghcr.io/cograda/comar-whatsapp`
+2. CI builds frontend, builds Docker images, pushes to `ghcr.io/cograda/comar-oss-app` and `ghcr.io/cograda/comar-oss-whatsapp`
 3. `make deploy-pull` → SSH into server, `docker compose pull && docker compose up -d`
 
 **Dev rsync deploy** (`make deploy-build`, or `deploy-fast` for backend-only) — use only to test uncommitted changes on the box without going through CI:

@@ -3,7 +3,7 @@ services:
   # comar-app connects to home-services-db via the homelab_default network.
 
   app:
-    image: ghcr.io/cograda/comar-app:latest
+    image: ghcr.io/cograda/comar-oss-app:latest
     build: .
     container_name: comar-app
     env_file: .env
@@ -32,7 +32,7 @@ services:
     restart: unless-stopped
 
   whatsapp-bridge:
-    image: ghcr.io/cograda/comar-whatsapp:latest
+    image: ghcr.io/cograda/comar-oss-whatsapp:latest
     build: ./whatsapp-bridge
     container_name: comar-whatsapp
     environment:

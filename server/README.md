@@ -281,7 +281,7 @@ make server-init      # First-time: create dir on server, copy .env template
 **CI deploy** (`make deploy-pull`):
 1. Push to `main` triggers GitHub Actions
 2. CI builds frontend, client wheel, and Docker images
-3. Pushes to GHCR (`ghcr.io/cograda/comar-app`, `ghcr.io/cograda/comar-whatsapp`)
+3. Pushes to GHCR (`ghcr.io/cograda/comar-oss-app`, `ghcr.io/cograda/comar-oss-whatsapp`)
 4. Run `make deploy-pull` on the server to pull and restart
 
 ### Reverse proxy

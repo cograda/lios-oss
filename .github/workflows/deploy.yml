@@ -7,8 +7,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  APP_IMAGE: ghcr.io/cograda/comar-app
-  WA_IMAGE: ghcr.io/cograda/comar-whatsapp
+  APP_IMAGE: ghcr.io/cograda/comar-oss-app
+  WA_IMAGE: ghcr.io/cograda/comar-oss-whatsapp
 
 jobs:
   build-app:
