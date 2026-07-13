@@ -1,0 +1,18 @@
+{
+  "counts_by_new_state": {
+    "home": 1
+  },
+  "days": 7,
+  "entity_id": "person.alex",
+  "stale": false,
+  "synced_at": "2026-01-15T09:58:00+00:00",
+  "transition_count": 1,
+  "transitions": [
+    {
+      "changed_at": "2026-01-15T09:00:00+00:00",
+      "entity_id": "person.alex",
+      "new_state": "home",
+      "old_state": "not_home"
+    }
+  ]
+}

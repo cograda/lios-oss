@@ -1,0 +1,218 @@
+"""Shared helpers for MCP tool handlers.
+
+These are the blessed implementations that replace mechanical, copy-pasted
+duplication across `app/integrations/*/tools.py`: per-user query scoping,
+row-to-dict serialization, semantic-search enrich callbacks, and stats
+primitives (count-by-period, top-N group-by).
+
+Bespoke logic — joins across models, live external-API calls, admin
+operations, anything with real domain shape — stays hand-written in each
+integration's tools.py. These helpers only exist to delete the mechanical
+1:1 boilerplate; they are deliberately not a framework.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Iterable
+
+from sqlalchemy import func as sa_func
+from sqlalchemy.orm import Query, Session
+
+from app.auth.context import current_user_id
+
+
+# ---------------------------------------------------------------------------
+# Scoping
+# ---------------------------------------------------------------------------
+
+
+def scoped_query(session: Session, model: type) -> Query:
+    """THE blessed query entry point for per-user-owned models.
+
+    Starts `session.query(model)` and, if `model` carries a `user_id` column
+    (i.e. it uses `UserOwnedMixin`), filters to the requesting user via
+    `current_user_id()`. Household-shared models (no `user_id` column) come
+    back unscoped.
+
+    `app/tools/list_tool.py` and `app/tools/search_tool.py` route their
+    auto-scoping through this same function, so there is exactly one
+    scoping implementation across the DSL and hand-written handlers.
+    """
+    query = session.query(model)
+    if hasattr(model, "user_id"):
+        query = query.filter(model.user_id == current_user_id())
+    return query
+
+
+# ---------------------------------------------------------------------------
+# Serialization
+# ---------------------------------------------------------------------------
+
+
+def iso_or_none(value: Any) -> str | None:
+    """Common transform for `serialize()`: datetime/date -> ISO string, else None."""
+    return value.isoformat() if value else None
+
+
+def serialize(
+    row: Any,
+    fields: Iterable[str],
+    renames: dict[str, str] | None = None,
+    transforms: dict[str, Callable[[Any], Any]] | None = None,
+) -> dict[str, Any]:
+    """Mechanical row -> dict serialization, replacing the `_x_to_dict` families.
+
+    `fields` are attribute names read off `row` in order. `renames` maps an
+    attribute name to a different output key (default: same name).
+    `transforms` maps an attribute name to a callable applied to the raw
+    value before output (e.g. `iso_or_none` for timestamp columns).
+
+    Bespoke serializers — computed fields, cross-model joins, live-API
+    response shapes — stay hand-written; this only replaces the 1:1
+    mechanical mapping.
+    """
+    renames = renames or {}
+    transforms = transforms or {}
+    out: dict[str, Any] = {}
+    for field in fields:
+        value = getattr(row, field)
+        if field in transforms:
+            value = transforms[field](value)
+        out[renames.get(field, field)] = value
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Semantic-search enrich factory
+# ---------------------------------------------------------------------------
+
+
+def make_enrich(
+    *,
+    model: type | None = None,
+    id_column: str | None = None,
+    fields: Iterable[str] = (),
+    renames: dict[str, str] | None = None,
+    transforms: dict[str, Callable[[Any], Any]] | None = None,
+    id_key: str = "id",
+    metadata_fields: Iterable[str] = (),
+    preview_len: int = 300,
+    preview_key: str = "preview",
+) -> Callable[[Session, list[dict]], list[dict]]:
+    """Factory for `SemanticSearchTool` `enrich` callbacks.
+
+    Every hand-written enrich callback did the same two things, in some
+    combination: (a) batch-fetch DB rows matching the raw hits' `source_id`
+    and copy a handful of fields across (google_mail's `_semantic_enrich`),
+    and/or (b) pull fields out of the JSON `metadata` blob stashed on the
+    embedding row at enqueue time, with no DB round-trip at all (whatsapp's
+    `_semantic_enrich`). This factory covers both, composably:
+
+    - Pass `model` + `id_column` to batch-fetch and `serialize()` `fields`
+      (optionally `renames`/`transforms`) from matching rows.
+    - Pass `metadata_fields` to copy keys straight out of each hit's
+      `metadata` JSON with no query at all.
+    - `id_key` names the output key that carries the raw `source_id`
+      (google_mail uses "id", whatsapp uses "segment_id").
+
+    Every result always carries `score`, `id_key`, and a `preview_key`
+    truncated to `preview_len` characters of the raw hit's preview text.
+    """
+    renames = renames or {}
+    transforms = transforms or {}
+
+    def enrich(session: Session, raw_results: list[dict]) -> list[dict]:
+        model_rows: dict[Any, Any] = {}
+        if model is not None and id_column is not None:
+            ids = [r["source_id"] for r in raw_results]
+            rows = (
+                scoped_query(session, model)
+                .filter(getattr(model, id_column).in_(ids))
+                .all()
+            )
+            model_rows = {getattr(row, id_column): row for row in rows}
+
+        out: list[dict[str, Any]] = []
+        for r in raw_results:
+            item: dict[str, Any] = {"score": r["score"], id_key: r["source_id"]}
+
+            if model is not None:
+                row = model_rows.get(r["source_id"])
+                if row is not None:
+                    item.update(serialize(row, fields, renames=renames, transforms=transforms))
+                else:
+                    item.update({renames.get(f, f): None for f in fields})
+
+            if metadata_fields:
+                meta = json.loads(r["metadata"]) if r.get("metadata") else {}
+                for f in metadata_fields:
+                    item[f] = meta.get(f)
+
+            item[preview_key] = r["preview"][:preview_len]
+            out.append(item)
+
+        return out
+
+    return enrich
+
+
+# ---------------------------------------------------------------------------
+# Stats primitives
+# ---------------------------------------------------------------------------
+
+_CALENDAR_PERIODS = {"this_week", "this_month", "this_year"}
+_ROLLING_PERIODS = {
+    "7day": 7,
+    "1month": 30,
+    "3month": 90,
+    "6month": 180,
+    "12month": 365,
+}
+
+
+def period_since(period: str, now: datetime | None = None) -> datetime | None:
+    """Resolve a period keyword to a start datetime, or None for all-time.
+
+    Supports calendar-aligned periods (`this_week`, `this_month`,
+    `this_year`) and Last.fm-style rolling windows (`7day`, `1month`,
+    `3month`, `6month`, `12month`). `all_time`/`overall` (or anything
+    unrecognised) resolve to None, meaning "no lower bound".
+    """
+    now = now or datetime.now(timezone.utc)
+
+    if period == "this_week":
+        start = now - timedelta(days=now.weekday())
+        return start.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "this_month":
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if period == "this_year":
+        return now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    if period in _ROLLING_PERIODS:
+        return now - timedelta(days=_ROLLING_PERIODS[period])
+    return None
+
+
+def top_n_group_by(
+    query: Query,
+    group_col: Any,
+    limit: int,
+    count_col: Any | None = None,
+    label: str = "n",
+) -> list[tuple]:
+    """Group `query` by `group_col`, count rows, order desc, limit N.
+
+    Replaces the copy-pasted `.with_entities(col, func.count(...)).group_by(col)
+    .order_by(func.count(...).desc()).limit(n).all()` shape used by lastfm's
+    top artists/tracks, coffee's origin/process/roaster/method breakdowns,
+    etc. Returns raw `(value, count)` row tuples — callers format them.
+    """
+    count_expr = sa_func.count(count_col if count_col is not None else group_col)
+    return (
+        query.with_entities(group_col, count_expr.label(label))
+        .group_by(group_col)
+        .order_by(count_expr.desc())
+        .limit(limit)
+        .all()
+    )

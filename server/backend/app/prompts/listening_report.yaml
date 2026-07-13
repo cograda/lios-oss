@@ -1,0 +1,52 @@
+name: listening_report
+title: "Listening Report"
+description: "Analyse recent Last.fm listening with genre breakdown and patterns"
+arguments:
+  - name: period
+    description: "Time period to analyse (e.g. 'this week', 'this month', 'last week', 'all time'). Defaults to 'this week'."
+    required: false
+messages:
+  - role: user
+    content: |
+      Analyse my recent listening using Last.fm data.
+
+      Period: {{ period }}
+
+      If no period specified, default to "this week".
+
+      ## Step 1 — Fetch data
+
+      Call these MCP tools:
+
+      1. `lastfm_stats` — pass the period parameter. Valid values: today, this_week, this_month, this_year, last_week, last_month, all_time. Returns total scrobbles, top artists, top tracks, top genres.
+      2. `lastfm_recent` — get the last 50 scrobbles for session/pattern analysis.
+      3. If the user asks about a specific artist or track, also call `lastfm_search` to search for it.
+
+      ## Period mapping
+
+      | User says | MCP period parameter |
+      |-----------|---------------------|
+      | today | today |
+      | this week / the week | this_week |
+      | this month | this_month |
+      | this year | this_year |
+      | last week | last_week |
+      | last month | last_month |
+      | all time | all_time |
+
+      If the user says something like "march" or a specific month, use the closest matching period parameter or date-bounded query.
+
+      ## Step 2 — Analyse
+
+      Using the raw data from the MCP tools, analyse and produce a structured summary covering:
+
+      - **Overview**: total scrobbles, estimated listening hours (avg 3.5 min/track)
+      - **Top artists**: with genres where available, highlighting heavy rotation vs. one-offs
+      - **Genre breakdown**: what the overall listening mood/theme was
+      - **Discoveries**: any artists with low play counts that look new
+      - **Patterns**: time of day from timestamps, any notable sessions or binges (gaps > 30 min between scrobbles = new session)
+      - **Vibe summary**: 1-2 sentence characterisation of the listening period
+
+      ## Step 3 — Present results
+
+      Present the analysis conversationally. Keep it interesting — highlight what stands out rather than just listing numbers.

@@ -1,0 +1,20 @@
+[
+  {
+    "album": "In Rainbows",
+    "album_art_url": "https://example.com/inrainbows.jpg",
+    "artist": "Radiohead",
+    "loved": true,
+    "mbid": null,
+    "played_at": "2026-01-15T10:00:00+00:00",
+    "track": "Weird Fishes"
+  },
+  {
+    "album": "The Bends",
+    "album_art_url": null,
+    "artist": "Radiohead",
+    "loved": false,
+    "mbid": null,
+    "played_at": "2026-01-15T09:00:00+00:00",
+    "track": "Fake Plastic Trees"
+  }
+]

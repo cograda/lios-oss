@@ -1,0 +1,11 @@
+{
+  "by_folder": {
+    "Daily Notes": 1,
+    "Household": 1
+  },
+  "last_indexed": "2026-01-15T10:00:00+00:00",
+  "model": "BAAI/bge-small-en-v1.5",
+  "queue_pending": 0,
+  "total_embedded": 0,
+  "total_files": 2
+}

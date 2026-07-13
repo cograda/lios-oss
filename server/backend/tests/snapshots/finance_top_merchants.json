@@ -1,0 +1,26 @@
+{
+  "merchants": [
+    {
+      "avg_amount": 45.3,
+      "category": "Groceries",
+      "count": 1,
+      "merchant": "tesco stores",
+      "total_spend": 45.3
+    },
+    {
+      "avg_amount": 12.99,
+      "category": "Uncategorized",
+      "count": 1,
+      "merchant": "random shop xyz",
+      "total_spend": 12.99
+    },
+    {
+      "avg_amount": 11.99,
+      "category": "Uncategorized",
+      "count": 1,
+      "merchant": "spotify",
+      "total_spend": 11.99
+    }
+  ],
+  "period": "2026-01"
+}

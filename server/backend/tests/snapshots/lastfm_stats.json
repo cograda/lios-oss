@@ -1,0 +1,33 @@
+{
+  "period": "all_time",
+  "top_artists": [
+    {
+      "artist": "Radiohead",
+      "play_count": 2,
+      "tags": [
+        "alternative rock"
+      ]
+    }
+  ],
+  "top_genres": [
+    {
+      "genre": "alternative rock",
+      "play_count": 2
+    }
+  ],
+  "top_tracks": [
+    {
+      "artist": "Radiohead",
+      "play_count": 1,
+      "track": "Fake Plastic Trees"
+    },
+    {
+      "artist": "Radiohead",
+      "play_count": 1,
+      "track": "Weird Fishes"
+    }
+  ],
+  "total_scrobbles": 2,
+  "unique_artists": 1,
+  "unique_tracks": 2
+}

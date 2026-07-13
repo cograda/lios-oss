@@ -1,0 +1,32 @@
+{
+  "count": 2,
+  "query": "pdf",
+  "results": [
+    {
+      "chat": "Snags",
+      "date": "2026-01-15T10:00:00+00:00",
+      "filename": "BoQ.pdf",
+      "historical_doc_id": null,
+      "id": 1,
+      "mime_type": "application/pdf",
+      "sender": "WindowCo",
+      "size": "200 KB",
+      "skip_reason": null,
+      "source": "whatsapp",
+      "status": "pending"
+    },
+    {
+      "chat": "Family",
+      "date": "2026-01-14T10:00:00+00:00",
+      "filename": "invoice.pdf",
+      "historical_doc_id": null,
+      "id": 2,
+      "mime_type": "application/pdf",
+      "sender": "Sam",
+      "size": "50 KB",
+      "skip_reason": null,
+      "source": "whatsapp",
+      "status": "ingested"
+    }
+  ]
+}

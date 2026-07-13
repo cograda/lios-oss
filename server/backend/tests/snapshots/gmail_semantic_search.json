@@ -1,0 +1,12 @@
+[
+  {
+    "date": "2026-01-15T10:00:00+00:00",
+    "from": "Servicer <service@example.com>",
+    "id": "gm1",
+    "preview": "Your annual boiler service is due for renewal next month.",
+    "score": 1.0,
+    "subject": "Boiler service reminder",
+    "thread_id": "th1",
+    "to": "alex@example.com"
+  }
+]

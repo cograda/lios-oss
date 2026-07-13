@@ -1,0 +1,54 @@
+name: add_task
+title: "Add Task"
+description: "Add a task to the appropriate backlog with correct priority, category, and formatting"
+arguments:
+  - name: task
+    description: "The task to add (e.g. 'book Finn swimming for summer', 'urgently call the plumber about the leak')"
+    required: true
+messages:
+  - role: user
+    content: |
+      Add a task to the appropriate backlog.
+
+      Task: {{ task }}
+
+      ## Steps
+
+      1. Parse the task from the input. If no task provided, ask what the task is.
+
+      2. Determine placement:
+         - Personal task -> add to the unified `vault/Task Backlog.md` under the right domain heading
+         - Otherwise -> `vault/Task Backlog.md` (default)
+
+      3. Determine priority from context:
+         - Urgent (needs doing today/tomorrow)
+         - High (this week)
+         - Medium (planned, this is the default)
+         - Low (nice to have)
+
+      4. Determine category. Read the target backlog file using `Read` and find the best-matching section heading. If none fits, add under the most relevant existing section.
+
+      5. Parse due date if mentioned. Convert relative dates to absolute (YYYY-MM-DD).
+
+      6. Format the task in Obsidian Tasks format:
+         ```markdown
+         - [ ] Task description ⏫ 📅 2026-04-15 #tag
+         ```
+         Priority emojis: 🔺 urgent, ⏫ high, 🔼 medium, 🔽 low.
+         Only include the date emoji (📅) if a due date was specified or implied.
+
+      7. Add the task under the appropriate section in the backlog using `Edit`. Don't add to the top or bottom of the file — find the right section.
+
+      8. If the task relates to a person or entity, use `[[wiki links]]` in the description:
+         ```markdown
+         - [ ] Book [[Finn]] swimming lessons for summer term 🔼 #school
+         ```
+
+      9. Show what was added and where.
+
+      ## Examples
+
+      - "book Finn's swimming for summer" -> shared backlog, Kids section, `- [ ] Book [[Finn]] swimming lessons for summer term 🔼 #school`
+      - "write up solar panel research" -> Alex backlog, Side Projects, `- [ ] Write up solar panel research 🔼`
+      - "NCT by end of April" -> shared backlog, Vehicle & Home, `- [ ] Car NCT 🔼 📅 2026-04-30 #vehicle`
+      - "urgently call the plumber about the leak" -> shared backlog, Household, `- [ ] Call plumber about the leak 🔺 #home`

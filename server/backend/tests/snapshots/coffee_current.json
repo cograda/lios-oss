@@ -1,0 +1,25 @@
+{
+  "coffees": [
+    {
+      "altitude_masl": "1700",
+      "category": "Light",
+      "fermentation": null,
+      "id": 1,
+      "name": "Honey Granada",
+      "notes": "Great as filter",
+      "origin_country": "Colombia",
+      "price": 16.5,
+      "process": "Honey",
+      "purchase_date": "2026-01-05",
+      "rating": 6,
+      "region_farm": "Granada",
+      "roast_date": "2026-01-01",
+      "roaster": "Hillside Roasters",
+      "roaster_tasting_notes": "Red apple, honey, caramel",
+      "status": "current",
+      "variety": "Castillo",
+      "weight_g": 250.0
+    }
+  ],
+  "count": 1
+}

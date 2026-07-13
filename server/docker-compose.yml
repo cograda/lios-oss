@@ -1,0 +1,64 @@
+services:
+  # Postgres is now owned by the infra project (~/infra/).
+  # comar-app connects to home-services-db via the homelab_default network.
+
+  app:
+    image: ghcr.io/cograda/comar-app:latest
+    build: .
+    container_name: comar-app
+    env_file: .env
+    environment:
+      # Connect to Postgres via homelab_default network (container name unchanged).
+      HOME_DATABASE__URL: postgresql://${HOME_DB_USER:-homeservices}:${HOME_DB_PASSWORD:?Set HOME_DB_PASSWORD in .env}@home-services-db:5432/home_services
+    networks:
+      - homelab
+    ports:
+      - "${HOME_PORT:-8400}:8000"         # HTTP API — direct (LAN, comar-client, Health Auto Export iOS)
+    labels:
+      caddy: comar.lab
+      caddy.reverse_proxy: "{{upstreams 8000}}"
+      caddy.reverse_proxy.flush_interval: "-1"
+      caddy.tls: internal
+    volumes:
+      # Per-user vaults live under /vaults/<user>/ (+ /vaults/shared/ for cross-user content).
+      # Existing code that still reads /obsidian sees Alex's vault via a bind mount;
+      # remove the second line once all callers migrate to vaults_root_path.
+      - ${HOME_VAULTS_HOST_PATH:-/dev/null}:/vaults:rw
+      - ${HOME_VAULTS_HOST_PATH:-/dev/null}/alex:/obsidian:rw
+      - ${HOME_DOC_CORPUS_HOST_PATH:-/dev/null}:/doc_corpus:ro   # historical renovation archive (one-shot ingest)
+      - fastembed_cache:/app/.cache/fastembed
+      - inbox_data:/inbox                  # automation webhook ingestion pipeline
+      - ${HOME_MEDIA_HOST_PATH:-/dev/null}:/data/media:rw   # WhatsApp media store (images/videos/audio)
+    restart: unless-stopped
+
+  whatsapp-bridge:
+    image: ghcr.io/cograda/comar-whatsapp:latest
+    build: ./whatsapp-bridge
+    container_name: comar-whatsapp
+    environment:
+      DATABASE_URL: postgresql://${HOME_DB_USER:-homeservices}:${HOME_DB_PASSWORD:?Set HOME_DB_PASSWORD in .env}@home-services-db:5432/home_services
+      LOG_LEVEL: info
+      SYNC_FULL_HISTORY: ${HOME_WA_SYNC_HISTORY:-false}
+    networks:
+      - homelab
+    volumes:
+      - wa_auth_state:/app/auth_state
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3100/health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # gateway (nginx) REMOVED — Caddy in infra project handles TLS + routing now.
+  # Dashboard served via Caddy reverse proxy at https://comar.lab
+
+networks:
+  homelab:
+    external: true
+    name: homelab_default
+
+volumes:
+  fastembed_cache:
+  wa_auth_state:
+  inbox_data:

@@ -1,0 +1,14 @@
+{
+  "accounts": [
+    {
+      "expense": 106.25,
+      "id": 1,
+      "income": 2500.0,
+      "name": "AIB Current",
+      "net": 2393.75,
+      "transaction_count": 7,
+      "type": "AIB"
+    }
+  ],
+  "period": "all"
+}

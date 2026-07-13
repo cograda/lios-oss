@@ -1,0 +1,26 @@
+[
+  {
+    "body": "Thanks, will check it tonight",
+    "caption": null,
+    "chat_id": "353851234567@s.whatsapp.net",
+    "chat_name": "Sam",
+    "date": "2026-01-15T09:30:00+00:00",
+    "is_from_me": true,
+    "is_group": false,
+    "message_id": "MSG2",
+    "sender": "Alex",
+    "type": "text"
+  },
+  {
+    "body": "Snags list is updated",
+    "caption": null,
+    "chat_id": "353851234567@s.whatsapp.net",
+    "chat_name": "Sam",
+    "date": "2026-01-15T10:00:00+00:00",
+    "is_from_me": false,
+    "is_group": false,
+    "message_id": "MSG1",
+    "sender": "Sam",
+    "type": "text"
+  }
+]

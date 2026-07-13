@@ -1,0 +1,15 @@
+{
+  "count": 1,
+  "days": 7,
+  "workouts": [
+    {
+      "avg_hr_bpm": 125.0,
+      "date": "2026-01-15",
+      "distance_km": 0,
+      "duration_min": 45.0,
+      "energy_kcal": 300.0,
+      "start": "2026-01-15T07:00:00+00:00",
+      "type": "strength_training"
+    }
+  ]
+}

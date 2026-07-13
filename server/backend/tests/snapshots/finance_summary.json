@@ -1,0 +1,15 @@
+{
+  "categorization_coverage": 25.0,
+  "net_savings": 2429.72,
+  "period": "2026-01",
+  "previous": {
+    "net_savings": -11.99,
+    "total_expense": 11.99,
+    "total_income": 0.0,
+    "transaction_count": 1
+  },
+  "total_expense": 70.28,
+  "total_income": 2500.0,
+  "transaction_count": 4,
+  "uncategorized_count": 3
+}

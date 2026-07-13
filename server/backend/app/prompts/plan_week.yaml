@@ -1,0 +1,57 @@
+name: plan_week
+title: "Plan Week"
+description: "Scaffold the coming week — distribute tasks across days, create daily note stubs, set reminders"
+arguments:
+  - name: week
+    description: "Which week to plan (e.g. 'next week', 'week of 14 April'). Default: coming week."
+    required: false
+messages:
+  - role: user
+    content: |
+      Scaffold the coming week — distribute tasks, create daily note stubs, set reminders.
+
+      Week override: {{ week }}
+
+      ## Steps
+
+      ### 1. Determine planning window
+
+      Default: Monday to Friday of the coming week. If a week override is specified above, use that.
+
+      ### 2. Gather context
+
+      Read the most recent weekly review from `Weekly Reviews/YYYY/` for priorities and carry-forward items.
+
+      Call MCP tools:
+      - `calendar_list_events` covering the planning window
+      - `reminders_list` for current reminders
+      - Read the unified backlog via `Read`:
+        - `Task Backlog.md`
+      - Read last 3 daily notes for uncompleted carried items
+
+      ### 3. Analyse week shape (Haiku subagent)
+
+      Spawn a Haiku subagent with all raw data to produce:
+      - Day-by-day shape (packed/moderate/light based on calendar)
+      - Task distribution (demanding tasks on light days, deadlines on correct days)
+      - Overdue items with days overdue
+      - Reminder gaps (high-priority tasks without matching reminders)
+      - One-line week summary
+
+      ### 4. Present the week shape
+
+      Show day-by-day breakdown with calendar events, suggested tasks, overdue items, and reminder gaps.
+
+      Ask user to confirm, adjust, or go.
+
+      ### 5. Execute scaffolding
+
+      After user confirms:
+      - Create daily note stubs (Mon-Fri) via `Write` — skip if note already exists
+      - Stubs include: frontmatter, calendar events in Today section, distributed tasks in Active section, empty Focus section
+      - Create Apple Reminders for high-priority tasks without matching reminders via `reminders_add`
+
+      ### 6. Summary
+
+      Show what was created: X stubs, Y tasks distributed, Z reminders set.
+      Remind to run `/daily-note` each morning.

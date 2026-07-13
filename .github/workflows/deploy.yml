@@ -1,0 +1,91 @@
+name: Build & Push Docker Images
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  APP_IMAGE: ghcr.io/cograda/comar-app
+  WA_IMAGE: ghcr.io/cograda/comar-whatsapp
+
+jobs:
+  build-app:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build frontend (output goes into server/frontend/dist/)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/frontend/package-lock.json
+
+      - name: Install frontend deps
+        run: npm ci
+        working-directory: server/frontend
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: server/frontend
+
+      # Build client wheel so server can serve it for auto-updates
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build client wheel
+        run: |
+          pip install hatchling
+          python -m hatchling build -t wheel
+          mkdir -p server/client-dist
+          cp dist/*.whl server/client-dist/
+        working-directory: client
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push app image
+        uses: docker/build-push-action@v6
+        with:
+          context: server
+          file: server/Dockerfile
+          push: true
+          tags: |
+            ${{ env.APP_IMAGE }}:latest
+            ${{ env.APP_IMAGE }}:${{ github.sha }}
+
+  build-whatsapp:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push WhatsApp bridge image
+        uses: docker/build-push-action@v6
+        with:
+          context: server/whatsapp-bridge
+          push: true
+          tags: |
+            ${{ env.WA_IMAGE }}:latest
+            ${{ env.WA_IMAGE }}:${{ github.sha }}

@@ -1,0 +1,18 @@
+{
+  "count": 2,
+  "entities": [
+    {
+      "area": "Kitchen",
+      "entity_id": "light.kitchen",
+      "friendly_name": "Kitchen Light",
+      "state": "on"
+    },
+    {
+      "entity_id": "person.alex",
+      "friendly_name": "Alex",
+      "state": "home"
+    }
+  ],
+  "stale": false,
+  "synced_at": "2026-01-15T09:58:00+00:00"
+}

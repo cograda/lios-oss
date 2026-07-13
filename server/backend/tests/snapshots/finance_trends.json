@@ -1,0 +1,29 @@
+{
+  "months": 4,
+  "trend": [
+    {
+      "expense": 11.99,
+      "income": 0.0,
+      "month": "2025-10",
+      "savings": -11.99
+    },
+    {
+      "expense": 11.99,
+      "income": 0.0,
+      "month": "2025-11",
+      "savings": -11.99
+    },
+    {
+      "expense": 11.99,
+      "income": 0.0,
+      "month": "2025-12",
+      "savings": -11.99
+    },
+    {
+      "expense": 70.28,
+      "income": 2500.0,
+      "month": "2026-01",
+      "savings": 2429.72
+    }
+  ]
+}

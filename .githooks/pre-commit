@@ -1,0 +1,16 @@
+#!/bin/sh
+# Pre-commit hook: block vault content from being committed.
+#
+# The vault/ directory is gitignored, but this hook is a safety net
+# against `git add -f vault/...` accidents.
+
+vault_files=$(git diff --cached --name-only | grep '^vault/')
+
+if [ -n "$vault_files" ]; then
+    echo "ERROR: Vault files staged for commit:"
+    echo "$vault_files"
+    echo ""
+    echo "Vault content must never be committed to git."
+    echo "Remove with: git reset HEAD vault/"
+    exit 1
+fi

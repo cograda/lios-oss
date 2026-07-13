@@ -1,0 +1,13 @@
+{
+  "date": "2026-01-15",
+  "metrics": {
+    "active_energy_kcal": 420.0,
+    "distance_km": 6.2,
+    "hr_avg_bpm": 72.0,
+    "hr_max_bpm": 140.0,
+    "hr_min_bpm": 50.0,
+    "hrv_ms": 55.0,
+    "resting_hr_bpm": 58.0,
+    "steps": 8000.0
+  }
+}

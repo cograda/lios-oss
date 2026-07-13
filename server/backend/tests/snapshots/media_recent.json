@@ -1,0 +1,33 @@
+{
+  "count": 2,
+  "results": [
+    {
+      "caption": "Snag - Kitchen - tile crack",
+      "chat": "Snags",
+      "date": "2026-01-15T10:00:00+00:00",
+      "id": 1,
+      "media_type": "image",
+      "mime_type": "image/jpeg",
+      "sender": "WindowCo",
+      "size_bytes": 204800,
+      "skip_reason": null,
+      "source": "whatsapp",
+      "status": "stored",
+      "storage_path": "/data/media/wa-media-1.jpg"
+    },
+    {
+      "caption": null,
+      "chat": "Family",
+      "date": "2026-01-15T07:00:00+00:00",
+      "id": 2,
+      "media_type": "video",
+      "mime_type": "video/mp4",
+      "sender": "Sam",
+      "size_bytes": 1048576,
+      "skip_reason": null,
+      "source": "whatsapp",
+      "status": "indexed",
+      "storage_path": null
+    }
+  ]
+}

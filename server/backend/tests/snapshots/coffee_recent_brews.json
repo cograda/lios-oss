@@ -1,0 +1,22 @@
+[
+  {
+    "brew_context": "home",
+    "brew_time_s": 210,
+    "brewed_at": "2026-01-15T10:00:00+00:00",
+    "coffee_id": 1,
+    "dose_g": 15.0,
+    "extraction_assessment": "good",
+    "filter_ratio": 16.67,
+    "flavour_notes": [
+      "red apple",
+      "honey"
+    ],
+    "grind_setting": "18",
+    "id": 1,
+    "method": "filter",
+    "notes": "Nice and clean",
+    "overall": 4,
+    "water_g": 250.0,
+    "water_temp_c": 94.0
+  }
+]

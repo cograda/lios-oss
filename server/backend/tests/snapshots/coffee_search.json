@@ -1,0 +1,22 @@
+[
+  {
+    "altitude_masl": "2000",
+    "category": "Light",
+    "fermentation": null,
+    "id": 2,
+    "name": "Yirgacheffe Natural",
+    "notes": "Loved this one",
+    "origin_country": "Ethiopia",
+    "price": 15.0,
+    "process": "Natural",
+    "purchase_date": "2020-01-03",
+    "rating": 9,
+    "region_farm": "Yirgacheffe",
+    "roast_date": "2020-01-01",
+    "roaster": "Hillside Roasters",
+    "roaster_tasting_notes": "Blueberry, stone fruit",
+    "status": "finished",
+    "variety": "Heirloom",
+    "weight_g": 250.0
+  }
+]

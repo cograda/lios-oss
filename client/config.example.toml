@@ -1,0 +1,43 @@
+# Comar client configuration — example / spec.
+#
+# Real config lives at ~/.config/comar/config.toml (gitignored, per-machine).
+# This file is committed as the canonical reference for what fields exist.
+#
+# The simplest way to produce a real config from this template is:
+#   bash scripts/setup-machine.sh
+# which runs `comar setup --noninteractive` and fills in the values for you.
+# You can also write ~/.config/comar/config.toml by hand — copy this file and
+# replace the placeholders.
+
+# Which user this client is operating as. Drives per-user data scoping on
+# the server (Alex = user_id 1, Sam = user_id 2). Lowercase.
+user = "alex"
+
+# Local MCP server port the daemon listens on. Claude Desktop reaches the
+# daemon at http://127.0.0.1:<mcp_port>; Claude Code talks straight to the
+# remote server's /mcp/sse and doesn't use this. Default 9400.
+mcp_port = 9400
+
+# Whether the daemon should auto-update its wheel from the server when a
+# newer version is published. Safe to leave on for personal machines.
+auto_update = true
+
+[server]
+# Base URL of comar-server. On home Wi-Fi use the LAN IP; off-network use
+# the Tailscale hostname.
+#   LAN:       "http://192.168.1.50:8400"
+#   Tailscale: "https://your-server.your-tailnet.ts.net"
+url = "http://192.168.1.50:8400"
+
+# Per-user bearer token. Look it up in the server's `client_tokens` table
+# (one row per (user_id, machine)). NEVER commit a real token.
+token = "REPLACE_ME_WITH_PER_USER_BEARER_TOKEN"
+
+# Optional CA cert path — only needed if you front the server with a
+# self-signed TLS cert. LAN HTTP deployments leave this unset.
+# ca_cert = "/Users/<you>/.config/comar/ca.crt"
+
+[vault]
+# Absolute path to the Obsidian vault on this machine. The daemon's fsevents
+# watcher pushes changes from here to the server for re-indexing.
+path = "/Users/you/Desktop/Code/comar/vault"

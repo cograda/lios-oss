@@ -1,0 +1,42 @@
+[
+  {
+    "account": "AIB Current",
+    "amount": -11.99,
+    "category": null,
+    "currency": "EUR",
+    "date": "2026-01-14",
+    "description": "SPOTIFY",
+    "id": 7,
+    "is_transfer": false
+  },
+  {
+    "account": "AIB Current",
+    "amount": -12.99,
+    "category": null,
+    "currency": "EUR",
+    "date": "2026-01-12",
+    "description": "RANDOM SHOP XYZ",
+    "id": 3,
+    "is_transfer": false
+  },
+  {
+    "account": "AIB Current",
+    "amount": 2500.0,
+    "category": null,
+    "currency": "EUR",
+    "date": "2026-01-10",
+    "description": "SALARY",
+    "id": 2,
+    "is_transfer": false
+  },
+  {
+    "account": "AIB Current",
+    "amount": -45.3,
+    "category": "Groceries",
+    "currency": "EUR",
+    "date": "2026-01-05",
+    "description": "TESCO STORES",
+    "id": 1,
+    "is_transfer": false
+  }
+]

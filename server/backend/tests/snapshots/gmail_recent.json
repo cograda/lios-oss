@@ -1,0 +1,28 @@
+[
+  {
+    "account": "alex@example.com",
+    "date": "2026-01-15T10:00:00+00:00",
+    "from": "Servicer <service@example.com>",
+    "has_attachments": false,
+    "id": "gm1",
+    "is_read": true,
+    "is_starred": false,
+    "snippet": "Your annual boiler service is due",
+    "subject": "Boiler service reminder",
+    "thread_id": "th1",
+    "to": "alex@example.com"
+  },
+  {
+    "account": "alex@example.com",
+    "date": "2026-01-15T09:00:00+00:00",
+    "from": "alex@example.com",
+    "has_attachments": false,
+    "id": "gm2",
+    "is_read": true,
+    "is_starred": true,
+    "snippet": "Confirmed for next Tuesday",
+    "subject": "Re: Boiler service reminder",
+    "thread_id": "th1",
+    "to": "service@example.com"
+  }
+]

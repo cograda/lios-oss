@@ -1,0 +1,30 @@
+{
+  "favourite_processes": [
+    "Natural"
+  ],
+  "favourite_roasters": [
+    "Hillside Roasters"
+  ],
+  "favourites": [
+    {
+      "id": 2,
+      "name": "Yirgacheffe Natural",
+      "rating": 9,
+      "roaster": "Hillside Roasters"
+    }
+  ],
+  "origins_explored": [
+    {
+      "count": 1,
+      "origin": "Ethiopia"
+    },
+    {
+      "count": 1,
+      "origin": "Colombia"
+    }
+  ],
+  "stale_favourite_roasters": [
+    "Hillside Roasters"
+  ],
+  "suggestion_prompt": "Look at favourites + favourite_processes + favourite_roasters. Suggest a coffee to try next that overlaps process/roaster but explores an underrepresented origin. Highlight stale_favourite_roasters as worth revisiting."
+}

@@ -1,0 +1,26 @@
+{
+  "actual": {
+    "strength_sessions": 1,
+    "total_workouts": 1,
+    "workouts": [
+      {
+        "avg_hr_bpm": 125.0,
+        "date": "2026-01-15",
+        "duration_min": 45.0,
+        "energy_kcal": 300.0,
+        "type": "strength_training"
+      }
+    ]
+  },
+  "on_track": true,
+  "remaining_days": [
+    "2026-01-16",
+    "2026-01-17",
+    "2026-01-18"
+  ],
+  "target": {
+    "strength_sessions": 2
+  },
+  "week_end": "2026-01-18",
+  "week_start": "2026-01-12"
+}

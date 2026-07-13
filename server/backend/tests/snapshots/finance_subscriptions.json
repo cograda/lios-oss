@@ -1,0 +1,14 @@
+{
+  "period": "all",
+  "subscriptions": [
+    {
+      "amount": 11.99,
+      "confidence": 1,
+      "currency": "EUR",
+      "description": "SPOTIFY",
+      "frequency": "monthly",
+      "last_charged": "2026-01-14",
+      "occurrences": 4
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+name: search
+title: "Search Vault"
+description: "Search the vault for notes, tasks, or information using keyword and semantic search"
+arguments:
+  - name: query
+    description: "What to search for (e.g. 'Finn ear', 'renovation flooring decisions', 'kitchen layout conversation')"
+    required: true
+messages:
+  - role: user
+    content: |
+      Search the vault for notes, tasks, or information.
+
+      Query: {{ query }}
+
+      ## Search strategy
+
+      ### Step 1 — Keyword search (fast)
+
+      Use the `Grep` MCP tool to search markdown files for the query terms.
+
+      If this returns good results (relevant file names and content), present them and stop.
+
+      ### Step 2 — Semantic search (if keyword search is insufficient)
+
+      Call the `vault_search` MCP tool with the query and a limit of 10.
+
+      This searches the server's pgvector index (384-dim embeddings of all vault files) using cosine similarity. Use this when keyword search misses context or the query is conversational/conceptual.
+
+      ### Step 3 — Present results
+
+      For each relevant result:
+      - Show the file path (relative to vault root)
+      - Show a 2-3 line preview of the most relevant content
+      - If it's a task file, show the task status
+
+      Group results by type:
+      - **Notes** — from Daily Notes, Personal, Household, Reference
+      - **Meetings** — from Meetings/
+      - **Tasks** — items in backlogs matching the query
+
+      ### Step 4 — Offer to read
+
+      Ask if the user wants to open/read any of the results. If they do, use `Read` to show the full content.
+
+      ## Examples
+
+      - "Finn ear" -> keyword search first, finds task files and kids notes
+      - "renovation flooring decisions" -> keyword search may miss context, fall back to semantic
+      - "that conversation about the kitchen layout" -> semantic search, meeting notes
+      - "Sam blog ideas" -> keyword search matches the file name directly

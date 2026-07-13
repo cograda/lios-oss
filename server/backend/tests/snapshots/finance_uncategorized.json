@@ -1,0 +1,27 @@
+{
+  "groups": [
+    {
+      "count": 4,
+      "earliest": "2025-10-16",
+      "latest": "2026-01-14",
+      "pattern": "spotify",
+      "total": -47.96
+    },
+    {
+      "count": 1,
+      "earliest": "2026-01-12",
+      "latest": "2026-01-12",
+      "pattern": "random shop xyz",
+      "total": -12.99
+    },
+    {
+      "count": 1,
+      "earliest": "2026-01-10",
+      "latest": "2026-01-10",
+      "pattern": "salary",
+      "total": 2500.0
+    }
+  ],
+  "groups_shown": 3,
+  "total_uncategorized": 6
+}

@@ -1,0 +1,40 @@
+{
+  "avg_coffee_rating": 7.5,
+  "by_method": [
+    {
+      "avg_overall": 4.0,
+      "count": 1,
+      "method": "filter"
+    }
+  ],
+  "by_origin": [
+    {
+      "count": 1,
+      "origin": "Ethiopia"
+    },
+    {
+      "count": 1,
+      "origin": "Colombia"
+    }
+  ],
+  "by_process": [
+    {
+      "count": 1,
+      "process": "Natural"
+    },
+    {
+      "count": 1,
+      "process": "Honey"
+    }
+  ],
+  "by_roaster": [
+    {
+      "avg_rating": 7.5,
+      "count": 2,
+      "roaster": "Hillside Roasters"
+    }
+  ],
+  "period": "all_time",
+  "total_brews": 1,
+  "total_coffees": 2
+}

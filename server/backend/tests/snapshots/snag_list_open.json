@@ -1,0 +1,19 @@
+{
+  "count": 1,
+  "results": [
+    {
+      "element": "Floor tile",
+      "external_ref": null,
+      "media_count": 0,
+      "reported_at": "2026-01-15T10:00:00+00:00",
+      "reported_by": "Alex",
+      "resolution_note": null,
+      "room": "Kitchen",
+      "severity": "minor",
+      "status": "open",
+      "title": "Cracked kitchen floor tile",
+      "trade": "windowco",
+      "uid": "SNAG-0001"
+    }
+  ]
+}

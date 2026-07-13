@@ -1,0 +1,5 @@
+# Test/dev-only dependencies — NOT installed in the server image.
+# The `db` test tier spins up a disposable Postgres via testcontainers
+# (or honours COMAR_TEST_DATABASE_URL in CI).
+pytest>=8.0
+testcontainers[postgres]>=4.0

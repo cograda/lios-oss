@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Environment
+.env
+.env.local
+.env*.local
+
+# Data
+*.csv
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!docker-compose.yml
+!scripts/**/*.json
+!backend/tests/snapshots/*.json
+*.db
+*.pkl
+
+# Build artifacts
+frontend/tsconfig.tsbuildinfo
+
+# Certs
+certs/*.pem
+certs/*.key
+certs/*.crt
+certs/*.p12
+!certs/README.md
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Docker
+pgdata/

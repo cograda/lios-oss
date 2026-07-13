@@ -1,0 +1,25 @@
+{
+  "entities": [
+    {
+      "attributes": {},
+      "device_class": null,
+      "domain": "person",
+      "entity_id": "person.alex",
+      "friendly_name": "Alex",
+      "last_changed": "2026-01-15T09:00:00+00:00",
+      "recent_changes": [
+        {
+          "changed_at": "2026-01-15T09:00:00+00:00",
+          "entity_id": "person.alex",
+          "new_state": "home",
+          "old_state": "not_home"
+        }
+      ],
+      "state": "home",
+      "synced_at": "2026-01-15T09:58:00+00:00"
+    }
+  ],
+  "not_found": [],
+  "stale": false,
+  "synced_at": "2026-01-15T09:58:00+00:00"
+}

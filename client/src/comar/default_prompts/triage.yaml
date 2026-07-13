@@ -1,0 +1,70 @@
+name: triage
+title: "Triage"
+description: "Triage incoming emails and WhatsApp messages since last check — quick routing for new items"
+arguments:
+  - name: lookback
+    description: "Custom lookback (e.g. 'last 2 hours', 'since lunch'). Default: since last triage."
+    required: false
+messages:
+  - role: user
+    content: |
+      Triage incoming items since the last check — quick routing for new emails, WhatsApp messages, and reminders.
+
+      Lookback override: {{ lookback }}
+
+      Default: since last triage timestamp (stored in vault/Alex/.triage-state.md). If override specified, use that instead.
+
+      ## Steps
+
+      ### 1. Determine lookback window
+
+      Read `vault/Alex/.triage-state.md` via `vault_read` to get the last triage timestamp. If the file doesn't exist, default to 24 hours ago.
+
+      If a lookback override is specified above, use that instead.
+
+      ### 2. Fetch new items
+
+      Call these MCP tools:
+      - `gmail_recent` with `after` set to the lookback timestamp, limit 50
+      - `whatsapp_recent` with `after` set to the lookback timestamp, limit 100, include_groups true
+      - `reminders_list` for cross-referencing
+
+      Also read today's daily note if it exists: `Daily Notes/Alex/YYYY-MM-DD.md`
+
+      ### 3. Classify items (Haiku subagent)
+
+      Spawn a Haiku subagent with all raw data. Classify each item as:
+      - `reply-needed` — unanswered question/request directed at Alex (include wait time in days)
+      - `action` — concrete task someone needs to do
+      - `FYI` — informational only
+      - `done` — something completed
+
+      Rules:
+      - Skip automated notifications, newsletters, casual chat, reactions, media-only
+      - For WhatsApp groups: only flag reply-needed if Alex was directly addressed
+      - For email: not reply-needed if Alex's account sent the last message in the thread
+      - Merge related items from the same thread/conversation
+      - Be conservative with reply-needed
+
+      ### 4. Present triage table
+
+      Show reply-needed items first (sorted by wait time), then actions, then FYI/done.
+
+      ### 5. Route items
+
+      Ask user to route: → backlog, → reply, → calendar, → done, dismiss.
+
+      Execute routing:
+      - Backlog: add to correct backlog file with Obsidian Tasks format via vault_edit
+      - Reply: note in today's daily note under Notes
+      - Calendar: call calendar_create_event
+      - Done: complete matching reminder if exists
+      - Offer to create Apple Reminders for backlog additions
+
+      ### 6. Update triage state
+
+      Write current timestamp to `vault/Alex/.triage-state.md` via vault_write.
+
+      ### 7. Summary
+
+      Brief summary of actions taken. Flag outstanding reply-needed items.

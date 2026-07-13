@@ -1,0 +1,36 @@
+{
+  "exercise": {
+    "strength_sessions": 1,
+    "target_met": false,
+    "total_workouts": 1,
+    "workouts": [
+      {
+        "date": "2026-01-15",
+        "duration_min": 45.0,
+        "type": "strength_training"
+      }
+    ]
+  },
+  "movement": {
+    "avg_active_energy": 420.0,
+    "avg_steps": 7600.0,
+    "total_distance_km": 12.4
+  },
+  "recovery_assessment": "poor",
+  "sleep": {
+    "avg_deep_hours": 1.5,
+    "avg_rem_hours": 1.5,
+    "avg_total_hours": 3.0,
+    "best_night": "2026-01-14",
+    "best_night_hours": 3.0,
+    "nights_tracked": 1,
+    "worst_night": "2026-01-14",
+    "worst_night_hours": 3.0
+  },
+  "vitals": {
+    "avg_hrv": 52.5,
+    "avg_resting_hr": 58.0
+  },
+  "week_end": "2026-01-18",
+  "week_start": "2026-01-12"
+}
