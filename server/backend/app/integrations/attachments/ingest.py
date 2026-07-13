@@ -31,6 +31,7 @@ from app.integrations.historical_corpus.parsers import (
     pdf as pdf_parser,
 )
 from app.integrations.historical_corpus.parsers.types import DocMeta
+from app.tools.helpers import scoped_query
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,14 @@ def _sanitize(name: str | None) -> str:
 
 
 def _download(message_ref: str, dest: Path) -> int:
-    with httpx.stream("GET", f"{BRIDGE_URL}/download/{message_ref}", timeout=120.0) as r:
+    from app.config import settings
+
+    headers = {}
+    if settings.wa_bridge_shared_secret:
+        headers["X-Bridge-Secret"] = settings.wa_bridge_shared_secret
+    with httpx.stream(
+        "GET", f"{BRIDGE_URL}/download/{message_ref}", timeout=120.0, headers=headers,
+    ) as r:
         r.raise_for_status()
         size = 0
         with dest.open("wb") as f:
@@ -72,7 +80,7 @@ def _download(message_ref: str, dest: Path) -> int:
 def ingest_one(session: Session, attachment_id: int) -> dict:
     """Ingest a single attachment. Safe to re-run: content-hash dedup upstream
     skips no-op re-embeds."""
-    att = session.get(MessageAttachment, attachment_id)
+    att = scoped_query(session, MessageAttachment).filter_by(id=attachment_id).one_or_none()
     if not att:
         return {"id": attachment_id, "status": "error", "detail": "not found"}
     if att.parse_status == "ingested" and att.historical_doc_id:

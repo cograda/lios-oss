@@ -39,6 +39,7 @@ services:
       DATABASE_URL: postgresql://${HOME_DB_USER:-homeservices}:${HOME_DB_PASSWORD:?Set HOME_DB_PASSWORD in .env}@home-services-db:5432/home_services
       LOG_LEVEL: info
       SYNC_FULL_HISTORY: ${HOME_WA_SYNC_HISTORY:-false}
+      BRIDGE_SHARED_SECRET: ${HOME_WA_BRIDGE_SHARED_SECRET:-}
     networks:
       - homelab
     volumes:

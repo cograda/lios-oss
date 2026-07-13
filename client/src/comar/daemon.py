@@ -416,7 +416,7 @@ async def _apply_heartbeat(
             logger.info(f"Update available: {current} → {latest_version}")
             checksum = hb.get("latest_client_checksum", "")
             success = await asyncio.to_thread(
-                download_and_install, config.server.url, checksum,
+                download_and_install, config.server.url, checksum, config.allow_insecure_updates,
             )
             if success:
                 logger.info("Update installed — restarting daemon")

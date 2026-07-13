@@ -107,6 +107,8 @@ If MCP isn't connecting in a Claude Code session, check (in order): `echo $COMAR
 
 This file (root `CLAUDE.md`) covers only the cross-cutting facts: architecture, monorepo layout, machine setup. Specialised detail lives in two places:
 
+The `vault/` paths below are inside your own Obsidian vault, not this repo — `vault/` is gitignored (see Monorepo Layout above), so those files don't exist until you've created your own vault content there.
+
 | For | See |
 |---|---|
 | **Vault rules** — folder structure, daily notes, task system, meeting processing, frontmatter schemas, tagging, naming, what-not-to-do | `vault/CLAUDE.md` |

@@ -28,7 +28,16 @@ COPY frontend/dist/ frontend/dist/
 # Without this the auto-updater finds no wheel and silently never advances. See ISS-015.
 COPY client-dist/ client-dist/
 
+# Run as a non-root user. Create the fastembed cache dir up front and hand
+# ownership of /app to appuser (writes: fastembed model cache on first run;
+# everything else the app touches at runtime — vault, media, inbox — comes
+# in via bind mounts owned by the host, not this image).
+RUN mkdir -p "${FASTEMBED_CACHE_PATH}" \
+    && useradd -m -u 1000 appuser \
+    && chown -R appuser:appuser /app
+
 EXPOSE 8000
 
 WORKDIR /app/backend
+USER appuser
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

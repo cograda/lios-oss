@@ -46,6 +46,10 @@ class ClientConfig:
     user: str = ""
     mcp_port: int = 9400
     auto_update: bool = True
+    # Auto-update refuses to run over a plain http:// server URL (an on-path
+    # attacker could substitute both the wheel and its checksum). Set true
+    # only if you understand the risk — see comar.updater.download_and_install.
+    allow_insecure_updates: bool = False
     server: ServerConfig = field(default_factory=ServerConfig)
     vault: VaultConfig = field(default_factory=VaultConfig)
     reminders: RemindersConfig = field(default_factory=RemindersConfig)
@@ -63,6 +67,7 @@ def load_config() -> ClientConfig:
         user=data.get("user", ""),
         mcp_port=data.get("mcp_port", 9400),
         auto_update=data.get("auto_update", True),
+        allow_insecure_updates=data.get("allow_insecure_updates", False),
     )
 
     if "server" in data:

@@ -219,11 +219,26 @@ def create_mcp_app(
 
     # -- Streamable HTTP transport --
 
+    # DNS rebinding protection: validates the Host header against an explicit
+    # allowlist. Left ON (unlike the SDK's own backwards-compat default,
+    # which is off) since this server only ever needs to answer requests
+    # aimed at its own loopback port — nothing legitimate sends a different
+    # Host header. Ports are pinned to config.mcp_port (default 9400) since
+    # that's what this daemon actually binds to.
     session_manager = StreamableHTTPSessionManager(
         app=mcp,
         json_response=False,
         stateless=False,
-        security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        security_settings=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[
+                f"localhost:{config.mcp_port}",
+                f"127.0.0.1:{config.mcp_port}",
+                "localhost",
+                "127.0.0.1",
+            ],
+            allowed_origins=[],
+        ),
     )
 
     # ASGI handler that delegates to the session manager
@@ -330,7 +345,9 @@ def _build_vault_tools(
 
     def vault_read(arguments: dict) -> list[TextContent]:
         rel = arguments.get("path", "")
-        fp = vault_path / rel
+        fp = (vault_path / rel).resolve()
+        if not fp.is_relative_to(vault_path.resolve()):
+            raise ValueError(f"Path escapes vault: {rel}")
         if not fp.is_file():
             # Help the model recover: show what IS in the parent folder
             parent = fp.parent
@@ -361,7 +378,9 @@ def _build_vault_tools(
 
     def vault_list(arguments: dict) -> list[TextContent]:
         folder = arguments.get("folder", "")
-        target = vault_path / folder if folder else vault_path
+        target = (vault_path / folder).resolve() if folder else vault_path.resolve()
+        if not target.is_relative_to(vault_path.resolve()):
+            raise ValueError(f"Path escapes vault: {folder}")
         if not target.is_dir():
             raise FileNotFoundError(f"Folder not found: {folder}")
         files = []
@@ -393,7 +412,9 @@ def _build_vault_tools(
         pattern = arguments.get("pattern", "").lower()
         folder = arguments.get("folder", "")
         limit = arguments.get("limit", 20)
-        search_root = vault_path / folder if folder else vault_path
+        search_root = (vault_path / folder).resolve() if folder else vault_path.resolve()
+        if not search_root.is_relative_to(vault_path.resolve()):
+            raise ValueError(f"Path escapes vault: {folder}")
 
         skip_dirs = {".obsidian", ".claude", ".tools", ".embeddings", ".trash", ".git", "Attachments", "Templates"}
         results = []
@@ -448,7 +469,7 @@ def _build_vault_tools(
         expected_mtime = arguments.get("expected_mtime")
         fp = (vault_path / rel).resolve()
         # Security: ensure path stays within vault
-        if not str(fp).startswith(str(vault_path.resolve())):
+        if not fp.is_relative_to(vault_path.resolve()):
             raise ValueError(f"Path escapes vault: {rel}")
         # Conflict check
         if expected_mtime and fp.is_file():
@@ -502,7 +523,7 @@ def _build_vault_tools(
         expected_mtime = arguments.get("expected_mtime")
 
         fp = (vault_path / rel).resolve()
-        if not str(fp).startswith(str(vault_path.resolve())):
+        if not fp.is_relative_to(vault_path.resolve()):
             raise ValueError(f"Path escapes vault: {rel}")
         if not fp.is_file():
             raise FileNotFoundError(f"File not found: {rel}")

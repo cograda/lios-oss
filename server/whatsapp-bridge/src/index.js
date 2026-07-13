@@ -31,6 +31,18 @@ const AUTH_DIR = process.env.AUTH_DIR || "/app/auth_state";
 const HEALTH_PORT = parseInt(process.env.HEALTH_PORT || "3100", 10);
 const SYNC_FULL_HISTORY = process.env.SYNC_FULL_HISTORY === "true";
 
+// Shared-secret header required on /download/:messageId — otherwise any
+// container on the shared Docker network can pull decrypted WhatsApp media
+// for any guessable message id. Unset = unauthenticated (dev mode), same
+// pattern as HOME_MCP_TOKEN on the main app.
+const BRIDGE_SHARED_SECRET = process.env.BRIDGE_SHARED_SECRET || "";
+if (!BRIDGE_SHARED_SECRET) {
+  logger.warn(
+    "BRIDGE_SHARED_SECRET is not set — /download/:messageId is unauthenticated. " +
+    "Set BRIDGE_SHARED_SECRET to require callers to send it as X-Bridge-Secret."
+  );
+}
+
 // Connection state
 let sock = null;
 let connectionState = "disconnected";
@@ -399,10 +411,15 @@ async function handleDownload(messageId, res) {
     }
   }
 
+  // Allow-list: alphanumeric, dot, dash, underscore, space. Everything else
+  // (quotes, path separators, control chars, CRLF header-injection attempts)
+  // gets replaced rather than just stripping the one `"` character.
+  const safeFilename = (media.fileName || messageId).replace(/[^A-Za-z0-9._\- ]+/g, "_");
+
   res.writeHead(200, {
     "Content-Type": media.mimetype || "application/octet-stream",
     "Content-Length": buffer.length,
-    "Content-Disposition": `attachment; filename="${(media.fileName || messageId).replace(/"/g, "")}"`,
+    "Content-Disposition": `attachment; filename="${safeFilename}"`,
   });
   res.end(buffer);
 }
@@ -426,6 +443,11 @@ function startHealthServer() {
     }
     const dlMatch = req.method === "GET" && req.url?.match(/^\/download\/(.+)$/);
     if (dlMatch) {
+      if (BRIDGE_SHARED_SECRET && req.headers["x-bridge-secret"] !== BRIDGE_SHARED_SECRET) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
       await handleDownload(decodeURIComponent(dlMatch[1]), res);
       return;
     }

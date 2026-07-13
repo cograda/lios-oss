@@ -169,7 +169,10 @@ server/
 │       └── db.js              # Postgres upsert for messages + contacts (batch + single)
 │
 └── scripts/
-    └── reminders-sync/        # Mac-side Apple Reminders agent
+    └── reminders-sync/        # LEGACY — Mac-side osascript agent, superseded by
+                                #   the client daemon's EventKit push (see "Why
+                                #   EventKit instead of osascript?" in root README).
+                                #   Not deployed; kept for reference only.
         ├── sync.py            # Reads via osascript, pushes to server, executes commands
         ├── run.sh             # Wrapper for launchd
         └── com.cograda.reminders-sync.plist  # launchd plist (reference copy)
@@ -203,7 +206,7 @@ Every integration lives in `backend/app/integrations/<name>/` and follows the `B
 5. Add any config fields to `HomeSettings` in `config.py`
 6. MCP tools and scheduler auto-discover from there
 
-### Current Integrations (13)
+### Current Integrations (18)
 
 | Integration | Sync Schedule | MCP Tools | Data Source | Notes |
 |-------------|--------------|-----------|-------------|-------|
@@ -214,13 +217,17 @@ Every integration lives in `backend/app/integrations/<name>/` and follows the `B
 | `finance` | None (manual) | 8 | CSV import (AIB, Revolut) | ~4,700 txns, ~670 rules, ~98% coverage |
 | `obsidian` | */30 * * * * | 3 | Local vault files | pgvector + fastembed, ~300 files |
 | `whatsapp` | */30 * * * * | 7 | Baileys bridge (Node.js sidecar) | ~15k messages, conversation-window embedding |
-| `weather` | */30 * * * * | 2 | Open-Meteo API (no key) | Malahide coords (configurable) |
+| `weather` | */30 * * * * | 2 | Open-Meteo API (no key) | Dublin coords (configurable) |
 | `lastfm` | */15 * * * * | 4 | Last.fm API | 50,000+ scrobbles |
 | `irish_rail` | None (live) | 2 | Irish Rail XML API | Malahide station (configurable), no caching |
 | `homeassistant` | WS events (real-time) + */5 poll reconcile | 4 | Home Assistant REST + WebSocket (192.168.1.51) | Gap-free: WS `state_changed` listener (lifespan task, `events.py`) feeds `ha_entities`/`ha_state_changes` live; the 5-min poll reconciles after downtime + refreshes areas. Numeric ticks excluded from history unless `HOME_HA_RECORD_NUMERIC_HISTORY`. Signal curation in `tools.py::SECTIONS`. |
 | `system` | None | 4 | Cross-integration diagnostics | Health alerts, morning briefing, week ahead, search everything |
 | `media` | 5,35 * * * * | 4 | Baileys bridge `/download/:id` | WhatsApp media store: indexes ALL images/videos/audio in `media_items`, auto-downloads last ~30 days to `HOME_MEDIA_ROOT` volume, `media_export` copies into the vault for note-embedding. Documents stay with `attachments`. **Host dir must live OUTSIDE `~/comar-server/`** (rsync deploy uses `--delete`). |
 | `snags` | None (user-gated capture) | 5 | WhatsApp `Snag - …` messages + manual | Snag register — **DB is source of truth**, immutable UIDs (`SNAG-0042`), trade/severity/status lifecycle, evidence via `snag_media` → media store. Vault note `Household/Renovation/Snags.md` is a generated one-way view (re-rendered on every write; evidence auto-exported to `Attachments/Snags/UID-n.jpg`). |
+| `coffee` | None (manual entry) | 12 | User-entered via MCP tools (`coffee_log`, `coffee_brew`) | Brew log + bean dial-in advisor, ported from brewhaha |
+| `attachments` | */30 * * * * (piggybacks on WhatsApp cadence) | 4 | WhatsApp message attachments (Gmail scanning not yet implemented) | User-gated flow: `scan` → `pending` → `ingest`; ingested files land in `historical_documents` alongside the corpus |
+| `historical_corpus` | None (one-shot CLI/REST ingest) | 2 | Static renovation document archive | No scheduled sync — ingested manually via `scripts/ingest_historical_corpus.py` or the REST endpoint; queried via `renovation_context` |
+| `inbox` | 7 * * * * | 6 | `/inbox/<bucket>/` webhook drop zone (automation ingestion) | Triage layer on top of the drop zone: hourly enrichment (kind sniff + preview), then `pending`/`preview`/`archive`/`dismiss`/`to_vault`/`to_corpus` |
 
 ## MCP Server
 
@@ -390,7 +397,7 @@ coglib is vendored in `server/coglib/` (copied from its upstream repo). Refresh 
 - **db** container: `pgvector/pgvector:pg16`, persistent volume `pgdata`, healthcheck via `pg_isready`
 - **app** container: Python 3.12-slim, installs coglib + requirements, copies backend + frontend/dist
 - Port mapping: container port 8000 → host port 8400 (configurable via `HOME_PORT`)
-- Vault mounted at `/obsidian` inside container (from `HOME_OBSIDIAN_HOST_PATH` on host)
+- Vault mounted at `/obsidian` inside container (from `HOME_VAULTS_HOST_PATH` on host)
 - Fastembed model cache persisted in `fastembed_cache` volume
 
 ### Server details
@@ -413,20 +420,31 @@ All prefixed `HOME_`. Stored in `.env` on the server (never committed).
 | `HOME_DB_PASSWORD` | Yes | Postgres password (used by docker-compose) |
 | `HOME_UI_TOKEN` | Yes | Web dashboard access token |
 | `HOME_MCP_TOKEN` | Legacy | Pre-multi-user MCP bearer. Per-user `client_tokens` is the live path; this is dev-only fallback. |
-| `HOME_TLS_PORT` | No | Web dashboard HTTPS port (default 8443) |
 | `HOME_GOOGLE_CLIENT_ID` | For OAuth | Google OAuth client ID |
 | `HOME_GOOGLE_CLIENT_SECRET` | For OAuth | Google OAuth client secret |
 | `HOME_OAUTH_REDIRECT_BASE` | For OAuth | Set to `http://localhost:8400` for SSH tunnel auth |
+| `HOME_OAUTH_ISSUER` | For claude.ai connector | Public issuer URL for the MCP OAuth 2.1 authorization server (e.g. the Tailscale host). Empty disables the OAuth routes. |
 | `HOME_LASTFM_API_KEY` | For Last.fm | Last.fm API key |
 | `HOME_LASTFM_USERNAME` | For Last.fm | Last.fm username (your_username) |
-| `HOME_OBSIDIAN_VAULT_PATH` | For vault | Path inside container (default `/obsidian`) |
-| `HOME_OBSIDIAN_HOST_PATH` | Docker | Host path to vault (mounted into container) |
+| `HOME_OBSIDIAN_VAULT_PATH` | For vault | Legacy in-container alias path, bind-mounted to Alex's vault (default `/obsidian`) |
+| `HOME_VAULTS_ROOT_PATH` | For vault | Root of the per-user vault tree inside the container (default `/vaults`) |
+| `HOME_VAULTS_HOST_PATH` | Docker | Host path to the vault tree, mounted into the container at `/vaults`. Should contain a per-user subfolder matching each Mac's user (e.g. `<host-path>/alex/`, bind-mounted to `/obsidian` per docker-compose.yml). |
 | `HOME_ANTHROPIC_API_KEY` | For backlog sync | Anthropic API key (Haiku task matching) |
 | `HOME_WA_SYNC_HISTORY` | No | Set `true` for one-time WhatsApp history backfill (default false) |
 | `HOME_HA_URL` | For HA | Home Assistant URL (e.g. `http://192.168.1.51:8123`) |
 | `HOME_HA_TOKEN` | For HA | Home Assistant long-lived access token (dedicated "comar" token) |
 | `HOME_MEDIA_HOST_PATH` | Docker | Host dir for the WhatsApp media store (mounted at `/data/media`) |
 | `HOME_HA_RECORD_NUMERIC_HISTORY` | No | Also record numeric→numeric transitions in `ha_state_changes` (default false; HA's recorder keeps numeric series) |
+| `HOME_WEATHER_LATITUDE` / `HOME_WEATHER_LONGITUDE` | No | Weather forecast location for the Open-Meteo integration (default: Dublin, `53.3498` / `-6.2603`) |
+| `HOME_RAIL_STATION_CODE` / `HOME_RAIL_STATION_NAME` | No | Irish Rail home station code + display name (default: Malahide, `MHIDE`) |
+| `HOME_TRANSFER_MATCH_NAMES` | No | Comma-separated account-holder names as they appear on bank statements — used to classify Revolut transfers between your own accounts as internal |
+| `HOME_INBOX_PATH` | No | Path inside the container for the automation webhook ingestion pipeline (default `/inbox`) |
+| `HOME_INBOX_TOKEN` | No | Bearer token for the `/api/inbox/ingest` webhook |
+| `HOME_HEALTH_PUSH_TOKEN` | No | Separate bearer token for Health Auto Export pushes (least-privilege, distinct from `HOME_UI_TOKEN`) |
+| `HOME_SYNCTHING_URL` | No | Server-side Syncthing REST URL, reached over the docker bridge gateway (default `http://172.21.0.1:8384`) |
+| `HOME_SYNCTHING_API_KEY` | No | Syncthing REST API key (generated by Syncthing on first run, read from its `config.xml`) |
+| `HOME_SYNCTHING_FOLDER_ID` | No | Folder ID shared with every paired Mac (default `vault`) — cross-device contract, don't rename without updating each client |
+| `HOME_CALENDAR_VISIBILITY` | No | Per-account calendar visibility map (`"full"` / `"busy"` / `"hidden"`); unrecognised accounts default to `"full"` |
 
 Client config lives in `~/.config/comar/config.toml` on each Mac (created by `comar setup`). Client tokens are stored in the `client_tokens` table — create via server admin or CLI.
 

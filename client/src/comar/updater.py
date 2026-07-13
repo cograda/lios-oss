@@ -54,16 +54,44 @@ def _fetch_wheel_filename(base: str) -> str | None:
     return name
 
 
-def download_and_install(server_url: str, expected_checksum: str = "") -> bool:
+def download_and_install(
+    server_url: str,
+    expected_checksum: str = "",
+    allow_insecure_updates: bool = False,
+) -> bool:
     """Download the latest wheel from the server and install via pipx.
 
     `server_url` is the V3 base URL (e.g. `http://192.168.1.50:8400` or
     `https://comar.lab`). The wheel endpoint is appended directly.
     Verifies SHA256 if `expected_checksum` is provided.
+
+    Checksum verification alone doesn't prove authenticity if the channel
+    itself is plaintext HTTP — an on-path attacker can substitute both the
+    wheel and the checksum the daemon compares it against. So unless
+    `allow_insecure_updates` is explicitly set, refuse to fetch/apply an
+    update over `http://`. This only gates the auto-update path; ordinary
+    API calls over `http://` (LAN-only deployments) are unaffected.
     """
     base = server_url.rstrip("/")
     if not base.startswith(("http://", "https://")):
         base = f"http://{base}"
+
+    if base.startswith("http://"):
+        if not allow_insecure_updates:
+            logger.error(
+                "Refusing to auto-update over plaintext HTTP (%s) — an "
+                "on-path attacker could substitute both the wheel and its "
+                "checksum. Set allow_insecure_updates=true in config.toml "
+                "to override, or use an https:// server URL.",
+                base,
+            )
+            return False
+        logger.warning(
+            "Auto-updating over plaintext HTTP (%s) with allow_insecure_updates=true — "
+            "the download is not protected against on-path tampering.",
+            base,
+        )
+
     download_url = f"{base}/api/client/download/latest"
 
     wheel_name = _fetch_wheel_filename(base)

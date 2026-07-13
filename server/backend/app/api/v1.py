@@ -281,23 +281,16 @@ def vault_push(
     user: User = Depends(get_current_user),
 ) -> dict:
     """Write a single vault file to disk and re-index it."""
-    from pathlib import Path
     from app.integrations.obsidian.sync import index_single_file
+    from app.services.vault_paths import resolve as resolve_vault_path
 
-    vault_path = settings.obsidian_vault_path
-    if not vault_path:
-        raise HTTPException(status_code=503, detail="Vault path not configured")
-
-    # Containment check — payload.path is bearer-authenticated input but a
-    # value like "../../../app/main.py" would otherwise let any client overwrite
-    # arbitrary container files (RCE-equivalent on the next reload).
-    rel = payload.path.lstrip("/")
-    if Path(rel).is_absolute() or ".." in Path(rel).parts:
-        raise HTTPException(status_code=400, detail="path escapes vault")
-    vault_root = Path(vault_path).resolve()
-    full = (vault_root / rel).resolve()
-    if not str(full).startswith(str(vault_root) + "/") and full != vault_root:
-        raise HTTPException(status_code=400, detail="path escapes vault")
+    # resolve() scopes the write to this user's own vault (/vaults/<user>/...)
+    # and rejects paths that escape it (e.g. "../../../app/main.py"), which
+    # would otherwise be RCE-equivalent on the next reload.
+    try:
+        full = resolve_vault_path(payload.path, user_id_override=user.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     full.parent.mkdir(parents=True, exist_ok=True)
     full.write_text(payload.content, encoding="utf-8")

@@ -152,6 +152,9 @@ class PromptStore:
 
         for pdef in prompt_defs:
             name = pdef["name"]
+            if not name or "/" in name or "\\" in name or ".." in name:
+                logger.warning(f"Skipping prompt with unsafe name from server: {name!r}")
+                continue
             server_names.add(name)
             target = self._dir / f"{name}.yaml"
 

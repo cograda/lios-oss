@@ -115,6 +115,12 @@ async def purge_integration(integration: str, before: str | None = None):
 
     with db.session() as session:
         for table_name, date_col in PURGE_MAP[integration]:
+            # Defense-in-depth: table_name/date_col are only ever sourced from
+            # the fixed PURGE_MAP above (never attacker input), but assert
+            # membership explicitly before building the raw SQL string.
+            assert (table_name, date_col) in PURGE_MAP[integration], (
+                f"purge identifier {table_name!r}/{date_col!r} not in PURGE_MAP"
+            )
             if cutoff and date_col:
                 result = session.execute(
                     text(f"DELETE FROM {table_name} WHERE {date_col} < :cutoff"),

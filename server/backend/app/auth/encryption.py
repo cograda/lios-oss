@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 
 _FERNET_PREFIX = "gAAAAA"
 
+# Set on the first call to encrypt_token() with no key configured, so the
+# warning below fires once at first use rather than spamming logs on every
+# OAuth token write.
+_warned_no_key = False
+
 
 def _get_fernet():
     """Get Fernet instance, or None if no key configured."""
@@ -36,6 +41,16 @@ def encrypt_token(plaintext: str) -> str:
         return plaintext
     fernet = _get_fernet()
     if fernet is None:
+        global _warned_no_key
+        if not _warned_no_key:
+            logger.warning(
+                "HOME_OAUTH_ENCRYPTION_KEY is not set — OAuth tokens (Google "
+                "Calendar/Gmail) are being stored in PLAINTEXT. Set "
+                "HOME_OAUTH_ENCRYPTION_KEY to enable encryption at rest "
+                "(generate one: python -c \"from cryptography.fernet import "
+                "Fernet; print(Fernet.generate_key().decode())\")."
+            )
+            _warned_no_key = True
         return plaintext
     return fernet.encrypt(plaintext.encode()).decode()
 

@@ -84,7 +84,10 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print("Run on the new machine:")
     print()
-    print(f"  curl -fsSL {public}/api/install/{code} | bash")
+    print(
+        f"  curl -fsSL -X POST -H 'Content-Type: application/json' "
+        f"-d '{{\"code\":\"{code}\"}}' {public}/api/install/redeem | bash"
+    )
     print()
     print("Fallback (if curl can't reach the server before Tailscale is up):")
     print()

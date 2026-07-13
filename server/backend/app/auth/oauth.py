@@ -2,7 +2,7 @@
 
 Each account gets its own token row in the oauth_tokens table. The flow:
 
-1. User visits /api/auth/google/login?account=user@gmail.com
+1. User visits /api/auth/google/login?account=alex@example.com
 2. Redirected to Google consent screen
 3. Google redirects back to /api/auth/google/callback with code + state
 4. We exchange the code for tokens and store them

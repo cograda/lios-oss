@@ -369,7 +369,7 @@ def handle_delete_brew(session: Session, arguments: dict[str, Any]) -> str:
     brew_id = _to_int(arguments.get("brew_id"))
     if not brew_id:
         return json.dumps({"error": "brew_id is required"})
-    brew = session.get(CoffeeBrew, brew_id)
+    brew = scoped_query(session, CoffeeBrew).filter_by(id=brew_id).one_or_none()
     if not brew:
         return json.dumps({"error": f"brew {brew_id} not found"})
     deleted = _brew_to_dict(brew)

@@ -25,7 +25,15 @@ async def login(request: Request):
     if not safe_token_check(token, settings.ui_token):
         return JSONResponse({"error": "Invalid token"}, status_code=401)
     response = JSONResponse({"status": "ok"})
-    response.set_cookie("ui_token", token, httponly=True, samesite="strict", max_age=86400 * 30)
+    # secure=True: this app has no separate "behind TLS" setting, and the
+    # documented dashboard access points (https://comar.lab via Caddy,
+    # https://<tailnet>.ts.net via Tailscale) both terminate TLS in front of
+    # this process. A browser will simply not attach this cookie on a plain
+    # http:// origin — use the Tailscale/Caddy hostname, not the raw
+    # http://SERVER_IP:8400 LAN address, when logging into the dashboard.
+    response.set_cookie(
+        "ui_token", token, httponly=True, samesite="strict", secure=True, max_age=86400 * 30,
+    )
     return response
 
 
@@ -57,7 +65,7 @@ async def google_login(request: Request, account: str, user: str = "alex"):
     attributes the resulting token to that User row (defaults to alex for
     back-compat). For Sam's account: `?account=sam@example.com&user=sam`.
 
-    Example: /api/auth/google/login?account=user@gmail.com&user=alex
+    Example: /api/auth/google/login?account=alex@example.com&user=alex
     """
     if not settings.google_client_id:
         return {"error": "Google OAuth not configured — set HOME_GOOGLE_CLIENT_ID and HOME_GOOGLE_CLIENT_SECRET"}
@@ -119,14 +127,22 @@ async def list_tokens():
 
 @router.get("/clients")
 async def list_clients():
-    """List all client tokens (never exposes the full token value)."""
-    from app.models.users import User
+    """List client tokens for every household member (never exposes the full token value).
+
+    Gated only by the shared HOME_UI_TOKEN, same as the rest of the
+    dashboard (e.g. /api/dashboard/summary) — this app has no per-user
+    browser session concept, so the UI token already implies full
+    household-admin visibility everywhere else. Scoping just this route to
+    a per-user bearer would be inconsistent with that model and the
+    dashboard has no bearer to send anyway.
+    """
+    from app.models.users import User as UserModel
 
     db = get_db()
     with db.session() as session:
         rows = (
-            session.query(ClientToken, User)
-            .join(User, ClientToken.user_id == User.id)
+            session.query(ClientToken, UserModel)
+            .join(UserModel, ClientToken.user_id == UserModel.id)
             .order_by(ClientToken.created_at.desc())
             .all()
         )
@@ -150,8 +166,14 @@ async def list_clients():
 
 @router.post("/clients")
 async def create_client(request: Request):
-    """Create a new client token. Returns the full token value ONCE."""
-    from app.models.users import User
+    """Create a new client token for any household member. Returns the full token value ONCE.
+
+    Gated only by the shared HOME_UI_TOKEN — see list_clients for why this
+    route doesn't add a separate per-user bearer requirement. The frontend
+    prompts for confirmation before minting a token for a user other than
+    the one currently viewing Settings, as light friction against mistakes.
+    """
+    from app.models.users import User as UserModel
 
     body = await request.json()
     user_name = (body.get("user") or "").strip()
@@ -164,7 +186,7 @@ async def create_client(request: Request):
 
     db = get_db()
     with db.session() as session:
-        user_row = session.query(User).filter_by(name=user_name).first()
+        user_row = session.query(UserModel).filter_by(name=user_name).first()
         if not user_row:
             return JSONResponse(
                 {"error": f"unknown user '{user_name}' — must exist in users table"},
@@ -189,7 +211,10 @@ async def create_client(request: Request):
 
 @router.delete("/clients/{client_id}")
 async def deactivate_client(client_id: int):
-    """Deactivate a client token (soft-delete — row preserved for audit)."""
+    """Deactivate a client token (soft-delete — row preserved for audit).
+
+    Gated only by the shared HOME_UI_TOKEN — see list_clients for why.
+    """
     db = get_db()
     with db.session() as session:
         client = session.query(ClientToken).filter_by(id=client_id).first()

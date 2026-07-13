@@ -5,6 +5,7 @@ and vault path.
 """
 
 import logging
+import os
 from pathlib import Path
 
 import click
@@ -70,6 +71,7 @@ token = "{token}"
 path = "{vp}"
 """
     CONFIG_FILE.write_text(config_content)
+    os.chmod(CONFIG_FILE, 0o600)  # contains the bearer token — owner read/write only
     click.echo(f"\n  Config saved to {CONFIG_FILE} ✓")
     click.echo("  Run `comar install` to start the daemon.\n")
 
@@ -112,6 +114,7 @@ def run_setup():
             if src.is_file():
                 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
                 ca_cert_path.write_bytes(src.read_bytes())
+                os.chmod(ca_cert_path, 0o600)
                 click.echo(f"  CA cert copied to {ca_cert_path} ✓")
             else:
                 click.echo(f"  Warning: {src} not found — HTTP will fall back to plain (LAN-only)")
@@ -151,6 +154,7 @@ path = "{vault_path}"
 """
 
     CONFIG_FILE.write_text(config_content)
+    os.chmod(CONFIG_FILE, 0o600)  # contains the bearer token — owner read/write only
     click.echo(f"\n  Config saved to {CONFIG_FILE} ✓")
     click.echo("\n  Run `comar install` to start the daemon as a service.")
     click.echo("  Or `comar daemon` to run in the foreground.\n")

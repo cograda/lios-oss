@@ -1,14 +1,17 @@
-"""Install endpoint — `GET /api/install/{code}` returns a personalised installer.
+"""Install endpoint — `POST /api/install/redeem` returns a personalised installer.
 
 This is the entrypoint for new machines that don't yet have comar credentials.
 An admin runs `python -m app.scripts.create_install_code --user sam
 --label sam-macbook` to mint a single-use code that wraps a freshly-minted
-bearer. The new machine then hits this route over Tailscale, gets back a bash
+bearer. The new machine then hits this route over Tailscale (code in the POST
+body, not the URL, so it doesn't end up in access logs), gets back a bash
 script with the token baked in, and pipes it into `bash`.
 
 The script is a chain of preflight gates (Xcode CLT → Tailscale → Google Drive
 vault sync → Claude Code app) followed by daemon install + working folder +
 launchd + E2E smoke. Safe to re-run.
+
+See `INSTALL_SCRIPT_TEMPLATE` below for the exact generated script.
 
 The route trusts the code as the auth boundary — no bearer header. Single-use
 and 24h-TTL bounds the blast radius.
@@ -21,6 +24,7 @@ import re
 import httpx
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.config import settings
@@ -30,6 +34,10 @@ from app.models.clients import ClientToken, InstallCode
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/install", tags=["install"])
+
+
+class InstallRedeemRequest(BaseModel):
+    code: str = Field(..., description="Single-use install code minted by create_install_code.py")
 
 
 # Bash installer template. Variables are __DOUBLE_UNDERSCORE__-wrapped so we
@@ -491,14 +499,19 @@ def _render(server_url: str, token: str, user: str, label: str) -> str:
     )
 
 
-@router.get("/{code}", response_class=PlainTextResponse)
-async def fetch_install_script(code: str, request: Request) -> PlainTextResponse:
+@router.post("/redeem", response_class=PlainTextResponse)
+async def fetch_install_script(payload: InstallRedeemRequest, request: Request) -> PlainTextResponse:
     """Render and return the install script for a single-use code.
+
+    Takes the code via POST body rather than a URL/path parameter — a GET
+    with the code in the URL would end up in shell history and any access
+    log the request passes through (Caddy, Tailscale, etc).
 
     Marks the code redeemed on success (with timestamp + caller IP). Subsequent
     fetches return 410 Gone. Expired codes return 410 Gone with a different
     detail. Unknown codes return 404.
     """
+    code = payload.code
     db = get_db()
     with db.session() as session:
         ic = session.execute(

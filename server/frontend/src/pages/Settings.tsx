@@ -18,7 +18,7 @@ import {
 } from '@/hooks/use-api'
 
 const ACCOUNTS = [
-  { email: 'user@gmail.com', label: 'User' },
+  { email: 'alex@example.com', label: 'Alex' },
   { email: 'sam@example.com', label: 'Sam' },
   { email: 'finn@example.com', label: 'Finn' },
   { email: 'isla@example.com', label: 'Isla' },
@@ -72,6 +72,9 @@ function ClientsTab() {
   }
 
   async function handleCreateToken() {
+    if (!window.confirm(
+      `Create a new bearer token for "${newUser}"? Anyone holding this token can read and write ${newUser}'s data.`,
+    )) return
     try {
       const res = await createMutation.mutateAsync({ user: newUser, label: newLabel })
       setCreatedToken(res.token)

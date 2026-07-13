@@ -87,9 +87,13 @@ def download_item(session: Session, item: MediaItem) -> bool:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / storage_filename(item)
 
+    headers = {}
+    if settings.wa_bridge_shared_secret:
+        headers["X-Bridge-Secret"] = settings.wa_bridge_shared_secret
+
     try:
         with httpx.stream(
-            "GET", f"{BRIDGE_URL}/download/{item.message_ref}", timeout=120.0
+            "GET", f"{BRIDGE_URL}/download/{item.message_ref}", timeout=120.0, headers=headers,
         ) as r:
             r.raise_for_status()
             sha = hashlib.sha256()

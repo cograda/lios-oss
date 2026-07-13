@@ -63,6 +63,13 @@ async def lifespan(app: FastAPI):
     register_mcp_tools()
     setup_scheduler()
 
+    if not settings.oauth_encryption_key:
+        logger.warning(
+            "HOME_OAUTH_ENCRYPTION_KEY is not set — OAuth tokens (Google "
+            "Calendar/Gmail) will be stored in PLAINTEXT. Set "
+            "HOME_OAUTH_ENCRYPTION_KEY to enable encryption at rest."
+        )
+
     # Capture the running loop so sync tool handlers (in asyncio.to_thread)
     # can publish SSE events back onto it via run_coroutine_threadsafe.
     from app.stream_manager import stream_manager
@@ -124,10 +131,26 @@ AUTH_EXEMPT_PREFIXES = ("/api/reminders/", "/api/client/", "/api/health/", "/api
 
 @app.middleware("http")
 async def check_ui_auth(request: Request, call_next):
-    """Gate API routes behind a simple token check (cookie or header)."""
+    """Gate API routes behind a simple token check (cookie or header).
+
+    Fails CLOSED: an unset HOME_UI_TOKEN is a misconfiguration, not an
+    invitation to skip auth. Every non-exempt /api/* route is rejected until
+    the token is configured — it must never fall through to call_next()
+    unauthenticated just because settings.ui_token happens to be "".
+    """
     path = request.url.path
     # Only protect /api/ routes (not static files, MCP, or exempt paths)
-    if path.startswith("/api/") and path not in AUTH_EXEMPT and not any(path.startswith(p) for p in AUTH_EXEMPT_PREFIXES) and settings.ui_token:
+    if path.startswith("/api/") and path not in AUTH_EXEMPT and not any(path.startswith(p) for p in AUTH_EXEMPT_PREFIXES):
+        if not settings.ui_token:
+            logger.error(
+                "HOME_UI_TOKEN is not set — refusing %s (fail-closed). "
+                "Set HOME_UI_TOKEN in .env to enable the dashboard.",
+                path,
+            )
+            return JSONResponse(
+                {"error": "Server misconfigured: HOME_UI_TOKEN is not set"},
+                status_code=500,
+            )
         token = request.cookies.get("ui_token") or request.headers.get("X-UI-Token")
         if not safe_token_check(token, settings.ui_token):
             return JSONResponse({"error": "Unauthorized"}, status_code=401)

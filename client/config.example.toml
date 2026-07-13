@@ -22,6 +22,14 @@ mcp_port = 9400
 # newer version is published. Safe to leave on for personal machines.
 auto_update = true
 
+# Auto-update refuses to download/install a new wheel when [server].url is
+# plain http:// — over an unauthenticated plaintext channel, an on-path
+# attacker could swap out both the wheel and the checksum it's verified
+# against. Leave this false for LAN http:// deployments (auto-update will
+# just no-op with a logged warning until you move to https://, e.g. the
+# Tailscale hostname). Only set true if you've accepted that risk.
+allow_insecure_updates = false
+
 [server]
 # Base URL of comar-server. On home Wi-Fi use the LAN IP; off-network use
 # the Tailscale hostname.

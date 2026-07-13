@@ -77,7 +77,7 @@ class TestDownloadAndInstall:
     @patch("comar.updater.subprocess.run")
     def test_curl_failure_returns_false(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1, stderr="connection refused")
-        result = download_and_install("10.0.0.1:8400")
+        result = download_and_install("10.0.0.1:8400", allow_insecure_updates=True)
         assert result is False
 
     @patch("comar.updater.subprocess.run")
@@ -89,7 +89,7 @@ class TestDownloadAndInstall:
             _version_response(),
             MagicMock(returncode=1, stderr="stop here"),  # download fails — fine
         ]
-        download_and_install("10.0.0.1:8400")
+        download_and_install("10.0.0.1:8400", allow_insecure_updates=True)
 
         download_cmd = mock_run.call_args_list[1][0][0]
         assert "http://10.0.0.1:8400/api/client/download/latest" in download_cmd
@@ -100,8 +100,41 @@ class TestDownloadAndInstall:
     def test_timeout_returns_false(self, mock_run):
         import subprocess
         mock_run.side_effect = subprocess.TimeoutExpired(cmd="curl", timeout=60)
+        result = download_and_install("10.0.0.1:8400", allow_insecure_updates=True)
+        assert result is False
+
+
+class TestInsecureUpdateGating:
+    """Auto-update must refuse plain http:// unless explicitly opted in —
+    checksum verification alone doesn't prove authenticity over a channel an
+    on-path attacker can tamper with (both the wheel and its checksum travel
+    over the same connection)."""
+
+    @patch("comar.updater.subprocess.run")
+    def test_http_blocked_by_default(self, mock_run):
+        result = download_and_install("http://10.0.0.1:8400")
+        assert result is False
+        mock_run.assert_not_called()
+
+    @patch("comar.updater.subprocess.run")
+    def test_bare_host_defaults_to_http_and_is_blocked(self, mock_run):
+        """No scheme prefix falls back to http:// — must still be gated."""
         result = download_and_install("10.0.0.1:8400")
         assert result is False
+        mock_run.assert_not_called()
+
+    @patch("comar.updater.subprocess.run")
+    def test_http_allowed_with_explicit_opt_in(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr="stop here")
+        download_and_install("http://10.0.0.1:8400", allow_insecure_updates=True)
+        # Proceeded past the gate — curl was actually invoked.
+        mock_run.assert_called()
+
+    @patch("comar.updater.subprocess.run")
+    def test_https_never_blocked(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr="stop here")
+        download_and_install("https://comar.lab")
+        mock_run.assert_called()
 
 
 class TestChecksumVerification:
@@ -124,11 +157,13 @@ class TestChecksumVerification:
             result = download_and_install(
                 "10.0.0.1:8400",
                 expected_checksum="0000000000000000000000000000000000000000000000000000000000000000",
+                allow_insecure_updates=True,
             )
             assert result is False
-            # pipx install should never be called
+            # pipx install should never be called (checksum mismatch, not the insecure gate)
             pipx_calls = [c for c in mock_run.call_args_list if "pipx" in str(c)]
             assert len(pipx_calls) == 0
+            assert mock_run.call_args_list, "test should exercise the download path, not just the insecure gate"
 
     def test_checksum_match_proceeds(self, tmp_path):
         """Correct checksum should allow installation to proceed."""
@@ -142,6 +177,7 @@ class TestChecksumVerification:
             result = download_and_install(
                 "10.0.0.1:8400",
                 expected_checksum=correct_checksum,
+                allow_insecure_updates=True,
             )
             assert result is True
             # pipx install should have been called
@@ -155,5 +191,7 @@ class TestChecksumVerification:
 
         with patch("comar.updater.subprocess.run", side_effect=self._mock_run()), \
              patch("comar.updater.tempfile.mkdtemp", return_value=str(tmp_path)):
-            result = download_and_install("10.0.0.1:8400", expected_checksum="")
+            result = download_and_install(
+                "10.0.0.1:8400", expected_checksum="", allow_insecure_updates=True,
+            )
             assert result is True

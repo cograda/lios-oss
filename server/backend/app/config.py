@@ -72,6 +72,11 @@ class HomeSettings(CogSettings):
     # OAuth token encryption (Fernet key, base64-encoded)
     oauth_encryption_key: str = ""
 
+    # Shared secret sent as X-Bridge-Secret to the whatsapp-bridge's
+    # /download/:messageId endpoint. Must match BRIDGE_SHARED_SECRET on that
+    # container. Empty = no header sent (matches the bridge's dev-mode default).
+    wa_bridge_shared_secret: str = ""
+
     # MCP OAuth 2.1 authorization server (claude.ai connector sign-in).
     # Public issuer URL (the Tailscale host, e.g.
     # https://your-server.your-tailnet.ts.net). Empty → OAuth routes disabled.
@@ -97,8 +102,8 @@ class HomeSettings(CogSettings):
     # Unrecognised accounts default to "full". The hidden example is an
     # extended-family calendar managed separately.
     calendar_visibility: dict[str, str] = {
-        "user@gmail.com": "full",
-        "user@work.com": "busy",
+        "alex@example.com": "full",
+        "alex@work.com": "busy",
         "nana@example.com": "hidden",
     }
 

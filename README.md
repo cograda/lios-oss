@@ -7,22 +7,21 @@ A family knowledge system built around an [Obsidian](https://obsidian.md) vault.
 ## How it works
 
 ```
-Claude Desktop / Claude Code
-    ↕ MCP (localhost:9400)
-comar-client (local daemon on each Mac)
-    ├── Local tools: vault read/write/grep/list, Apple Reminders (EventKit)
-    ├── MCP prompts: 15 orchestration workflows (daily note, weekly review, ...)
+Claude Code ── MCP / Streamable HTTP (per-user bearer, COMAR_TOKEN) ── comar-server (home server, Docker)
+                                                                            ├── ~13 integrations, ~80 tools
+                                                                            ├── Postgres 16 + pgvector (semantic search)
+                                                                            ├── WhatsApp bridge (Baileys sidecar)
+                                                                            ├── APScheduler (background sync)
+                                                                            └── Web dashboard (React 19)
+
+comar-client (macOS daemon, side-car — not on the Claude Code MCP path)
     ├── Vault watcher: fsevents → POST /api/v1/vault/push
-    ├── SSE consumer: GET /api/v1/events for server→client signals
-    └── HTTPS+JSON → comar-server (home server, Docker)
-                      ├── ~13 integrations, ~80 proxied tools
-                      ├── Postgres 16 + pgvector (semantic search)
-                      ├── WhatsApp bridge (Baileys sidecar)
-                      ├── APScheduler (background sync)
-                      └── Web dashboard (React 19)
+    ├── Apple Reminders: EventKit (PyObjC), dispatched via server SSE callbacks
+    └── Legacy local MCP proxy on localhost:9400 — used only by Claude Desktop
+        via mcp-remote (see "Connect Claude" below), pending retirement
 ```
 
-The client runs as a macOS daemon (launchd) and exposes a single MCP endpoint. Claude sees one tool list — it doesn't need to know which are local and which are proxied to the server. Transport between client and server is HTTPS + JSON, with SSE for server→client signals. **No gRPC, no protobuf.**
+Claude Code talks directly to the server's `/mcp/` endpoint over Streamable HTTP, authenticated with a per-user bearer token (`COMAR_TOKEN`) — this is the primary, supported path and doesn't go through the daemon at all. The daemon runs on each Mac for two jobs the server can't do itself: writing to Apple Reminders via EventKit, and watching the vault folder for changes to push to the server for re-indexing. It also still boots a legacy local MCP proxy that Claude Desktop connects to via `mcp-remote` (Claude Desktop doesn't yet support connecting to a remote HTTP MCP server directly) — that proxy has nothing to do with the Claude Code path and is on its own deprecation track. Transport between client and server is HTTPS + JSON, with SSE for server→client signals. **No gRPC, no protobuf.**
 
 Audio transcription has moved out of comar-client into a separate repo (`cograda/scribe`), which drops markdown into a watched folder.
 
@@ -89,7 +88,17 @@ For automated/scripted installs:
 comar setup --user alex --server http://192.168.1.50:8400 --token <your-token>
 ```
 
-### 3. Start the daemon
+### 3. Run the machine setup script
+
+```bash
+bash scripts/setup-machine.sh
+```
+
+This installs the daemon via pipx, runs `comar setup` if `~/.config/comar/config.toml` doesn't already exist, and writes `~/.config/comar/env.sh` — then patches `~/.zshenv` to source it, so `COMAR_TOKEN` (the per-user bearer token) is exported for `.mcp.json` to pick up.
+
+**Why `~/.zshenv` and not `~/.zshrc`**: Claude Code expands `${COMAR_TOKEN}` in `.mcp.json` from its own process environment at startup. When launched from Spotlight, the Dock, or an IDE, zsh runs `~/.zshenv` but not `~/.zshrc` — so a token exported only in `.zshrc` is invisible to GUI-launched apps. Quit and relaunch Claude Code after running the script so it picks up the token.
+
+### 4. Start the daemon
 
 ```bash
 comar install   # installs as a launchd agent (auto-starts on login)
@@ -97,9 +106,27 @@ comar install   # installs as a launchd agent (auto-starts on login)
 comar daemon    # foreground, for debugging
 ```
 
-### 4. Connect Claude
+The daemon isn't on Claude Code's MCP path (see "How it works" above) — it needs to be running for Apple Reminders (EventKit) writes and vault-watcher re-indexing.
 
-**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+### 5. Connect Claude
+
+**Claude Code** (primary, supported path): point your per-machine `.mcp.json` (gitignored, not shipped in the repo) at the server's `/mcp/` endpoint using `${COMAR_TOKEN}`:
+
+```json
+{
+  "mcpServers": {
+    "comar": {
+      "type": "http",
+      "url": "https://comar.lab/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${COMAR_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`) doesn't yet support connecting to a remote HTTP MCP server directly, so it goes through the daemon's legacy local MCP proxy instead, via `mcp-remote`:
 
 ```json
 {
@@ -112,11 +139,15 @@ comar daemon    # foreground, for debugging
 }
 ```
 
-**Claude Code**: the repo's `.mcp.json` already points at `localhost:9400/mcp`.
+This Claude Desktop path is separate from the Claude Code path above and is on its own deprecation track — see `client/README.md`.
 
-### 5. Verify
+### 6. Verify
 
 ```bash
+# Claude Code path — server heartbeat
+curl -H "Authorization: Bearer $COMAR_TOKEN" http://192.168.1.50:8400/api/v1/heartbeat
+
+# Claude Desktop path — daemon health
 curl http://localhost:9400/health
 ```
 
@@ -200,7 +231,10 @@ See `server/.env.example`. Key variables:
 | `HOME_GOOGLE_CLIENT_ID` | For OAuth | Google Calendar + Gmail |
 | `HOME_GOOGLE_CLIENT_SECRET` | For OAuth | Google Calendar + Gmail |
 | `HOME_LASTFM_API_KEY` | For Last.fm | Last.fm scrobble history |
-| `HOME_OBSIDIAN_HOST_PATH` | For vault | Host path mounted into the container |
+| `HOME_VAULTS_HOST_PATH` | For vault | Host path mounted into the container. Should contain a per-user subfolder, e.g. `<host-path>/alex/` |
+| `HOME_WEATHER_LATITUDE` / `HOME_WEATHER_LONGITUDE` | No | Weather forecast location (default: Dublin) |
+| `HOME_RAIL_STATION_CODE` / `HOME_RAIL_STATION_NAME` | No | Irish Rail home station (default: Malahide) |
+| `HOME_TRANSFER_MATCH_NAMES` | No | Comma-separated account-holder names for internal transfer detection |
 
 ## CLI reference
 
@@ -242,14 +276,15 @@ make test-server
 ### Deploy
 
 ```bash
-make deploy           # Full: build client wheel + frontend + rsync + docker build
-make deploy-fast      # Backend only: rsync + docker build (skip frontend)
-make deploy-pull      # Pull pre-built images from GHCR (after CI push)
+make deploy           # DEFAULT: pull pre-built images from GHCR + restart (after CI push)
+make deploy-pull      # Alias for make deploy
+make deploy-build     # Dev rsync path: build client wheel + frontend + rsync + docker build
+make deploy-fast      # Dev rsync path, backend only: rsync + docker build (skip frontend)
 ```
 
 ### CI/CD
 
-Pushing to `main` triggers GitHub Actions (`.github/workflows/deploy.yml`) — builds the React frontend, the client wheel (for auto-updates), and Docker images for `comar-app` + `comar-whatsapp`, then pushes to GHCR. Run `make deploy-pull` on the server to pull and restart.
+Pushing to `main` triggers GitHub Actions (`.github/workflows/deploy.yml`) — builds the React frontend, the client wheel (for auto-updates), and Docker images for `comar-oss-app` + `comar-oss-whatsapp`, then pushes to GHCR. Run `make deploy-pull` on the server to pull and restart.
 
 ### Auto-updates
 
@@ -276,7 +311,7 @@ Comar is built for a specific household but the architecture is generic:
 1. **Users**: change name choices in `setup_flow.py` and the vault folder structure
 2. **Integrations**: each one is self-contained in `server/backend/app/integrations/<name>/`. Disable by removing from `register_all()`, or add a new one following `BaseIntegration`
 3. **Prompts**: edit YAML in `client/src/comar/default_prompts/`
-4. **Location-specific**: weather coordinates and rail station live in their integration configs
+4. **Location-specific**: weather coordinates (`HOME_WEATHER_LATITUDE`/`HOME_WEATHER_LONGITUDE`) and rail station (`HOME_RAIL_STATION_CODE`/`HOME_RAIL_STATION_NAME`) are set via `.env`, with sensible defaults baked in
 5. **Calendar filtering**: `calendar_visibility` in `config.py` per Google account — `"full"`, `"busy"`, or `"hidden"`
 
 ## License
