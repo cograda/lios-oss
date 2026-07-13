@@ -44,8 +44,8 @@ jobs:
         run: |
           pip install hatchling
           python -m hatchling build -t wheel
-          mkdir -p server/client-dist
-          cp dist/*.whl server/client-dist/
+          mkdir -p ../server/client-dist
+          cp dist/*.whl ../server/client-dist/
         working-directory: client
 
       - name: Log in to GHCR
