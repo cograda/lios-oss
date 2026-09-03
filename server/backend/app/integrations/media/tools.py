@@ -18,6 +18,8 @@ from sqlalchemy.orm import Session
 from app.integrations.media.models import MediaItem
 from app.integrations.media.scan import scan_whatsapp_media
 from app.integrations.media import store
+from app.services.text import ILIKE_ESCAPE_CHAR, escape_ilike
+from app.tools import CustomTool, ToolAnnotations
 from app.tools.helpers import iso_or_none, scoped_query, serialize
 
 
@@ -40,11 +42,23 @@ def _apply_filters(q, arguments: dict):
     if arguments.get("status"):
         q = q.filter(MediaItem.status == arguments["status"])
     if arguments.get("chat"):
-        q = q.filter(MediaItem.chat_or_thread.ilike(f"%{arguments['chat']}%"))
+        q = q.filter(
+            MediaItem.chat_or_thread.ilike(
+                f"%{escape_ilike(arguments['chat'])}%", escape=ILIKE_ESCAPE_CHAR
+            )
+        )
     if arguments.get("sender"):
-        q = q.filter(MediaItem.sender_name.ilike(f"%{arguments['sender']}%"))
+        q = q.filter(
+            MediaItem.sender_name.ilike(
+                f"%{escape_ilike(arguments['sender'])}%", escape=ILIKE_ESCAPE_CHAR
+            )
+        )
     if arguments.get("caption_contains"):
-        q = q.filter(MediaItem.caption.ilike(f"%{arguments['caption_contains']}%"))
+        q = q.filter(
+            MediaItem.caption.ilike(
+                f"%{escape_ilike(arguments['caption_contains'])}%", escape=ILIKE_ESCAPE_CHAR
+            )
+        )
     if arguments.get("since_days") is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=int(arguments["since_days"]))
         q = q.filter(MediaItem.message_ts >= cutoff)
@@ -156,41 +170,43 @@ def mcp_tools() -> list[dict[str, Any]]:
         "since_days": {"type": "integer", "description": "Only items from the last N days."},
     }
     return [
-        {
-            "name": "media_recent",
-            "description": (
+        CustomTool(
+            name="media_recent",
+            description=(
                 "List WhatsApp media (images/videos/audio) from the media store "
                 "index, newest first. Filter by chat, sender, caption substring, "
                 "type, status, or recency. status='stored' means the bytes are "
                 "on disk and exportable to the vault."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     **_filters,
                     "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
                 },
             },
-            "handler": media_recent_handler,
-        },
-        {
-            "name": "media_sync",
-            "description": (
+            handler=media_recent_handler,
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+        ).build(),
+        CustomTool(
+            name="media_sync",
+            description=(
                 "Scan WhatsApp messages for new media and auto-download the "
                 "recent window (last ~30 days) into the media store. Runs on a "
                 "schedule anyway — call this to pick up something sent minutes ago."
             ),
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": media_sync_handler,
-        },
-        {
-            "name": "media_fetch",
-            "description": (
+            input_schema={"type": "object", "properties": {}},
+            handler=media_sync_handler,
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True),
+        ).build(),
+        CustomTool(
+            name="media_fetch",
+            description=(
                 "Force-download specific media items by id, including 'expired' "
                 "or previously 'failed' ones (WhatsApp re-upload is attempted; "
                 "old items may be genuinely unrecoverable)."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "ids": {
@@ -201,24 +217,25 @@ def mcp_tools() -> list[dict[str, Any]]:
                 },
                 "required": ["ids"],
             },
-            "handler": media_fetch_handler,
-        },
-        {
-            "name": "media_export",
-            "description": (
+            handler=media_fetch_handler,
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True),
+        ).build(),
+        CustomTool(
+            name="media_export",
+            description=(
                 "Copy stored media into a vault folder with readable filenames "
                 "(HHMM-caption-slug.ext) so notes can embed them — snag evidence, "
                 "receipts, etc. Select by ids or by the media_recent filters. "
                 "Returns vault-relative paths ready for wiki-linking."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "dest_folder": {
                         "type": "string",
                         "description": (
                             "Vault-relative destination folder, e.g. "
-                            "'Attachments/Snags 2026-07-07 WindowCo'. Created if missing."
+                            "'Attachments/Snags 2026-07-07'. Created if missing."
                         ),
                     },
                     "ids": {
@@ -231,6 +248,7 @@ def mcp_tools() -> list[dict[str, Any]]:
                 },
                 "required": ["dest_folder"],
             },
-            "handler": media_export_handler,
-        },
+            handler=media_export_handler,
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=False),
+        ).build(),
     ]

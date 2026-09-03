@@ -71,61 +71,75 @@ def test_use_user_nested_does_not_bleed():
 
 
 # Validate the auth flow logic without touching the database or fastapi:
-# stub the resolve function and exercise the precedence (client_tokens > MCP token).
-def test_authenticate_request_prefers_client_token_over_legacy():
-    """Per-user bearer should win even if the same string also matches MCP token."""
+# stub the resolve function(s) and exercise precedence/fallthrough.
+#
+# V4 chunk 2.3 deleted the shared HOME_MCP_TOKEN admin fallback outright —
+# `_authenticate_request` in app/mcp/server.py now only has two real
+# resolution paths (per-user client_tokens, then OAuth access tokens), no
+# third "any bearer matching one env var" branch. These fakes are modeled
+# on that two-path shape.
+def test_authenticate_request_prefers_client_token_over_oauth():
+    """Per-user client_tokens should win if a bearer somehow resolves both."""
     fake_user = MagicMock(id=2, name="sam")
 
-    # Ad-hoc helper modeled after `_authenticate_request` in mcp/server.py.
-    def _authenticate(token, *, resolve, mcp_token):
+    def _authenticate(token, *, resolve_client, resolve_oauth):
         if not token:
             return None
-        u = resolve(token)
+        u = resolve_client(token)
         if u is not None:
             return u
-        if mcp_token and token == mcp_token:
-            return MagicMock(id=1, name="alex-admin")
-        return None
+        return resolve_oauth(token)
 
     user = _authenticate(
         "sam-token",
-        resolve=lambda t: fake_user if t == "sam-token" else None,
-        mcp_token="sam-token",  # would also match the legacy token
+        resolve_client=lambda t: fake_user if t == "sam-token" else None,
+        resolve_oauth=lambda t: MagicMock(id=99, name="should-not-win"),
     )
-    # Per-user takes precedence — the user is Sam, not the synth admin.
     assert user is fake_user
 
 
-def test_authenticate_request_falls_back_to_legacy_mcp_token():
-    def _authenticate(token, *, resolve, mcp_token):
+def test_authenticate_request_falls_back_to_oauth_token():
+    fake_oauth_user = MagicMock(id=2, name="sam")
+
+    def _authenticate(token, *, resolve_client, resolve_oauth):
         if not token:
             return None
-        u = resolve(token)
+        u = resolve_client(token)
         if u is not None:
             return u
-        if mcp_token and token == mcp_token:
-            return MagicMock(id=1, name="alex-admin")
-        return None
+        return resolve_oauth(token)
 
     user = _authenticate(
-        "legacy-admin",
-        resolve=lambda t: None,  # not in client_tokens
-        mcp_token="legacy-admin",
+        "sam-oauth-token",
+        resolve_client=lambda t: None,  # not in client_tokens
+        resolve_oauth=lambda t: fake_oauth_user if t == "sam-oauth-token" else None,
     )
-    assert user is not None
-    assert user.id == 1
+    assert user is fake_oauth_user
 
 
 def test_authenticate_request_rejects_unknown_bearer():
-    def _authenticate(token, *, resolve, mcp_token):
+    def _authenticate(token, *, resolve_client, resolve_oauth):
         if not token:
             return None
-        u = resolve(token)
+        u = resolve_client(token)
         if u is not None:
             return u
-        if mcp_token and token == mcp_token:
-            return MagicMock()
-        return None
+        return resolve_oauth(token)
 
-    assert _authenticate("garbage", resolve=lambda t: None, mcp_token="other") is None
-    assert _authenticate("", resolve=lambda t: None, mcp_token="other") is None
+    assert _authenticate(
+        "garbage", resolve_client=lambda t: None, resolve_oauth=lambda t: None,
+    ) is None
+    assert _authenticate(
+        "", resolve_client=lambda t: None, resolve_oauth=lambda t: None,
+    ) is None
+
+
+def test_home_mcp_token_setting_no_longer_exists():
+    """Explicit regression guard (V4 chunk 2.3): `settings.mcp_token` — the
+    shared-secret admin fallback's config field — must be gone entirely,
+    not merely unused. If this ever comes back, the impersonation path in
+    app/mcp/server.py could be reintroduced without anyone noticing.
+    """
+    from app.config import settings
+
+    assert not hasattr(settings, "mcp_token")

@@ -32,6 +32,24 @@ class HAEntity(Base):
     synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # ⚠️ `synced_at` above is bumped on EVERY sync (`sync.py`: `row.synced_at =
+    # now`), so it is a heartbeat and cannot tell you when an entity appeared.
+    # `first_seen_at` is written once, on insert, and never touched again.
+    #
+    # Added 2026-08-19 because entity churn was unattributable by construction.
+    # HA went from 1,573 to 1,717 entities in 24 hours and the only surviving
+    # artefact was the count — a count can never tell you *what* changed. (The
+    # cause turned out to be a Dreame robot vacuum: 289 entities, 184 of them
+    # `unavailable`, mostly per-room `select`/`number` config entities. Found by
+    # grouping the offline population by device-name token, not from stored
+    # history, which no longer existed.)
+    #
+    # Note this is only half the picture: entities removed from HA are still
+    # hard-deleted below the sync loop, so a *disappearance* leaves no trace. A
+    # churn log would fix that and is deliberately not in this change.
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
     def __repr__(self) -> str:
         return f"<HAEntity {self.entity_id}={self.state}>"

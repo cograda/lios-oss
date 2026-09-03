@@ -48,22 +48,34 @@ _stub_models.ReminderCommand = _StubReminderCommand
 _ensure_pkg("app")
 _ensure_pkg("app.integrations")
 _ensure_pkg("app.integrations.apple_reminders")
-sys.modules["app.integrations.apple_reminders.models"] = _stub_models
 
 import importlib  # noqa: E402
 
 stream_manager_mod = importlib.import_module("app.stream_manager")
 
-# Now load commands.py directly.
-_commands_path = (
-    Path(__file__).resolve().parent.parent
-    / "app" / "integrations" / "apple_reminders" / "commands.py"
-)
-_spec = importlib.util.spec_from_file_location(
-    "app.integrations.apple_reminders.commands", str(_commands_path),
-)
-commands_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(commands_mod)
+# Load commands.py directly with the stub models module in place — but only
+# for the duration of the load. Leaving the stub in sys.modules permanently
+# poisoned every later-collected test that imports the REAL models module
+# (e.g. test_system_routes → routes/system → apple_reminders.routes failed
+# with "cannot import name 'Reminder' ... (unknown location)").
+_MODELS_KEY = "app.integrations.apple_reminders.models"
+_prior_models = sys.modules.get(_MODELS_KEY)
+sys.modules[_MODELS_KEY] = _stub_models
+try:
+    _commands_path = (
+        Path(__file__).resolve().parent.parent
+        / "app" / "integrations" / "apple_reminders" / "commands.py"
+    )
+    _spec = importlib.util.spec_from_file_location(
+        "app.integrations.apple_reminders.commands", str(_commands_path),
+    )
+    commands_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(commands_mod)
+finally:
+    if _prior_models is not None:
+        sys.modules[_MODELS_KEY] = _prior_models
+    else:
+        sys.modules.pop(_MODELS_KEY, None)
 
 
 @pytest.fixture(autouse=True)
@@ -91,7 +103,12 @@ def test_dispatch_returns_queued_when_no_loop_bound(monkeypatch):
         action="add", args={"summary": "test"},
     )
 
-    assert result["ok"] is True
+    # `ok is False` since 2026-08-19. This test previously asserted `ok is True`,
+    # i.e. it encoded the bug as intended behaviour: a queued write reported as a
+    # success is indistinguishable from an applied one at the call site, which is
+    # how three reminder completions were silently lost and re-issued by hand.
+    assert result["ok"] is False
+    assert result["applied"] is False
     assert result["queued"] is True
     assert result["command_id"] == 42
     assert "loop" in result["reason"]
@@ -126,6 +143,10 @@ def test_dispatch_returns_queued_when_no_subscriber():
     assert result["queued"] is True
     assert result["command_id"] == 7
     assert "no client" in result["reason"]
+    # These two are what a mutation reverting the honesty fix trips on — the
+    # assertions above pass either way, since `queued` was always True.
+    assert result["ok"] is False
+    assert result["applied"] is False
 
 
 def test_complete_command_resolves_pending_future():

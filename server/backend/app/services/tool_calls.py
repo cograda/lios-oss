@@ -1,15 +1,21 @@
 """Best-effort persistence for the tool_calls audit trail.
 
-Written from both tool-dispatch boundaries — `app/mcp/server.py::call_tool`
-and `app/api/v1.py::call_tool` — after every call (ok, error, or timeout).
+Written from `app.plugin.dispatch.dispatch_tool` — the one chokepoint both
+transports (`app/mcp/server.py::call_tool` and `app/api/v1.py::call_tool`)
+route through — after every call (ok, error, or timeout).
 
 `record_tool_call` opens its own short-lived session via `get_db()`,
 independent of the tool handler's own session/transaction, and NEVER lets a
 persistence failure break tool dispatch: any exception here is caught and
 logged as a warning, not raised. Callers should run this off the event loop
 (`asyncio.to_thread`) since it does a blocking DB round-trip.
+
+V4 chunk 2.5: also persists `args_summary` (redacted — see
+`app.services.redaction.scrub_args`), `affected` (JSON-encoded list of
+entity refs, or None), `source_ip`, and `transport`.
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -31,6 +37,10 @@ def record_tool_call(
     status: str,
     error: str | None,
     tool_call_id: str,
+    args_summary: str | None = None,
+    affected: list[str] | None = None,
+    source_ip: str | None = None,
+    transport: str | None = None,
 ) -> None:
     """Insert one `tool_calls` row. Never raises — logs a warning on failure."""
     try:
@@ -44,6 +54,14 @@ def record_tool_call(
                 status=status,
                 error=error[:_MAX_ERROR_LEN] if error else None,
                 called_at=datetime.now(timezone.utc),
+                args_summary=args_summary,
+                affected=json.dumps(affected) if affected else None,
+                source_ip=source_ip,
+                # The column is 10 chars ("mcp"|"http"). A longer label from a
+                # script or a new transport must shorten, not lose the row —
+                # on 2026-09-02 a 21-char label dropped the audit for ~60
+                # dispatches while the calls themselves succeeded.
+                transport=transport[:10] if transport else None,
             ))
             session.commit()
     except Exception:

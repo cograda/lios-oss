@@ -34,8 +34,13 @@ class HistoricalDocument(Base):
     author: Mapped[str | None] = mapped_column(String(500), nullable=True)
     participants: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
     document_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    # The app always passes this explicitly (ingest.default_project_tags()
+    # reads the manifest config key), so the server_default is only a
+    # belt-and-braces floor for hand-written INSERTs. Was "{riverside}" — a
+    # family project name baked into the schema; existing rows keep their
+    # original tags as a contemporaneous record and are not rewritten.
     project_tags: Mapped[list[str]] = mapped_column(
-        ARRAY(String), server_default="{renovation}",
+        ARRAY(String), server_default="{household}",
     )
     body_chars: Mapped[int | None] = mapped_column(Integer, nullable=True)
     content_hash: Mapped[str] = mapped_column(String(64), index=True)

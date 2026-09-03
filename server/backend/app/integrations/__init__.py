@@ -22,41 +22,15 @@ def get(name: str) -> BaseIntegration | None:
 
 
 def register_all() -> None:
-    """Register all available integrations. Called at startup."""
-    from app.integrations.google_calendar import GoogleCalendarIntegration
-    from app.integrations.google_mail import GoogleMailIntegration
-    from app.integrations.apple_reminders import AppleRemindersIntegration
-    from app.integrations.finance import FinanceIntegration
-    from app.integrations.lastfm import LastfmIntegration
-    from app.integrations.obsidian import ObsidianIntegration
-    from app.integrations.weather import WeatherIntegration
-    from app.integrations.irish_rail import IrishRailIntegration
-    from app.integrations.whatsapp import WhatsAppIntegration
-    from app.integrations.system import SystemIntegration
-    from app.integrations.apple_health import AppleHealthIntegration
-    from app.integrations.historical_corpus import HistoricalCorpusIntegration
-    from app.integrations.attachments import AttachmentsIntegration
-    from app.integrations.coffee import CoffeeIntegration
-    from app.integrations.inbox import InboxIntegration
-    from app.integrations.homeassistant import HomeAssistantIntegration
-    from app.integrations.media import MediaIntegration
-    from app.integrations.snags import SnagsIntegration
+    """Register all available integrations. Called at startup.
 
-    register(GoogleCalendarIntegration())
-    register(GoogleMailIntegration())
-    register(AppleRemindersIntegration())
-    register(FinanceIntegration())
-    register(LastfmIntegration())
-    register(ObsidianIntegration())
-    register(WeatherIntegration())
-    register(IrishRailIntegration())
-    register(WhatsAppIntegration())
-    register(SystemIntegration())
-    register(AppleHealthIntegration())
-    register(HistoricalCorpusIntegration())
-    register(AttachmentsIntegration())
-    register(CoffeeIntegration())
-    register(InboxIntegration())
-    register(HomeAssistantIntegration())
-    register(MediaIntegration())
-    register(SnagsIntegration())
+    V4 chunk 1.2: thin wrapper over `app.plugin.discovery.discover_integrations()`,
+    which walks `app/integrations/*` on disk and instantiates each package's
+    `BaseIntegration` subclass — no more hand-maintained import+register list.
+    Adding a new integration package with a valid `manifest.py` requires zero
+    edits here.
+    """
+    from app.plugin.discovery import discover_integrations
+
+    for integration in discover_integrations():
+        register(integration)

@@ -2,7 +2,7 @@
 
 import asyncio
 
-from comar.supervisor import TaskSupervisor
+from lios_sync.supervisor import TaskSupervisor
 
 
 def _run(coro):

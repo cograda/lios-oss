@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.auth.oauth import create_auth_url, exchange_code
+from app.auth.rate_limit import is_over_limit, record_failure
 from app.auth.utils import safe_token_check
 from app.config import settings
 from app.db import get_db
@@ -18,21 +19,24 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 @router.post("/login")
 async def login(request: Request):
     """Validate UI token and set a cookie."""
+    # F8: the UI-token login endpoint is the other guessable secret on this
+    # boundary — same per-IP failure budget as the bearer paths, checked
+    # before anything else. This path doesn't go through record_auth_event,
+    # so the failed guess is recorded explicitly below.
+    client_ip = request.client.host if request.client else "unknown"
+    if is_over_limit(client_ip):
+        return JSONResponse({"error": "Too many attempts"}, status_code=429)
+
     body = await request.json()
     token = body.get("token", "")
     if not settings.ui_token:
         return {"status": "ok", "message": "Auth not configured"}
     if not safe_token_check(token, settings.ui_token):
+        record_failure(client_ip)
         return JSONResponse({"error": "Invalid token"}, status_code=401)
     response = JSONResponse({"status": "ok"})
-    # secure=True: this app has no separate "behind TLS" setting, and the
-    # documented dashboard access points (https://comar.lab via Caddy,
-    # https://<tailnet>.ts.net via Tailscale) both terminate TLS in front of
-    # this process. A browser will simply not attach this cookie on a plain
-    # http:// origin — use the Tailscale/Caddy hostname, not the raw
-    # http://SERVER_IP:8400 LAN address, when logging into the dashboard.
     response.set_cookie(
-        "ui_token", token, httponly=True, samesite="strict", secure=True, max_age=86400 * 30,
+        "ui_token", token, httponly=True, secure=True, samesite="strict", max_age=86400 * 30
     )
     return response
 
@@ -58,14 +62,17 @@ def _redirect_uri(request: Request) -> str:
 
 
 @router.get("/google/login")
-async def google_login(request: Request, account: str, user: str = "alex"):
+async def google_login(request: Request, account: str, user: str):
     """Start Google OAuth flow for a given account email.
 
-    Visit this URL in a browser to grant access. The optional `?user=` param
-    attributes the resulting token to that User row (defaults to alex for
-    back-compat). For Sam's account: `?account=sam@example.com&user=sam`.
+    Visit this URL in a browser to grant access. `?user=` is REQUIRED and
+    attributes the resulting token to that User row — there is no default.
+    A forgotten `?user=` used to silently default to "alex", which would
+    attribute a re-auth done during someone else's setup (e.g. Sam's) to
+    Alex's account instead. Every caller that builds this URL must now name
+    the user explicitly. For Sam's account: `?account=sam@gmail.com&user=sam`.
 
-    Example: /api/auth/google/login?account=alex@example.com&user=alex
+    Example: /api/auth/google/login?account=user@gmail.com&user=alex
     """
     if not settings.google_client_id:
         return {"error": "Google OAuth not configured — set HOME_GOOGLE_CLIENT_ID and HOME_GOOGLE_CLIENT_SECRET"}
@@ -100,22 +107,34 @@ async def google_callback(request: Request, code: str, state: str):
 
 @router.get("/tokens")
 async def list_tokens():
-    """List all stored tokens with expiry status (no secrets exposed)."""
+    """List all stored tokens with expiry status (no secrets exposed).
+
+    Includes `user` (the owning User's name) — `google/login` now requires
+    `?user=`, so any UI building a reconnect/reauth link from this list needs
+    the name to build a correct URL, not just the account email.
+    """
+    from app.models.users import User
+
     db = get_db()
     with db.session() as session:
-        tokens = session.query(OAuthToken).all()
+        rows = (
+            session.query(OAuthToken, User)
+            .join(User, OAuthToken.user_id == User.id)
+            .all()
+        )
         now = datetime.now(timezone.utc)
         return {
             "tokens": [
                 {
                     "provider": t.provider,
                     "account": t.account_email,
+                    "user": u.name,
                     "scopes": t.scopes,
                     "expires_at": t.expires_at.isoformat() if t.expires_at else None,
                     "expired": t.expires_at < now if t.expires_at else False,
                     "has_refresh_token": t.refresh_token is not None,
                 }
-                for t in tokens
+                for t, u in rows
             ]
         }
 
@@ -127,25 +146,31 @@ async def list_tokens():
 
 @router.get("/clients")
 async def list_clients():
-    """List client tokens for every household member (never exposes the full token value).
+    """List all client tokens (never exposes the full token value)."""
+    import json as _json
 
-    Gated only by the shared HOME_UI_TOKEN, same as the rest of the
-    dashboard (e.g. /api/dashboard/summary) — this app has no per-user
-    browser session concept, so the UI token already implies full
-    household-admin visibility everywhere else. Scoping just this route to
-    a per-user bearer would be inconsistent with that model and the
-    dashboard has no bearer to send anyway.
-    """
-    from app.models.users import User as UserModel
+    from app.models.users import User
 
     db = get_db()
     with db.session() as session:
         rows = (
-            session.query(ClientToken, UserModel)
-            .join(UserModel, ClientToken.user_id == UserModel.id)
+            session.query(ClientToken, User)
+            .join(User, ClientToken.user_id == User.id)
             .order_by(ClientToken.created_at.desc())
             .all()
         )
+
+        def _task_health(raw: str | None):
+            # F11c: surfaced to the dashboard as parsed JSON, not the raw
+            # string — malformed/legacy content shouldn't break the whole
+            # clients list, so degrade to null rather than raise.
+            if not raw:
+                return None
+            try:
+                return _json.loads(raw)
+            except (TypeError, ValueError):
+                return None
+
         return {
             "clients": [
                 {
@@ -157,7 +182,9 @@ async def list_clients():
                     "created_at": c.created_at.isoformat() if c.created_at else None,
                     "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
                     "client_version": c.client_version,
-                    "token_preview": f"{c.token[:4]}...{c.token[-4:]}",
+                    "expires_at": c.expires_at.isoformat() if c.expires_at else None,
+                    "token_preview": f"...{c.token_last4}",
+                    "task_health": _task_health(c.task_health),
                 }
                 for c, u in rows
             ]
@@ -166,14 +193,8 @@ async def list_clients():
 
 @router.post("/clients")
 async def create_client(request: Request):
-    """Create a new client token for any household member. Returns the full token value ONCE.
-
-    Gated only by the shared HOME_UI_TOKEN — see list_clients for why this
-    route doesn't add a separate per-user bearer requirement. The frontend
-    prompts for confirmation before minting a token for a user other than
-    the one currently viewing Settings, as light friction against mistakes.
-    """
-    from app.models.users import User as UserModel
+    """Create a new client token. Returns the full token value ONCE."""
+    from app.models.users import User
 
     body = await request.json()
     user_name = (body.get("user") or "").strip()
@@ -186,23 +207,34 @@ async def create_client(request: Request):
 
     db = get_db()
     with db.session() as session:
-        user_row = session.query(UserModel).filter_by(name=user_name).first()
+        user_row = session.query(User).filter_by(name=user_name).first()
         if not user_row:
             return JSONResponse(
                 {"error": f"unknown user '{user_name}' — must exist in users table"},
                 status_code=400,
             )
-        client = ClientToken(user_id=user_row.id, label=label)
+        client, plaintext = ClientToken.mint(user_id=user_row.id, label=label)
         session.add(client)
         session.commit()
         session.refresh(client)
+
+        from app.services.auth_events import record_auth_event
+
+        record_auth_event(
+            outcome="issued",
+            token_last4=client.token_last4,
+            source_ip=request.client.host if request.client else None,
+            transport="http",
+            user_id=client.user_id,
+        )
         return JSONResponse(
             {
                 "id": client.id,
                 "user": user_row.name,
                 "user_id": client.user_id,
                 "label": client.label,
-                "token": client.token,
+                "token": plaintext,
+                "expires_at": client.expires_at.isoformat() if client.expires_at else None,
                 "message": "Save this token now — it will not be shown again.",
             },
             status_code=201,
@@ -210,16 +242,24 @@ async def create_client(request: Request):
 
 
 @router.delete("/clients/{client_id}")
-async def deactivate_client(client_id: int):
-    """Deactivate a client token (soft-delete — row preserved for audit).
-
-    Gated only by the shared HOME_UI_TOKEN — see list_clients for why.
-    """
+async def deactivate_client(client_id: int, request: Request):
+    """Deactivate a client token (soft-delete — row preserved for audit)."""
     db = get_db()
     with db.session() as session:
         client = session.query(ClientToken).filter_by(id=client_id).first()
         if not client:
             return JSONResponse({"error": "Client token not found"}, status_code=404)
         client.is_active = False
+        token_last4_val, user_id = client.token_last4, client.user_id
         session.commit()
+
+        from app.services.auth_events import record_auth_event
+
+        record_auth_event(
+            outcome="revoked",
+            token_last4=token_last4_val,
+            source_ip=request.client.host if request.client else None,
+            transport="http",
+            user_id=user_id,
+        )
         return {"status": "ok", "id": client_id}

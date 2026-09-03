@@ -156,14 +156,14 @@ CSV import from supported banks (AIB, Revolut). Drop CSVs in `csv-inbox/` and us
 
 ### Obsidian Vault
 
-Mount your vault tree into the container:
+Mount your vault into the container:
 
 ```bash
 # .env
-HOME_VAULTS_HOST_PATH=/path/to/your/vaults
+HOME_OBSIDIAN_HOST_PATH=/path/to/your/vault
 ```
 
-The host path should contain a per-user subfolder for each Mac (e.g. `/path/to/your/vaults/alex/`) — `docker-compose.yml` mounts the whole tree at `/vaults` and additionally bind-mounts `<host-path>/alex/` to `/obsidian` as a back-compat alias. A watchdog process monitors for changes and re-indexes files for semantic search. The client also pushes individual file changes via `POST /api/v1/vault/push` for immediate re-indexing.
+The vault is mounted at `/obsidian` inside the container. A watchdog process monitors for changes and re-indexes files for semantic search. The client also pushes individual file changes via `POST /api/v1/vault/push` for immediate re-indexing.
 
 **Sync**: the vault is synced to the server independently (Google Drive + rclone, iCloud, Syncthing, etc.).
 
@@ -198,15 +198,15 @@ curl -X POST http://localhost:8400/api/integrations/lastfm/backfill
 
 ### Weather
 
-Uses [Open-Meteo](https://open-meteo.com/) (free, no API key). Location is set via `HOME_WEATHER_LATITUDE` / `HOME_WEATHER_LONGITUDE` in `.env`, with a sensible default baked in (Dublin: `53.3498` / `-6.2603`).
+Uses [Open-Meteo](https://open-meteo.com/) (free, no API key). Coordinates live in the integration code.
 
 ### Irish Rail
 
-Uses the [Irish Rail API](http://api.irishrail.ie/realtime/) (free, no API key). Station is set via `HOME_RAIL_STATION_CODE` / `HOME_RAIL_STATION_NAME` in `.env`, with a sensible default baked in (Malahide: `MHIDE`).
+Uses the [Irish Rail API](http://api.irishrail.ie/realtime/) (free, no API key). Station configured in the integration code.
 
 ### Coffee, Attachments, Apple Health, Historical Corpus
 
-See `server/CLAUDE.md` for the full integration table — schedules, tool counts, and data sources for all 18 integrations.
+See `server/CLAUDE.md` for the full integration table — schedules, tool counts, and data sources for all ~13 integrations.
 
 ## Architecture
 
@@ -261,9 +261,9 @@ Mechanical tools (list, search, semantic search, stats) use the declarative DSL 
 
 ```bash
 make dev              # Local: uvicorn --reload + vite dev (two terminals)
-make deploy-pull      # DEFAULT: pull pre-built GHCR images + restart (after CI push)
-make deploy-build     # Dev rsync path: build frontend + rsync + docker compose up --build
-make deploy-fast      # Dev rsync path, backend only: rsync + docker compose up --build app
+make deploy           # Full: build frontend + rsync + docker compose up --build
+make deploy-fast      # Backend only: skip frontend build
+make deploy-pull      # Pull GHCR images + restart (after CI push)
 make server-logs      # Tail app container logs
 make server-status    # Show container status
 make server-restart   # Restart app container
@@ -273,16 +273,16 @@ make server-init      # First-time: create dir on server, copy .env template
 
 ### How deploy works
 
-**CI deploy** (`make deploy-pull` — the default):
-1. Push to `main` triggers GitHub Actions
-2. CI builds frontend, client wheel, and Docker images
-3. Pushes to GHCR (`ghcr.io/cograda/comar-oss-app`, `ghcr.io/cograda/comar-oss-whatsapp`)
-4. Run `make deploy-pull` on the server to pull and restart
-
-**Dev rsync deploy** (`make deploy-build`, or `deploy-fast` for backend-only) — use only to test uncommitted changes on the box without going through CI:
-1. Builds the React frontend (`npm run build`) — skipped by `deploy-fast`
+**rsync deploy** (`make deploy`):
+1. Builds the React frontend (`npm run build`)
 2. Rsyncs project files to the server
 3. SSH → `docker compose up -d --build`
+
+**CI deploy** (`make deploy-pull`):
+1. Push to `main` triggers GitHub Actions
+2. CI builds frontend, client wheel, and Docker images
+3. Pushes to GHCR (`ghcr.io/cograda/lios-core`, `ghcr.io/cograda/lios-whatsapp`)
+4. Run `make deploy-pull` on the server to pull and restart
 
 ### Reverse proxy
 
@@ -314,13 +314,10 @@ All prefixed `HOME_`. See `.env.example` for the full template.
 | `HOME_LASTFM_API_KEY` | For Last.fm | Last.fm API key |
 | `HOME_LASTFM_USERNAME` | For Last.fm | Last.fm username |
 | `HOME_OBSIDIAN_VAULT_PATH` | For vault | Path inside container (default `/obsidian`) |
-| `HOME_VAULTS_HOST_PATH` | Docker | Host path to the vault tree (should contain a per-user subfolder, e.g. `<host-path>/alex/`) |
+| `HOME_OBSIDIAN_HOST_PATH` | Docker | Host path to vault |
 | `HOME_ANTHROPIC_API_KEY` | For backlog sync | Anthropic API key (Haiku task matching) |
 | `HOME_WA_SYNC_HISTORY` | No | `true` for one-time WhatsApp backfill |
 | `HOME_OAUTH_ENCRYPTION_KEY` | Recommended | Fernet key for OAuth token encryption at rest |
-| `HOME_WEATHER_LATITUDE` / `HOME_WEATHER_LONGITUDE` | No | Weather forecast location (default: Dublin) |
-| `HOME_RAIL_STATION_CODE` / `HOME_RAIL_STATION_NAME` | No | Irish Rail home station (default: Malahide) |
-| `HOME_TRANSFER_MATCH_NAMES` | No | Comma-separated account-holder names for internal transfer detection |
 
 ## Web dashboard
 
@@ -371,8 +368,10 @@ python -m pytest tests/ -v
 
 ### coglib dependency
 
-The server uses `coglib` (shared config, DB, logging), vendored in `server/coglib/`. If you maintain coglib in a separate upstream repo, refresh the vendored copy with:
+The server uses `coglib` (shared config, DB, logging, LLM calls) from `lios/libs/coglib` — the one copy, in this same repo. It is **not vendored** (the `server/coglib/` copy was removed 2026-09-02, once upstream and consumer shared a commit). Locally, install it editable into the backend venv:
 
 ```bash
-make refresh-coglib
+cd backend && .venv/bin/pip install -e ../../../libs/coglib
 ```
+
+For Docker, whose build context is `core/server` and cannot see `../../libs`, `make stage-libs` copies it into the gitignored `.libs/` directory immediately before the build (`make build`, `make docker-up` and `make deploy-fast` depend on it; CI runs it before the image push).

@@ -1,4 +1,13 @@
-"""Sync logic: poll Gmail API → upsert message metadata into Postgres."""
+"""Sync logic: poll Gmail API → upsert message metadata into Postgres.
+
+`pull_mail`/`store_mail` are the `SourceIntegration.pull()`/`.store()` pair
+(V4 chunk 4.3, batch C) — the pre-4.3 `sync_mail()` collapsed fetch and
+persist into one function; this splits it the same way google_calendar's
+4.1 conversion did. `sync_mail()` had exactly one caller
+(`GoogleMailIntegration.sync()`'s per-account fan-out closure), which now
+calls `pull_mail`/`store_mail` directly, so the combined function is removed
+rather than kept as a redundant wrapper.
+"""
 
 import json
 import logging
@@ -13,6 +22,7 @@ from app.integrations.google_mail.client import (
     list_messages,
 )
 from app.integrations.google_mail.models import MailMessage
+from app.plugin.bases import PullResult
 
 logger = logging.getLogger(__name__)
 
@@ -20,33 +30,44 @@ logger = logging.getLogger(__name__)
 COMMIT_BATCH = 500
 
 
-def sync_mail(
+def pull_mail(
     account_email: str,
     session: Session,
     *,
     user_id: int,
     max_results: int = 500,
-) -> int:
-    """Fetch recent INBOX messages and upsert metadata into the DB.
-
-    For regular scheduled sync. Fetches latest messages and updates
-    read/starred/label status on existing ones. user_id comes from the
-    OAuthToken row that owns this account_email.
-
-    Returns the number of messages synced.
-    """
+) -> PullResult:
+    """Fetch recent INBOX message metadata for one account. No DB writes —
+    see `store_mail`. `user_id` is stamped onto each record (`store()`'s
+    `SourceIntegration` signature only receives `records`, not the account
+    itself, so the owning user has to travel with the row — same reasoning
+    as `account_email` already being a `_parse_message` field)."""
     messages = list_messages(
         account_email, session,
         user_id=user_id, label_ids=["INBOX"], max_results=max_results,
     )
     if not messages:
         logger.info(f"No messages found for {account_email}")
-        return 0
+        return PullResult(records=[])
+    for m in messages:
+        m["user_id"] = user_id
+    return PullResult(records=messages)
 
-    synced = _upsert_messages(messages, account_email, session, user_id=user_id)
+
+def store_mail(session: Session, records: list[dict]) -> int:
+    """Upsert `records` (one account's fetched message metadata, each
+    carrying its own `account_email`/`user_id`) and commit. Returns the
+    number of messages persisted."""
+    if not records:
+        return 0
+    account_email = records[0]["account_email"]
+    user_id = records[0]["user_id"]
+    synced = _upsert_messages(records, account_email, session, user_id=user_id)
     session.commit()
     logger.info(f"Synced {synced} messages for {account_email}")
     return synced
+
+
 
 
 def backfill_mail(
@@ -252,17 +273,21 @@ def embed_messages(session: Session, batch_size: int = 200) -> int:
             # Build chunk texts and enqueue
             for msg in batch:
                 body = bodies.get(msg.google_message_id, msg.snippet or "")
-                if len(body) > 4000:
-                    body = body[:4000]
-
                 date_str = msg.date.strftime("%Y-%m-%d %H:%M") if msg.date else ""
-                chunk = (
-                    f"From: {msg.sender or 'unknown'}\n"
-                    f"To: {msg.to or ''}\n"
-                    f"Subject: {msg.subject or '(no subject)'}\n"
-                    f"Date: {date_str}\n\n"
-                    f"{body}"
-                )
+
+                # Subject as bare text + body, and nothing else. Measured
+                # 2026-08-05 on 2,000 messages against the gemini reference
+                # space: dropping the subject costs -34.4% on 10-NN agreement
+                # (it is the highest-signal line in a mail), while the old
+                # `From:/To:/Subject:/Date:` header block was worth -4.0%
+                # versus this shape — sender/recipient/date are metadata, and
+                # they're already in metadata_json below for filtering.
+                #
+                # No truncation here on purpose: EmbeddingService.enqueue()
+                # cleans first and caps after. Truncating a raw HTML body at
+                # 4000 chars, as this did, routinely kept `<style>` blocks and
+                # threw the prose away.
+                chunk = f"{msg.subject or ''}\n\n{body}".strip()
 
                 metadata = json.dumps({
                     "account": msg.account_email,

@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from comar.config import ClientConfig, load_config, CONFIG_FILE
+from lios_sync.config import ClientConfig, load_config, CONFIG_FILE
 
 
 class TestConfigDefaults:
@@ -23,7 +23,7 @@ class TestConfigDefaults:
 
 class TestConfigLoading:
     def test_load_missing_file_returns_defaults(self):
-        with patch("comar.config.CONFIG_FILE", Path("/nonexistent/config.toml")):
+        with patch("lios_sync.config.CONFIG_FILE", Path("/nonexistent/config.toml")):
             config = load_config()
             assert config.user == ""
             assert config.auto_update is True
@@ -42,7 +42,7 @@ token = "test-token"
 [vault]
 path = "/tmp/vault"
 """)
-        with patch("comar.config.CONFIG_FILE", config_file):
+        with patch("lios_sync.config.CONFIG_FILE", config_file):
             config = load_config()
             assert config.user == "alex"
             assert config.auto_update is False
@@ -59,7 +59,7 @@ token = "abc"
 [vault]
 path = "/tmp/vault"
 """)
-        with patch("comar.config.CONFIG_FILE", config_file):
+        with patch("lios_sync.config.CONFIG_FILE", config_file):
             config = load_config()
             assert config.auto_update is True
 
@@ -73,7 +73,7 @@ user = "alex"
 url = "10.0.0.1:9999"
 token = "secret"
 """)
-        with patch("comar.config.CONFIG_FILE", config_file):
+        with patch("lios_sync.config.CONFIG_FILE", config_file):
             config = load_config()
             assert config.server.urls == ["10.0.0.1:9999"]
             assert config.server.url == "10.0.0.1:9999"
@@ -82,7 +82,7 @@ token = "secret"
     def test_load_config_default_reminders_section(self, tmp_path):
         config_file = tmp_path / "config.toml"
         config_file.write_text('user = "alex"\n')
-        with patch("comar.config.CONFIG_FILE", config_file):
+        with patch("lios_sync.config.CONFIG_FILE", config_file):
             config = load_config()
             assert config.reminders.source_emails == {}
 
@@ -95,7 +95,7 @@ user = "alex"
 "AAAA-1111-2222-3333" = "alex@example.com"
 "BBBB-4444-5555-6666" = "alex.work@example.com"
 """)
-        with patch("comar.config.CONFIG_FILE", config_file):
+        with patch("lios_sync.config.CONFIG_FILE", config_file):
             config = load_config()
             assert config.reminders.source_emails == {
                 "AAAA-1111-2222-3333": "alex@example.com",
@@ -109,11 +109,11 @@ user = "alex"
 user = "alex"
 
 [server]
-urls = ["192.168.1.50:9444", "100.64.0.1:9444"]
+urls = ["192.168.1.50:9444", "100.82.221.91:9444"]
 token = "secret"
 """)
-        with patch("comar.config.CONFIG_FILE", config_file):
+        with patch("lios_sync.config.CONFIG_FILE", config_file):
             config = load_config()
-            assert config.server.urls == ["192.168.1.50:9444", "100.64.0.1:9444"]
+            assert config.server.urls == ["192.168.1.50:9444", "100.82.221.91:9444"]
             assert config.server.url == "192.168.1.50:9444"
             assert config.server.token == "secret"

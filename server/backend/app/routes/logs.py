@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from app.db import get_db
 from app.models.clients import ClientLog
 from app.models.users import User
+from app.services.text import ILIKE_ESCAPE_CHAR, escape_ilike
 
 router = APIRouter(prefix="/logs", tags=["logs"])
 
@@ -57,7 +58,9 @@ async def query_logs(
             levels = [l.strip().upper() for l in level.split(",")]
             q = q.filter(ClientLog.level.in_(levels))
         if search:
-            q = q.filter(ClientLog.message.ilike(f"%{search}%"))
+            q = q.filter(
+                ClientLog.message.ilike(f"%{escape_ilike(search)}%", escape=ILIKE_ESCAPE_CHAR)
+            )
         if before:
             from datetime import datetime, timezone
             try:

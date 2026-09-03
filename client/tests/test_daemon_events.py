@@ -7,24 +7,11 @@ points run via asyncio.run() so no pytest async plugin is needed.
 
 import asyncio
 
-from comar.daemon import (
+from lios_sync.daemon import (
     _handle_eventkit_command,
     _handle_server_event,
     _next_event,
 )
-
-
-class StubPromptStore:
-    def __init__(self, local_hash="aaa"):
-        self.local_hash = local_hash
-        self.synced_with = None
-
-    def prompt_set_hash(self):
-        return self.local_hash
-
-    def sync_from_server(self, prompts):
-        self.synced_with = prompts
-        return len(prompts)
 
 
 class StubServerClient:
@@ -59,10 +46,9 @@ class StubReminderStore:
         return self.complete_ok
 
 
-def _run(event, prompt_store=None, server_client=None, reminder_store=None):
+def _run(event, server_client=None, reminder_store=None):
     asyncio.run(_handle_server_event(
         event,
-        prompt_store or StubPromptStore(),
         server_client or StubServerClient(),
         reminder_store,
     ))
@@ -86,30 +72,13 @@ def test_next_event_pulls_in_order():
 # prompt_update / hello / unknown
 # ---------------------------------------------------------------------------
 
-def test_prompt_update_with_new_hash_syncs():
-    store = StubPromptStore(local_hash="old")
-    client = StubServerClient(prompts=[{"name": "p1"}])
-
-    _run({"type": "prompt_update", "prompt_set_hash": "new"}, store, client)
-
-    assert store.synced_with == [{"name": "p1"}]
-
-
-def test_prompt_update_with_same_hash_is_noop():
-    store = StubPromptStore(local_hash="same")
-    _run({"type": "prompt_update", "prompt_set_hash": "same"}, store)
-    assert store.synced_with is None
-
-
-def test_prompt_sync_failure_does_not_propagate():
-    store = StubPromptStore(local_hash="old")
-
-    class ExplodingClient(StubServerClient):
-        def list_prompts(self):
-            raise ConnectionError("down")
-
-    _run({"type": "prompt_update", "prompt_set_hash": "new"}, store, ExplodingClient())
-    assert store.synced_with is None  # failed quietly, loop survives
+def test_prompt_update_is_noop():
+    """Phase 4 (2026-07-14): prompt mirroring retired along with the local
+    MCP app. The server may still emit prompt_update events; the daemon
+    just logs and ignores them."""
+    client = StubServerClient()
+    _run({"type": "prompt_update", "prompt_set_hash": "new"}, client)
+    assert client.acks == []
 
 
 def test_hello_and_unknown_events_are_noops():

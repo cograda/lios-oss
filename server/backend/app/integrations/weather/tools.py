@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.integrations.weather.models import WeatherCurrent, WeatherForecast
+from app.tools import CustomTool, ToolAnnotations
 
 logger = logging.getLogger(__name__)
 
@@ -136,37 +137,38 @@ def handle_forecast(session: Session, arguments: dict[str, Any]) -> str:
 def get_mcp_tools() -> list[dict]:
     """Return MCP tool definitions with handler functions."""
     return [
-        {
-            "name": "weather_current",
-            "description": (
-                "Current weather conditions at the configured home location "
-                "(e.g. Malahide, Co. Dublin). "
+        CustomTool(
+            name="weather_current",
+            description=(
+                "Current weather conditions at the configured location. "
                 "Returns temperature, feels-like, humidity, wind, cloud cover, "
                 "precipitation, and a human-readable description. "
                 "Includes today's sunrise/sunset and high/low."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {},
             },
-            "handler": handle_current,
-            "category": "home",
-            "examples": [
+            handler=handle_current,
+            annotations=ToolAnnotations(
+                read_only_hint=True, idempotent_hint=True, open_world_hint=True,
+            ),
+            category="home",
+            examples=[
                 "What's the weather like?",
                 "Is it raining?",
                 "What temperature is it?",
             ],
-        },
-        {
-            "name": "weather_forecast",
-            "description": (
-                "7-day weather forecast for the configured home location "
-                "(e.g. Malahide, Co. Dublin). "
+        ).build(),
+        CustomTool(
+            name="weather_forecast",
+            description=(
+                "7-day weather forecast for the configured location. "
                 "Returns daily high/low temperatures, precipitation, wind, "
                 "sunrise/sunset, and weather description. "
                 "Use this to plan ahead for the week."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "days": {
@@ -176,12 +178,15 @@ def get_mcp_tools() -> list[dict]:
                     },
                 },
             },
-            "handler": handle_forecast,
-            "category": "home",
-            "examples": [
+            handler=handle_forecast,
+            annotations=ToolAnnotations(
+                read_only_hint=True, idempotent_hint=True, open_world_hint=True,
+            ),
+            category="home",
+            examples=[
                 "What's the weather this week?",
                 "Will it rain tomorrow?",
                 "Weekend weather forecast",
             ],
-        },
+        ).build(),
     ]

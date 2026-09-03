@@ -60,45 +60,37 @@ async def lifespan(app: FastAPI):
     # container restarting and the failure being visible).
     get_db()
     register_all()
+
+    # V4 chunk 1.1: fail loud at boot if any integration's manifest is
+    # missing or inconsistent (bad model name, schedule drift, unknown/
+    # cyclic depends_on, duplicate tool name). Pure declaration for now —
+    # nothing else consumes these manifests yet.
+    from app.plugin.validate import discover_manifests, validate_manifests
+    from app.integrations import get_all as get_all_integrations
+    validate_manifests(discover_manifests(), get_all_integrations())
+
     register_mcp_tools()
     setup_scheduler()
-
-    if not settings.oauth_encryption_key:
-        logger.warning(
-            "HOME_OAUTH_ENCRYPTION_KEY is not set — OAuth tokens (Google "
-            "Calendar/Gmail) will be stored in PLAINTEXT. Set "
-            "HOME_OAUTH_ENCRYPTION_KEY to enable encryption at rest."
-        )
 
     # Capture the running loop so sync tool handlers (in asyncio.to_thread)
     # can publish SSE events back onto it via run_coroutine_threadsafe.
     from app.stream_manager import stream_manager
     stream_manager.loop = asyncio.get_running_loop()
 
-    # Start server-side vault watcher (catches Google Drive / rclone changes)
-    vault_observer = None
-    if settings.obsidian_vault_path:
-        from app.integrations.obsidian.watcher import start_vault_watcher
-        vault_observer = start_vault_watcher(settings.obsidian_vault_path)
-
-    # Home Assistant WebSocket event listener (real-time state history;
-    # the scheduled poll doubles as reconciliation)
-    ha_listener = None
-    if settings.ha_url and settings.ha_token:
-        from app.integrations.homeassistant import events as ha_events
-        ha_listener = ha_events.HAEventListener()
-        ha_events.current_listener = ha_listener
-        ha_listener.start()
+    # Startup-kind background tasks, manifest-driven (V4 chunk 3.1): the
+    # obsidian vault watcher and the Home Assistant WebSocket listener used
+    # to be started here by name. Now every manifest's `background_tasks`
+    # entries with kind="startup" are discovered, supervised (restart with
+    # backoff on crash — see app.plugin.supervisor), and started as one
+    # asyncio.Task each — this file never imports an integration package.
+    from app.plugin.startup_tasks import start_all, stop_all
+    startup_tasks, startup_stop_event = start_all()
 
     # Streamable HTTP MCP transport — task group must run for the app's lifetime.
     async with mcp_lifespan():
         yield
 
-    if ha_listener:
-        await ha_listener.stop()
-    if vault_observer:
-        vault_observer.stop()
-        vault_observer.join(timeout=5)
+    await stop_all(startup_tasks, startup_stop_event)
     scheduler.shutdown(wait=False)
     logger.info("Shutdown complete")
 
@@ -124,6 +116,21 @@ AUTH_EXEMPT = {
     "/api/auth/google/callback",
     "/api/auth/login",
     "/api/auth/check",
+    # An OAuth provider redirects the BROWSER back here, and `ui_token` is set
+    # SameSite=Strict — so it is not sent on that cross-site navigation and the
+    # callback would 401, losing a grant the user had just approved. Hence the
+    # google callback above, and hence this one.
+    #
+    # Exempt from the UI token, NOT unauthenticated: both callbacks verify an
+    # HMAC-signed `state` (strava's additionally expires after 10 minutes), so
+    # a forged callback cannot attach a token to someone else's user row.
+    #
+    # ⚠️ This is the one place an integration cannot be dropped in without a
+    # kernel edit. `MANIFEST.routes` mounts a router, but nothing in the
+    # manifest can declare "this route authenticates itself", so a third-party
+    # OAuth callback has to be named here by hand. Worth a `public_routes`
+    # manifest field if a third provider ever appears.
+    "/api/strava/callback",
 }
 # Prefix exemptions — routes under these prefixes handle their own auth
 AUTH_EXEMPT_PREFIXES = ("/api/reminders/", "/api/client/", "/api/health/", "/api/inbox/", "/api/v1/", "/api/install/")
@@ -133,28 +140,42 @@ AUTH_EXEMPT_PREFIXES = ("/api/reminders/", "/api/client/", "/api/health/", "/api
 async def check_ui_auth(request: Request, call_next):
     """Gate API routes behind a simple token check (cookie or header).
 
-    Fails CLOSED: an unset HOME_UI_TOKEN is a misconfiguration, not an
-    invitation to skip auth. Every non-exempt /api/* route is rejected until
-    the token is configured — it must never fall through to call_next()
-    unauthenticated just because settings.ui_token happens to be "".
+    Fails CLOSED: an unset/empty `HOME_UI_TOKEN` used to fall straight
+    through (the `and settings.ui_token` clause short-circuited the whole
+    gate), leaving every UI-token-gated `/api/*` route — including
+    `DELETE /api/data/purge/{integration}` — unauthenticated on a
+    misconfigured deploy. Now a gated route with no configured token is
+    rejected outright rather than treated as "auth not required".
     """
     path = request.url.path
     # Only protect /api/ routes (not static files, MCP, or exempt paths)
     if path.startswith("/api/") and path not in AUTH_EXEMPT and not any(path.startswith(p) for p in AUTH_EXEMPT_PREFIXES):
         if not settings.ui_token:
-            logger.error(
-                "HOME_UI_TOKEN is not set — refusing %s (fail-closed). "
-                "Set HOME_UI_TOKEN in .env to enable the dashboard.",
-                path,
-            )
             return JSONResponse(
-                {"error": "Server misconfigured: HOME_UI_TOKEN is not set"},
-                status_code=500,
+                {"error": "Service unavailable", "detail": "HOME_UI_TOKEN not configured"},
+                status_code=503,
             )
         token = request.cookies.get("ui_token") or request.headers.get("X-UI-Token")
         if not safe_token_check(token, settings.ui_token):
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return await call_next(request)
+
+
+@app.middleware("http")
+async def api_security_headers(request: Request, call_next):
+    """Small, blanket hardening for every `/api/*` response (V4 chunk 2.5).
+
+    8400 is plaintext-by-design, LAN/Tailscale-only (see server/CLAUDE.md's
+    transport-stance note) — these headers aren't about that; they're just
+    good hygiene that costs nothing: stop browsers from MIME-sniffing
+    responses into something executable, and stop any intermediate cache
+    from persisting API responses (some of which carry bearer-adjacent data).
+    """
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 # API routes

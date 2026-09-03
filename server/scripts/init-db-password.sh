@@ -10,7 +10,7 @@
 #     -c "ALTER USER homeservices WITH PASSWORD '${HOME_DB_PASSWORD}'"
 #
 #   # Option 2: run this script (reads from .env)
-#   cd ~/comar-server && bash scripts/init-db-password.sh
+#   cd ~/lios-core && bash scripts/init-db-password.sh
 #
 # Idempotent — safe to run repeatedly.
 

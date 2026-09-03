@@ -1,7 +1,7 @@
-.PHONY: dev build deploy-pull deploy-build deploy-fast deploy-local docker-up docker-down docker-logs init-certs refresh-coglib db-migrate db-upgrade db-downgrade db-history db-current
+.PHONY: dev build stage-libs deploy-pull deploy-build deploy-fast deploy-local docker-up docker-down docker-logs db-migrate db-upgrade db-downgrade db-history db-current
 
-DEPLOY_HOST = ubuntu    # your server's SSH alias
-DEPLOY_DIR = ~/comar-server
+DEPLOY_HOST = ubuntu
+DEPLOY_DIR = ~/lios-core
 SERVER_IP ?= 127.0.0.1
 
 # ── Database migrations (Alembic) ─────────────────────────
@@ -38,38 +38,12 @@ dev:
 	cd frontend && npm run dev
 
 # Build frontend for production
-build:
+build: stage-libs
 	cd frontend && npm run build
-
-# ── TLS certificate generation ─────────────────────────────
-
-# Generate self-signed CA + server cert for gRPC and nginx TLS.
-# Run once on the server, then distribute ca.crt to clients.
-init-certs:
-	@mkdir -p certs
-	@echo "Generating CA key and cert..."
-	openssl genrsa -out certs/ca.key 4096
-	openssl req -new -x509 -key certs/ca.key -sha256 \
-		-subj "/CN=Comar CA" -days 3650 -out certs/ca.crt
-	@echo "Generating server key and CSR..."
-	openssl genrsa -out certs/server.key 2048
-	openssl req -new -key certs/server.key \
-		-subj "/CN=comar-server" -out certs/server.csr
-	@echo "Signing server cert with CA..."
-	openssl x509 -req -in certs/server.csr \
-		-CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial \
-		-extfile <(printf "subjectAltName=IP:$(SERVER_IP),DNS:localhost") \
-		-days 3650 -sha256 -out certs/server.crt
-	@rm -f certs/server.csr certs/ca.srl
-	@echo ""
-	@echo "Certs generated in certs/:"
-	@echo "  ca.crt      — distribute to clients (comar setup)"
-	@echo "  server.crt  — server certificate"
-	@echo "  server.key  — server private key (keep secret)"
 
 # ── Local Docker (for testing) ─────────────────────────────
 
-docker-up:
+docker-up: stage-libs
 	docker compose up -d
 
 docker-down:
@@ -91,23 +65,44 @@ sync:
 		--exclude='certs' \
 		. $(DEPLOY_HOST):$(DEPLOY_DIR)/
 
-# Refresh vendored coglib from the upstream monorepo (run manually when coglib changes)
-# Also stamps coglib/.vendored-commit with the upstream HEAD sha + ISO date,
-# so CI can warn (never fail) if the vendored copy looks stale.
-COGLIB_SRC ?= $(HOME)/Desktop/Code/coglib-monorepo
-refresh-coglib:
-	rsync -avz --delete \
-		--exclude='__pycache__' \
-		--exclude='.git' \
-		--exclude='*.egg-info' \
-		--exclude='tests' \
-		$(COGLIB_SRC)/coglib/ coglib/
-	@{ \
-		sha=$$(git -C $(COGLIB_SRC) rev-parse HEAD); \
-		date=$$(date -u +%Y-%m-%dT%H:%M:%SZ); \
-		printf '%s\n%s\n' "$$sha" "$$date" > coglib/.vendored-commit; \
-		echo "Stamped coglib/.vendored-commit: $$sha @ $$date"; \
-	}
+# ── coglib: staged at build time, never copied into git ─────────────
+#
+# Until 2026-09-02 coglib was VENDORED here: `make refresh-coglib` rsynced
+# lios/libs/coglib into server/coglib/, stamped it, and a test + a CI step
+# checked the copy against its stamp. That loop existed because coglib lived in
+# a different repo (alexunism) and could drift between commits. It cannot any
+# more: coglib and its consumer are in the same repo and the same commit, so
+# the vendored tree was a copy of itself — the exact second editable copy the
+# monorepo exists to eliminate.
+#
+# The Docker build context is `core/server` (widening it to the repo root
+# would put the gitignored vault inside every build context — see
+# .github/workflows/core-deploy.yml), so the Dockerfile cannot reach
+# ../../libs. `stage-libs` copies coglib into the gitignored .libs/ directory
+# immediately before a build, the same pattern apps/dashboard uses for
+# libs/ha. Nothing under .libs/ is ever committed.
+#
+# COGLIB_SRC resolves to lios/libs/coglib. The fallback to ./coglib exists for
+# ONE consumer: the public comar-oss release, where prepare-release.sh lays a
+# copy of libs/coglib at server/coglib/ because that repo has no libs/ above
+# it. Inside lios neither path being present is a hard error, not a skip — an
+# absent sibling directory means the path is wrong, and skipping would report
+# success for a build that has no coglib in it.
+LIOS_ROOT := $(shell git rev-parse --show-toplevel)
+COGLIB_SRC ?= $(if $(wildcard $(LIOS_ROOT)/libs/coglib/src/coglib),$(LIOS_ROOT)/libs/coglib,./coglib)
+stage-libs:
+	@if [ ! -d "$(COGLIB_SRC)/src/coglib" ]; then \
+		echo "stage-libs: FAILED — no coglib source at $(COGLIB_SRC)." >&2; \
+		echo "  Expected lios/libs/coglib (or ./coglib in a comar-oss checkout)." >&2; \
+		echo "  This is a hard error: an image built without coglib would not start." >&2; \
+		exit 1; \
+	fi
+	rm -rf .libs
+	mkdir -p .libs/coglib
+	rsync -a --exclude tests --exclude '__pycache__' --exclude '*.egg-info' \
+		--exclude '.pytest_cache' --exclude '.mypy_cache' --exclude '.ruff_cache' \
+		"$(COGLIB_SRC)/" .libs/coglib/
+	@echo "stage-libs: coglib staged from $(COGLIB_SRC) into .libs/coglib"
 
 # ── Which deploy target to use ─────────────────────────────
 # deploy-pull   DEFAULT (root `make deploy` points here). Pulls the pre-built
@@ -121,15 +116,23 @@ refresh-coglib:
 #               uncommitted changes.
 
 # Deploy using pre-built GHCR images (after CI pushes them) — preferred path
+# ⚠️ The prune is not housekeeping. Every deploy pulls two images tagged
+# :latest AND :<sha>, so the previous ones stay tagged and are never dangling;
+# seven deploys on 2026-09-02 took the 61 GB host to 100 % and Postgres
+# PANICked mid-checkpoint ("No space left on device") and crash-looped in
+# recovery until images were pruned. `-a` removes every image no running
+# container uses; `until=24h` keeps the most recent previous images, so the
+# usual same-day rollback is still local. Anything older is re-pullable from
+# GHCR by its :<sha> tag — the rollback path is the registry, not the disk.
 deploy-pull:
-	ssh $(DEPLOY_HOST) "cd $(DEPLOY_DIR) && docker compose pull && docker compose up -d"
+	ssh $(DEPLOY_HOST) "cd $(DEPLOY_DIR) && docker compose pull && docker compose up -d && docker image prune -af --filter until=24h | tail -1 && df -h / | tail -1"
 
 # Dev rsync deploy: build frontend, sync everything, rebuild + restart on server
 deploy-build: build sync
 	ssh $(DEPLOY_HOST) "cd $(DEPLOY_DIR) && docker compose up -d --build"
 
 # Dev rsync deploy without rebuilding frontend (backend-only changes)
-deploy-fast: sync
+deploy-fast: stage-libs sync
 	ssh $(DEPLOY_HOST) "cd $(DEPLOY_DIR) && docker compose up -d --build app"
 
 # View logs on home server

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from app.integrations.apple_reminders.commands import dispatch_command
 from app.integrations.apple_reminders.models import Reminder, ReminderCommand
 
 logger = logging.getLogger(__name__)
@@ -218,13 +219,74 @@ def match_tasks_local(
 # ─── Sync engine ───
 
 
-def sync_backlogs(session: Session, vault_path: str) -> dict:
-    """Two-way sync between vault backlogs and Apple Reminders.
+def _vault_push_enabled() -> bool:
+    """Whether the vault→Reminders direction should actually write.
+
+    Default off. It was effectively off for five months anyway (rows were
+    created and never dispatched), so defaulting it on would turn a silent
+    no-op into a surprise write of one reminder per unmatched backlog task on
+    the very next 30-minute tick. Opt in deliberately, watch what lands.
+    """
+    from app.plugin.config_store import plugin_config
+
+    try:
+        return bool(plugin_config("apple_reminders").reminders_push_vault_to_reminders)
+    except Exception:  # noqa: BLE001
+        # A config read failure must not turn the write path on.
+        logger.exception("could not read reminders_push_vault_to_reminders; treating as off")
+        return False
+
+
+def _already_queued(session: Session, *, user_id: int, summary: str) -> bool:
+    r"""Whether an equivalent `add` is already queued for this user.
+
+    Compares the **decoded** `summary` field, never a substring of the stored
+    JSON. The previous `payload.contains(task.text[:50])` could not match its
+    own output: `json.dumps` escapes `"` to `\"` and non-ASCII to `\uXXXX`, so
+    any task with a quote or an em-dash failed to find itself and was re-queued
+    every run. That single line produced ~3,300 rows a day.
+
+    Compares full text rather than a 50-character prefix, too — two backlog
+    tasks sharing an opening phrase are different tasks, and the prefix test
+    would have silently dropped the second.
+    """
+    rows = (
+        session.query(ReminderCommand.payload)
+        .filter(
+            ReminderCommand.user_id == user_id,
+            ReminderCommand.action == "add",
+            ReminderCommand.status == "pending",
+        )
+        .all()
+    )
+    for (payload,) in rows:
+        if not payload:
+            continue
+        try:
+            if json.loads(payload).get("args", {}).get("summary") == summary:
+                return True
+            # dispatch_command nests under "args"; rows written by the older
+            # direct-insert path stored the fields flat. Accept both so the
+            # guard still recognises pre-existing rows.
+            if json.loads(payload).get("summary") == summary:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def sync_backlogs(session: Session, vault_path: str, user_id: int) -> dict:
+    """Two-way sync between one user's vault backlogs and their Apple Reminders.
 
     1. Parse vault backlogs
     2. Match against Reminders in DB (local fuzzy matching, no API key needed)
     3. Vault → Reminders: new backlog tasks → queue add commands
     4. Reminders → Vault: completed reminders → mark done in backlog
+
+    Scoped to `user_id` throughout (sam-rollout A3, 2026-07-26) — every
+    user has their own vault and their own reminders, so the caller loops
+    over users and calls this once per user rather than this function
+    fanning out itself.
 
     Returns sync stats.
     """
@@ -232,7 +294,29 @@ def sync_backlogs(session: Session, vault_path: str) -> dict:
     if not vp.is_dir():
         return {"error": "Vault path not found"}
 
-    stats = {"matched": 0, "new_to_reminders": 0, "completed_in_vault": 0, "errors": 0}
+    # `dispatch_command` targets the SSE stream by user *name*, not id (see
+    # stream_manager.publish's `target_user`), so resolve it once here rather
+    # than per task. Resolved even when the push direction is disabled, so a
+    # missing user row fails loudly at the start instead of on first write.
+    from app.models.users import User
+
+    user_row = session.get(User, user_id)
+    if user_row is None:
+        return {"error": f"No user row for user_id={user_id}"}
+    user_name = user_row.name
+
+    stats = {
+        "matched": 0,
+        "new_to_reminders": 0,
+        "completed_in_vault": 0,
+        "errors": 0,
+        # Vault tasks with no matching reminder that were *not* pushed, because
+        # the vault→Reminders direction is off. Reported so "sync ran, nothing
+        # happened" and "sync ran, this direction is disabled" are different
+        # readings at a glance.
+        "vault_only_not_pushed": 0,
+        "queued_not_applied": 0,
+    }
 
     for backlog_file, list_name in BACKLOG_TO_LIST.items():
         backlog_path = vp / backlog_file
@@ -247,12 +331,12 @@ def sync_backlogs(session: Session, vault_path: str) -> dict:
             stats["errors"] += 1
             continue
 
-        # Get reminders for this list. Backlog sync runs outside an MCP
-        # request context, so we hardcode Alex (user_id=1) — the vault is
-        # single-user and all lists feed the one unified backlog.
+        # Get reminders for this list, scoped to the user whose vault this
+        # backlog belongs to (sam-rollout A3 — one pass per user, see
+        # run_scheduled_sync below).
         reminders = (
             session.query(Reminder)
-            .filter(Reminder.user_id == 1, Reminder.list_name == list_name)
+            .filter(Reminder.user_id == user_id, Reminder.list_name == list_name)
             .all()
         )
 
@@ -265,22 +349,42 @@ def sync_backlogs(session: Session, vault_path: str) -> dict:
         matched_reminder_uids = {m["reminder_uid"] for m in matches}
         stats["matched"] += len(matches)
 
-        # Vault → Reminders: unmatched open backlog tasks → create reminders
+        # Vault → Reminders: unmatched open backlog tasks → create reminders.
+        #
+        # ⚠️ Gated, and default OFF — because until 2026-08-19 this loop wrote
+        # `ReminderCommand` rows that **nothing ever dispatched**. There is no
+        # `dispatch_command()` call here and no reaper drains the table, so the
+        # rows accumulated forever: 107,058 pending `add`s spanning five months,
+        # ~3,300 a day, all abandoned in one sweep on that date. Anyone reading
+        # `stats["new_to_reminders"]` was reading the count of rows written to a
+        # queue with no reader — which is why a task re-dated in the vault never
+        # reached Reminders and looked 18 days overdue instead.
+        #
+        # Two faults compounded. The volume came from the dedupe guard below,
+        # which used `payload.contains(task.text[:50])` — a raw-text substring
+        # test against `json.dumps` output. `json.dumps` escapes `"` to `\"` and
+        # (with the default `ensure_ascii=True`) `—` to `\u2014`, so a task
+        # containing a quote or any non-ASCII character never matched itself and
+        # was re-queued on every 30-minute run. Measured on live rows: the test
+        # returned False for all of them, including a pure-ASCII one, because it
+        # contained quotes.
+        #
+        # So the guard now decodes payloads and compares the `summary` field,
+        # never a substring of serialised JSON, and the whole loop only runs when
+        # someone has deliberately enabled it. Turning it on dispatches for real.
+        push_to_reminders = _vault_push_enabled()
         for i, task in enumerate(backlog_tasks):
             if task.completed or i in matched_backlog_idxs:
                 continue
 
-            # Check if we already queued this task (avoid duplicates)
-            existing_cmd = (
-                session.query(ReminderCommand)
-                .filter(
-                    ReminderCommand.action == "add",
-                    ReminderCommand.status == "pending",
-                    ReminderCommand.payload.contains(task.text[:50]),
-                )
-                .first()
-            )
-            if existing_cmd:
+            if not push_to_reminders:
+                # Count it so the gap stays *visible* rather than silent — a
+                # disabled path that reports nothing is indistinguishable from
+                # a working one with nothing to do.
+                stats["vault_only_not_pushed"] += 1
+                continue
+
+            if _already_queued(session, user_id=user_id, summary=task.text):
                 continue
 
             payload = {
@@ -294,13 +398,24 @@ def sync_backlogs(session: Session, vault_path: str) -> dict:
                     else "none"
                 ),
             }
-            cmd = ReminderCommand(
+            # Dispatch rather than only enqueue. `dispatch_command` creates the
+            # row itself, publishes it over SSE and waits for the daemon's ack,
+            # so a row exists only as the record of a real attempt.
+            result = dispatch_command(
+                session,
+                user_id=user_id,
+                user_name=user_name,
                 action="add",
-                payload=json.dumps(payload),
-                status="pending",
+                args=payload,
             )
-            session.add(cmd)
-            stats["new_to_reminders"] += 1
+            if result.get("synced"):
+                stats["new_to_reminders"] += 1
+            else:
+                # Queued-but-not-applied. Counted separately because conflating
+                # the two is the exact bug being fixed here: a queued write is
+                # not a completed write, and the reaper (commands.py) is what
+                # will retry it.
+                stats["queued_not_applied"] += 1
 
         # Reminders → Vault: completed reminders that match open backlog tasks → mark done
         lines = content.split("\n")
@@ -332,3 +447,48 @@ def sync_backlogs(session: Session, vault_path: str) -> dict:
 
     session.commit()
     return stats
+
+
+# ─── Scheduled cron entry (manifest background_tasks, moved from
+#     app/scheduler.py in V4 chunk 3.1) ───
+#
+# sam-rollout A3 (2026-07-26): loops over every active user, resolving
+# each one's vault via app.services.vault_paths.user_vault_path(user.name)
+# (same pattern as obsidian/__init__.py's accounts()/store()) rather than
+# the single hardcoded settings.obsidian_vault_path / user_id=1 pass. A user
+# with no vault directory on disk is skipped (logged, not an error) — this
+# also fixes a pre-existing bug where `asyncio.run(sync_backlogs(...))` was
+# passed an already-evaluated dict (sync_backlogs is a plain `def`, not a
+# coroutine function), which would have raised a TypeError the first time
+# this path was actually exercised.
+
+
+def _run_scheduled_sync_blocking() -> None:
+    """Run vault backlog <-> Reminders sync, once per active user, in a thread."""
+    from app.auth.context import use_user
+    from app.db import get_db
+    from app.models.users import User
+    from app.services import vault_paths
+
+    db = get_db()
+    with db.session() as session:
+        users = session.query(User).filter_by(is_active=True).order_by(User.id).all()
+        for user in users:
+            vault_dir = vault_paths.user_vault_path(user.name)
+            if not vault_dir.is_dir():
+                logger.info(f"Backlog sync: no vault for {user.name}, skipping")
+                continue
+            with use_user(user.id):
+                result = sync_backlogs(session, str(vault_dir), user.id)
+            if result.get("matched") or result.get("completed_in_vault") or result.get("new_to_reminders"):
+                logger.info(f"Backlog sync [{user.name}]: {result}")
+
+
+async def run_scheduled_sync() -> None:
+    """Sync vault backlogs with Apple Reminders (cron: every 30 minutes)."""
+    import asyncio
+
+    try:
+        await asyncio.to_thread(_run_scheduled_sync_blocking)
+    except Exception:
+        logger.exception("Backlog sync failed")

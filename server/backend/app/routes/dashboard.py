@@ -51,17 +51,26 @@ async def dashboard_summary():
     try:
         from app.db import get_db
         from app.models.tokens import OAuthToken
+        from app.models.users import User
         db = get_db()
         with db.session() as session:
+            rows = (
+                session.query(OAuthToken, User)
+                .join(User, OAuthToken.user_id == User.id)
+                .filter(OAuthToken.needs_reauth_at.isnot(None))
+                .all()
+            )
             data["reauth_needed"] = [
                 {
                     "provider": t.provider,
                     "account_email": t.account_email,
                     "flagged_at": t.needs_reauth_at.isoformat() if t.needs_reauth_at else None,
                     "reason": t.needs_reauth_reason,
-                    "reauth_url": f"/api/auth/google/login?account={t.account_email}",
+                    # google/login now requires ?user= — thread the owning
+                    # user's name through so this link doesn't 422.
+                    "reauth_url": f"/api/auth/google/login?account={t.account_email}&user={u.name}",
                 }
-                for t in session.query(OAuthToken).filter(OAuthToken.needs_reauth_at.isnot(None)).all()
+                for t, u in rows
             ]
     except Exception:
         logger.exception("Failed to load reauth_needed list")

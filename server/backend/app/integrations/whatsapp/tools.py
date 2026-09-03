@@ -12,8 +12,10 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.auth.context import current_user_id
 from app.integrations.whatsapp.models import WhatsAppMessage, WhatsAppContact
-from app.tools import CustomTool, ExtraFilter, ListTool, SearchTool, SemanticSearchTool, StatsTool
+from app.services.text import ILIKE_ESCAPE_CHAR, escape_ilike
+from app.tools import CustomTool, ExtraFilter, ListTool, SearchTool, SemanticSearchTool, StatsTool, ToolAnnotations
 from app.tools.helpers import make_enrich, scoped_query, serialize
 
 logger = logging.getLogger(__name__)
@@ -43,13 +45,17 @@ def _chat_filter(session: Session, query, value: str):
     """Filter messages by contact/group name. Resolves via WhatsAppContact then chat_id."""
     if not value:
         return query
-    pattern = f"%{value}%"
+    pattern = f"%{escape_ilike(value)}%"
+    # Scoped: `whatsapp_contacts` became per-user when the second bridge
+    # landed. Resolving a name against every user's contacts would let one
+    # person's chat names steer another person's message filter.
     matching_contacts = (
-        session.query(WhatsAppContact.jid)
+        scoped_query(session, WhatsAppContact)
+        .with_entities(WhatsAppContact.jid)
         .filter(
-            WhatsAppContact.name.ilike(pattern)
-            | WhatsAppContact.notify_name.ilike(pattern)
-            | WhatsAppContact.jid.ilike(pattern)
+            WhatsAppContact.name.ilike(pattern, escape=ILIKE_ESCAPE_CHAR)
+            | WhatsAppContact.notify_name.ilike(pattern, escape=ILIKE_ESCAPE_CHAR)
+            | WhatsAppContact.jid.ilike(pattern, escape=ILIKE_ESCAPE_CHAR)
         )
         .all()
     )
@@ -57,7 +63,7 @@ def _chat_filter(session: Session, query, value: str):
     if jids:
         return query.filter(WhatsAppMessage.chat_id.in_(jids))
     # Fallback: direct ILIKE on chat_id
-    return query.filter(WhatsAppMessage.chat_id.ilike(pattern))
+    return query.filter(WhatsAppMessage.chat_id.ilike(pattern, escape=ILIKE_ESCAPE_CHAR))
 
 
 def _include_groups_filter(session: Session, query, value: bool):
@@ -95,7 +101,7 @@ def handle_contacts(session: Session, arguments: dict[str, Any]) -> str:
     include_groups = arguments.get("include_groups", True)
     limit = min(int(arguments.get("limit", 30)), 100)
 
-    query = session.query(WhatsAppContact)
+    query = scoped_query(session, WhatsAppContact)
     if not include_groups:
         query = query.filter(WhatsAppContact.is_group == False)  # noqa: E712
 
@@ -136,23 +142,90 @@ _semantic_enrich = make_enrich(
 )
 
 
+def _semantic_date_filter(after_dt: datetime | None, before_dt: datetime | None):
+    """Build an embeddings-table filter clause for whatsapp_semantic_search's
+    after/before args.
+
+    A WhatsApp embedding row is a conversation *segment* (several messages
+    merged into one chunk, see sync.py's `_build_segments`), not a single
+    `WhatsAppMessage` row — there is no natural join key back to one message,
+    unlike gmail's google_message_id. The segment's real start time is
+    already carried in `metadata_json["start"]` (an ISO string, set by
+    `_segment_metadata` at enqueue time) purely for exactly this reason, so
+    filtering casts that JSON field to a timestamp rather than using
+    `Embedding.created_at` (embedding time, not message time — the same trap
+    noted in google_mail's `_semantic_date_filter`). Cast happens inside the
+    WHERE clause `EmbeddingService.search()` already builds before its
+    `ORDER BY`/`LIMIT`, so this narrows the top-K candidate set in SQL rather
+    than trimming results after the fact.
+    """
+    from sqlalchemy import DateTime, and_, cast
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    from app.services.embedding import Embedding
+
+    start_expr = cast(
+        cast(Embedding.metadata_json, JSONB)["start"].astext,
+        DateTime(timezone=True),
+    )
+    conditions = []
+    if after_dt is not None:
+        conditions.append(start_expr >= after_dt)
+    if before_dt is not None:
+        conditions.append(start_expr <= before_dt)
+    return and_(*conditions)
+
+
 def _whatsapp_stats_compute(session: Session, _arguments: dict[str, Any]) -> dict:
+    """Per-caller stats.
+
+    Every figure here is scoped to `current_user_id()`. Unscoped these are a
+    metadata leak rather than a content one — total volume, group count and the
+    date of someone's earliest message describe a person's WhatsApp life even
+    though no message body is returned — and they're simply wrong for the
+    caller, who sees a total that isn't theirs.
+    """
     from app.services.embedding import Embedding, EmbeddingQueue
 
-    total_messages = session.query(func.count(WhatsAppMessage.id)).scalar() or 0
-    total_contacts = session.query(func.count(WhatsAppContact.id)).scalar() or 0
-    total_groups = (
-        session.query(func.count(WhatsAppContact.id)).filter_by(is_group=True).scalar() or 0
+    user_id = current_user_id()
+
+    total_messages = (
+        session.query(func.count(WhatsAppMessage.id))
+        .filter(WhatsAppMessage.user_id == user_id).scalar() or 0
     )
+    total_contacts = (
+        session.query(func.count(WhatsAppContact.id))
+        .filter(WhatsAppContact.user_id == user_id).scalar() or 0
+    )
+    total_groups = (
+        session.query(func.count(WhatsAppContact.id))
+        .filter(WhatsAppContact.user_id == user_id, WhatsAppContact.is_group.is_(True))
+        .scalar() or 0
+    )
+    # `embeddings` carries the owning user_id (see sync.py's per-(user, chat)
+    # windowing), so these two scope the same way.
     total_embedded = (
-        session.query(func.count(Embedding.id)).filter_by(source="whatsapp").scalar() or 0
+        session.query(func.count(Embedding.id))
+        .filter(Embedding.source == "whatsapp", Embedding.user_id == user_id)
+        .scalar() or 0
     )
     queue_pending = (
         session.query(func.count(EmbeddingQueue.id))
-        .filter_by(source="whatsapp", status="pending").scalar() or 0
+        .filter(
+            EmbeddingQueue.source == "whatsapp",
+            EmbeddingQueue.status == "pending",
+            EmbeddingQueue.user_id == user_id,
+        )
+        .scalar() or 0
     )
-    earliest = session.query(func.min(WhatsAppMessage.timestamp)).scalar()
-    latest = session.query(func.max(WhatsAppMessage.timestamp)).scalar()
+    earliest = (
+        session.query(func.min(WhatsAppMessage.timestamp))
+        .filter(WhatsAppMessage.user_id == user_id).scalar()
+    )
+    latest = (
+        session.query(func.max(WhatsAppMessage.timestamp))
+        .filter(WhatsAppMessage.user_id == user_id).scalar()
+    )
     return {
         "total_messages": total_messages,
         "total_contacts": total_contacts,
@@ -200,7 +273,7 @@ def get_mcp_tools() -> list[dict]:
             category="home",
             examples=[
                 "What's been said on WhatsApp today?",
-                "Recent messages from Sam",
+                "Recent messages from a given contact",
                 "Show group chat messages",
             ],
         ).build(),
@@ -231,6 +304,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="whatsapp_thread",
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
             description=(
                 "Read full message history for a specific WhatsApp chat by chat_id (JID). "
                 "Returns messages in chronological order. Use after whatsapp_contacts to "
@@ -257,6 +331,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="whatsapp_contacts",
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
             description=(
                 "List WhatsApp contacts and groups, sorted by most recent message. "
                 "Shows name, JID (needed for whatsapp_thread), and last message time."
@@ -287,12 +362,16 @@ def get_mcp_tools() -> list[dict]:
                 "Semantic search across WhatsApp conversations using embeddings. "
                 "Returns conversation segments (groups of messages in context) ranked "
                 "by relevance. Better than keyword search for topics and discussions. "
+                "Optional after/before date range narrows to segments that actually "
+                "started in that window — useful when the same topic recurs over "
+                "years and only a specific period's conversations matter. "
                 "Requires whatsapp_embed to have been run."
             ),
             model=WhatsAppMessage,
             embedding_source="whatsapp",
             embed_tool_name="whatsapp_embed",
             enrich=_semantic_enrich,
+            date_filter=_semantic_date_filter,
             default_limit=10,
             max_limit=50,
             category="search",
@@ -304,6 +383,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="whatsapp_embed",
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True),
             description=(
                 "Embed un-embedded WhatsApp messages for semantic search. "
                 "Admin tool — run after initial setup or periodically to index new messages."

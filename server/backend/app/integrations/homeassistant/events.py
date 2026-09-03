@@ -17,8 +17,8 @@ from datetime import datetime, timezone
 
 import websockets
 
-from app.config import settings
 from app.db import get_db
+from app.plugin.config_store import plugin_config
 from app.integrations.homeassistant.models import HAEntity, HAStateChange
 from app.integrations.homeassistant.sync import (
     _parse_ts,
@@ -34,8 +34,47 @@ _BACKOFF_MAX = 60.0
 current_listener: "HAEventListener | None" = None
 
 
+async def run_listener_task(stop_event: asyncio.Event) -> None:
+    """Startup-task entry point (manifest `background_tasks`, kind="startup").
+
+    Supervised by `app.plugin.supervisor`. `HAEventListener` already owns its
+    own reconnect-with-backoff loop internally (see `_run` below) — this
+    wrapper just starts it, publishes it as `current_listener` (so
+    `ws_last_event_at()` keeps working for the freshness probe), waits for
+    `stop_event`, then stops it. No-op if HA isn't configured, matching the
+    pre-3.1 `if settings.ha_url and settings.ha_token:` guard in main.py.
+    """
+    global current_listener
+
+    cfg = plugin_config("homeassistant")
+    if not (cfg.ha_url and cfg.ha_token):
+        await stop_event.wait()
+        return
+
+    listener = HAEventListener()
+    current_listener = listener
+    listener.start()
+    try:
+        await stop_event.wait()
+    finally:
+        await listener.stop()
+        current_listener = None
+
+
+def ws_last_event_at() -> "datetime | None":
+    """Last time the WS listener actually received a state_changed event.
+
+    None if the listener hasn't started, or hasn't seen an event yet.
+    Used by `services.data_freshness` to detect a listener that's silently
+    stopped receiving events (task alive/reconnect loop running, but no
+    events flowing) — distinct from `current_listener.connected`, which
+    only reflects the socket handshake.
+    """
+    return current_listener.last_event_at if current_listener else None
+
+
 def _ws_url() -> str:
-    base = settings.ha_url.rstrip("/")
+    base = plugin_config("homeassistant").ha_url.rstrip("/")
     scheme = "wss" if base.startswith("https") else "ws"
     return f"{scheme}://{base.split('://', 1)[1]}/api/websocket"
 
@@ -64,7 +103,7 @@ def apply_state_event(data: dict) -> None:
         old_state = old.get("state") if old else (row.state if row else None)
 
         if old is not None and old_state != state and should_record_transition(
-            old_state, state
+            old_state, state, entity_id
         ):
             session.add(
                 HAStateChange(
@@ -98,6 +137,12 @@ class HAEventListener:
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
         self.connected = False
+        # Heartbeat: stamped every time a state_changed event is actually
+        # received off the socket (not just "TCP connected" — a listener
+        # can sit connected-but-silent, e.g. subscribed but HA stops
+        # pushing). This is the signal data_freshness uses to detect a
+        # dead-but-connected listener, which `connected` alone can't catch.
+        self.last_event_at: datetime | None = None
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="ha-event-listener")
@@ -138,7 +183,7 @@ class HAEventListener:
             if msg.get("type") != "auth_required":
                 raise RuntimeError(f"unexpected HA hello: {msg.get('type')}")
             await ws.send(json.dumps(
-                {"type": "auth", "access_token": settings.ha_token}
+                {"type": "auth", "access_token": plugin_config("homeassistant").ha_token}
             ))
             msg = json.loads(await ws.recv())
             if msg.get("type") != "auth_ok":
@@ -169,4 +214,5 @@ class HAEventListener:
                 if msg.get("type") != "event":
                     continue
                 data = msg.get("event", {}).get("data", {})
+                self.last_event_at = datetime.now(timezone.utc)
                 await asyncio.to_thread(apply_state_event, data)

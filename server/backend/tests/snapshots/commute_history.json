@@ -1,0 +1,15 @@
+{
+  "counts_by_state": {
+    "comfortable": 1,
+    "tight": 1
+  },
+  "days": 14,
+  "decision_count": 2,
+  "interchange_delay_distribution_min": {
+    "max": 4.0,
+    "mean": 2.75,
+    "n": 2,
+    "p50": 4.0,
+    "p90": 4.0
+  }
+}

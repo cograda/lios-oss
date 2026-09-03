@@ -4,6 +4,20 @@ Sync and embedding work runs in a thread pool via asyncio.to_thread to avoid
 blocking the event loop with CPU-bound tasks (fastembed inference, file I/O,
 heavy DB queries). Includes single retry on transient failures and duration
 tracking for observability.
+
+V4 chunk 3.1: job registration is manifest-driven. `setup_scheduler()`
+schedules three kinds of job, all read from manifests/kernel declarations —
+no integration-specific names appear in this file:
+
+  1. Per-integration sync jobs, from each manifest's `schedule` /
+     `schedule_timezone` (replaces calling the old `sync_schedule()` ABC
+     method, deleted along with `sync_timezone()` now that manifests are
+     the single source of truth).
+  2. Kernel-owned jobs (`app.plugin.kernel_jobs.KERNEL_JOBS`) — embedding
+     processor, audit-table prunes. Declared there, iterated here.
+  3. Cron-kind `background_tasks` from manifests (e.g. the WhatsApp bridge
+     heartbeat, the apple_reminders backlog sync) — resolved via
+     `app.plugin.refs.resolve_ref` and scheduled the same way.
 """
 
 import asyncio
@@ -15,6 +29,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.integrations import get_all
+from app.plugin.config_store import is_integration_enabled
+from app.plugin.kernel_jobs import KERNEL_JOBS
+from app.plugin.refs import resolve_ref
+from app.plugin.validate import discover_manifests
 
 logger = logging.getLogger(__name__)
 
@@ -159,217 +177,58 @@ async def run_sync(integration_name: str) -> None:
     _update_sync_state(integration_name, "error", error, duration_ms=duration_ms)
 
 
-def _run_embedding_blocking() -> None:
-    """Process embedding queue in a thread (fastembed is CPU-bound)."""
-    from app.db import get_db
-    from app.services.embedding import EmbeddingService
-
-    db = get_db()
-    with db.session() as session:
-        processed = EmbeddingService.process_queue(session, batch_size=100)
-        if processed:
-            logger.info(f"Embedding processor: embedded {processed} items")
-
-
-async def run_embedding_processor() -> None:
-    """Process the unified embedding queue."""
-    try:
-        await asyncio.to_thread(_run_embedding_blocking)
-    except Exception:
-        logger.exception("Embedding processor failed")
-
-
-def _prune_client_logs_blocking() -> None:
-    """Delete client log entries older than 30 days."""
-    from datetime import timedelta
-
-    from app.db import get_db
-    from app.models.clients import ClientLog
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-    db = get_db()
-    with db.session() as session:
-        deleted = (
-            session.query(ClientLog)
-            .filter(ClientLog.logged_at < cutoff)
-            .delete(synchronize_session=False)
-        )
-        session.commit()
-        if deleted:
-            logger.info(f"Pruned {deleted} client log entries older than 30 days")
-
-
-async def run_prune_client_logs() -> None:
-    """Prune old client logs (runs daily)."""
-    try:
-        await asyncio.to_thread(_prune_client_logs_blocking)
-    except Exception:
-        logger.exception("Client log pruning failed")
-
-
-def _prune_tool_calls_blocking() -> None:
-    """Delete tool_calls audit rows older than 30 days.
-
-    Same retention window and same daily-3am cadence as `client_logs` — both
-    are append-only per-call/per-request audit trails with no long-term
-    analytical value beyond system_alerts' rolling 1h/24h lookback windows.
-    """
-    from datetime import timedelta
-
-    from app.db import get_db
-    from app.models.tool_calls import ToolCall
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-    db = get_db()
-    with db.session() as session:
-        deleted = (
-            session.query(ToolCall)
-            .filter(ToolCall.called_at < cutoff)
-            .delete(synchronize_session=False)
-        )
-        session.commit()
-        if deleted:
-            logger.info(f"Pruned {deleted} tool_calls entries older than 30 days")
-
-
-async def run_prune_tool_calls() -> None:
-    """Prune old tool_calls audit rows (runs daily)."""
-    try:
-        await asyncio.to_thread(_prune_tool_calls_blocking)
-    except Exception:
-        logger.exception("Tool call pruning failed")
-
-
-def _check_whatsapp_bridge_blocking() -> None:
-    """Probe the WhatsApp bridge's HTTP health endpoint.
-
-    Writes a SyncState row keyed `whatsapp_bridge` so the alerts layer can
-    distinguish "bridge dead" (no recent heartbeat) from "bridge alive but
-    writes are failing" (data freshness probe says messages have stopped).
-    """
-    import urllib.request
-
-    url = "http://whatsapp-bridge:3100/health"
-    try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            ok = 200 <= resp.status < 300
-            error = None if ok else f"HTTP {resp.status}"
-    except Exception as e:
-        ok = False
-        error = str(e)[:200]
-
-    _update_sync_state(
-        "whatsapp_bridge",
-        status="ok" if ok else "error",
-        error=error,
-        trigger="heartbeat",
-    )
-
-
-async def run_whatsapp_bridge_heartbeat() -> None:
-    """Heartbeat the WhatsApp bridge container (every minute)."""
-    try:
-        await asyncio.to_thread(_check_whatsapp_bridge_blocking)
-    except Exception:
-        logger.exception("WhatsApp bridge heartbeat failed")
-
-
-def _run_backlog_sync_blocking() -> None:
-    """Run vault backlog ↔ Reminders sync in a thread."""
-    from app.config import settings
-    from app.db import get_db
-    from app.integrations.apple_reminders.backlog_sync import sync_backlogs
-
-    if not settings.obsidian_vault_path:
-        return
-
-    db = get_db()
-    with db.session() as session:
-        result = asyncio.run(sync_backlogs(session, settings.obsidian_vault_path))
-        if result.get("matched") or result.get("completed_in_vault") or result.get("new_to_reminders"):
-            logger.info(f"Backlog sync: {result}")
-
-
-async def run_backlog_sync() -> None:
-    """Sync vault backlogs with Apple Reminders (scheduled)."""
-    try:
-        await asyncio.to_thread(_run_backlog_sync_blocking)
-    except Exception:
-        logger.exception("Backlog sync failed")
-
-
 def setup_scheduler() -> None:
-    """Register sync jobs for all integrations with a schedule."""
+    """Register sync jobs, kernel jobs, and manifest cron background tasks."""
     integrations = get_all()
+    manifests = discover_manifests()
 
-    for integration in integrations.values():
-        schedule = integration.sync_schedule()
-        if schedule and integration.is_configured():
+    # 1. Per-integration sync jobs, schedule sourced from the manifest.
+    for name, integration in integrations.items():
+        manifest = manifests.get(name)
+        schedule = manifest.schedule if manifest else None
+        if schedule and integration.is_configured() and is_integration_enabled(name):
+            tz = manifest.schedule_timezone
             scheduler.add_job(
                 run_sync,
-                CronTrigger.from_crontab(schedule),
-                args=[integration.name],
-                id=f"sync_{integration.name}",
+                CronTrigger.from_crontab(schedule, timezone=tz),
+                args=[name],
+                id=f"sync_{name}",
                 replace_existing=True,
                 misfire_grace_time=120,
                 max_instances=1,
             )
-            logger.info(f"Scheduled sync for {integration.name}: {schedule}")
+            logger.info(f"Scheduled sync for {name}: {schedule} ({tz or 'UTC'})")
 
-    # Embedding queue processor — every 5 minutes
-    scheduler.add_job(
-        run_embedding_processor,
-        CronTrigger.from_crontab("*/5 * * * *"),
-        id="embedding_processor",
-        replace_existing=True,
-        misfire_grace_time=120,
-        max_instances=1,
-    )
-    logger.info("Scheduled embedding processor: */5 * * * *")
+    # 2. Kernel-owned jobs (embedding processor, audit prunes).
+    for job in KERNEL_JOBS:
+        scheduler.add_job(
+            job.func,
+            CronTrigger.from_crontab(job.cron),
+            id=job.id,
+            replace_existing=True,
+            misfire_grace_time=job.misfire_grace_time,
+            max_instances=1,
+        )
+        logger.info(f"Scheduled kernel job {job.id}: {job.cron}")
 
-    # Backlog sync (Reminders ↔ vault tasks) — every 30 minutes
-    scheduler.add_job(
-        run_backlog_sync,
-        CronTrigger.from_crontab("*/30 * * * *"),
-        id="backlog_sync",
-        replace_existing=True,
-        misfire_grace_time=120,
-        max_instances=1,
-    )
-    logger.info("Scheduled backlog sync: */30 * * * *")
-
-    # WhatsApp bridge heartbeat — every minute
-    scheduler.add_job(
-        run_whatsapp_bridge_heartbeat,
-        CronTrigger.from_crontab("* * * * *"),
-        id="whatsapp_bridge_heartbeat",
-        replace_existing=True,
-        misfire_grace_time=30,
-        max_instances=1,
-    )
-    logger.info("Scheduled WhatsApp bridge heartbeat: * * * * *")
-
-    # Client log pruning — daily at 3am
-    scheduler.add_job(
-        run_prune_client_logs,
-        CronTrigger.from_crontab("0 3 * * *"),
-        id="prune_client_logs",
-        replace_existing=True,
-        misfire_grace_time=300,
-        max_instances=1,
-    )
-    logger.info("Scheduled client log pruning: daily at 03:00")
-
-    # Tool call audit trail pruning — daily at 3am (same window as client_logs)
-    scheduler.add_job(
-        run_prune_tool_calls,
-        CronTrigger.from_crontab("0 3 * * *"),
-        id="prune_tool_calls",
-        replace_existing=True,
-        misfire_grace_time=300,
-        max_instances=1,
-    )
-    logger.info("Scheduled tool_calls pruning: daily at 03:00")
+    # 3. Cron-kind background tasks declared by manifests (e.g. WhatsApp
+    #    bridge heartbeat, apple_reminders backlog sync).
+    for name, manifest in manifests.items():
+        if not is_integration_enabled(name):
+            continue
+        for task in manifest.background_tasks:
+            if task.kind != "cron":
+                continue
+            func = resolve_ref(task.target)
+            scheduler.add_job(
+                func,
+                CronTrigger.from_crontab(task.cron),
+                id=task.name,
+                replace_existing=True,
+                misfire_grace_time=task.misfire_grace_time,
+                max_instances=1,
+            )
+            logger.info(f"Scheduled background task {task.name} ({name}): {task.cron}")
 
     scheduler.start()
     logger.info("Scheduler started")

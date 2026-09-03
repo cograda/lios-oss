@@ -17,6 +17,8 @@ from sqlalchemy.orm import Session
 
 from app.integrations.attachments.models import MessageAttachment
 from app.integrations.attachments.scan import scan_gmail, scan_whatsapp
+from app.services.text import ILIKE_ESCAPE_CHAR, escape_ilike
+from app.tools import CustomTool, ToolAnnotations
 from app.tools.helpers import iso_or_none, scoped_query, serialize
 
 
@@ -91,10 +93,10 @@ def attachments_search_handler(session: Session, arguments: dict) -> str:
         return json.dumps({"error": "query is required"})
     limit = int(arguments.get("limit") or 25)
 
-    pattern = f"%{query}%"
+    pattern = f"%{escape_ilike(query)}%"
     rows = (
         scoped_query(session, MessageAttachment)
-        .filter(MessageAttachment.filename.ilike(pattern))
+        .filter(MessageAttachment.filename.ilike(pattern, escape=ILIKE_ESCAPE_CHAR))
         .order_by(MessageAttachment.message_ts.desc().nullslast())
         .limit(limit)
         .all()
@@ -111,7 +113,7 @@ def attachments_ingest_handler(session: Session, arguments: dict) -> str:
 
     WhatsApp only today — bridge exposes /download/:message_id via Baileys'
     downloadMediaMessage. Each ingested attachment becomes a HistoricalDocument
-    and is surfaced by `renovation_context` automatically.
+    and is surfaced by `corpus_search` automatically.
     """
     from app.integrations.attachments.ingest import ingest_many
 
@@ -129,32 +131,37 @@ def attachments_ingest_handler(session: Session, arguments: dict) -> str:
 
 def mcp_tools() -> list[dict[str, Any]]:
     return [
-        {
-            "name": "attachments_scan",
-            "description": (
-                "Scan WhatsApp for unprocessed attachments. Populates "
-                "metadata-only rows in message_attachments — no downloads "
-                "happen here. Safe to call repeatedly; idempotent via "
-                "(source, message_ref, filename) unique constraint. Gmail "
-                "attachment scanning is not implemented — Gmail messages are "
-                "synced metadata-only, so there's no attachment filename/"
-                "mimetype data to scan; the response includes a gmail block "
-                "noting this rather than silently reporting zero results."
+        CustomTool(
+            name="attachments_scan",
+            description=(
+                "Scan WhatsApp and Gmail for unprocessed attachments. "
+                "Populates metadata-only rows in message_attachments — no "
+                "downloads happen here. Safe to call repeatedly; idempotent "
+                "via the (source, message_ref, filename) unique constraint. "
+                "WhatsApp scans instantly from already-cached message data. "
+                "Gmail does a bounded, checkpointed full-format backfill "
+                "against the live API each call (new attachments since the "
+                "last scan, plus one page further into history) — repeated "
+                "calls make progress until history is fully covered."
             ),
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": attachments_scan_handler,
-        },
-        {
-            "name": "attachments_pending",
-            "description": (
+            input_schema={"type": "object", "properties": {}},
+            handler=attachments_scan_handler,
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True),
+        ).build(),
+        CustomTool(
+            name="attachments_pending",
+            description=(
                 "List attachments awaiting user approval. Use before "
                 "attachments_ingest so the user can see filenames, sizes, "
                 "senders, and dates and pick which to ingest. Supports "
-                "filtering by source and recency. In practice only "
-                "source='whatsapp' rows exist — Gmail attachment scanning "
-                "is not implemented (see attachments_scan)."
+                "filtering by source and recency. Covers both "
+                "source='whatsapp' and source='gmail' rows once "
+                "attachments_scan has run — note attachments_ingest only "
+                "downloads WhatsApp today, so Gmail rows are queued as "
+                "'unsupported' (not 'pending') and won't show under the "
+                "default pending filter; pass status='unsupported' to see them."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "source": {
@@ -174,17 +181,18 @@ def mcp_tools() -> list[dict[str, Any]]:
                     "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
                 },
             },
-            "handler": attachments_pending_handler,
-        },
-        {
-            "name": "attachments_search",
-            "description": (
+            handler=attachments_pending_handler,
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+        ).build(),
+        CustomTool(
+            name="attachments_search",
+            description=(
                 "Filename search across all attachments (any status). Use "
                 "when the user remembers part of a filename. Returns "
                 "metadata + parse_status so caller can tell whether the "
                 "doc is already ingested or still pending."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Substring to match in filename."},
@@ -192,17 +200,18 @@ def mcp_tools() -> list[dict[str, Any]]:
                 },
                 "required": ["query"],
             },
-            "handler": attachments_search_handler,
-        },
-        {
-            "name": "attachments_ingest",
-            "description": (
+            handler=attachments_search_handler,
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+        ).build(),
+        CustomTool(
+            name="attachments_ingest",
+            description=(
                 "Download, parse, and embed a specific set of attachments "
                 "into the historical corpus. WhatsApp documents only. After "
-                "ingest the doc is searchable via renovation_context with "
+                "ingest the doc is searchable via corpus_search with "
                 "source_type=wa_attachment_{pdf,docx,xlsx}."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "ids": {
@@ -213,6 +222,7 @@ def mcp_tools() -> list[dict[str, Any]]:
                 },
                 "required": ["ids"],
             },
-            "handler": attachments_ingest_handler,
-        },
+            handler=attachments_ingest_handler,
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=False),
+        ).build(),
     ]

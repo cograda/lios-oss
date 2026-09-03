@@ -38,10 +38,52 @@ U2_MARKER = "LEAK-CANARY-U2"
 # onboarding artefact, user_id records who the install is FOR. ToolCall:
 # nullable user_id, admin/ops audit trail (tool-call dispatch log) — not
 # per-user application data, ON DELETE SET NULL so it outlives the user row.
-NULLABLE_OR_ADMIN_USER_ID = {"embeddings", "embedding_queue", "install_codes", "tool_calls"}
+NULLABLE_OR_ADMIN_USER_ID = {
+    "embeddings", "embedding_queue", "install_codes", "tool_calls",
+    # auth_events: nullable user_id by design (a failed-auth attempt usually
+    # has no resolved user) — admin/ops audit log, not per-user app data.
+    # See app/models/auth_events.py's docstring (V4 chunk 2.5).
+    "auth_events",
+    # sync_cursors: nullable user_id by design — single-account integrations
+    # (weather, lastfm's global sync) have no owning user for their cursor.
+    # Opt-in bookkeeping table, not per-user app data. See
+    # app/models/sync_cursor.py (V4 chunk 3.2).
+    "sync_cursors",
+    # notification_sends: nullable user_id by design (F7, hardening 2026-08) —
+    # NULL means household-shared infrastructure alert, which is the NORMAL
+    # case, not a backfill artifact; only user-attributable alerts (e.g. the
+    # apple_health per-user data-gap) carry an owner. UserOwnedMixin's
+    # NOT NULL would be wrong here. The read-side scoping (bound caller sees
+    # shared + own, never another user's) is enforced directly by
+    # tests/test_notifications.py::TestNotifyRecentScoping and the migration
+    # docstring (2026_08_08_8b9c0d1e2f3a).
+    "notification_sends",
+}
 
 
 def user_owned_models() -> list[type]:
+    """Every currently-live `UserOwnedMixin` model registered against
+    `coglib.Base`.
+
+    Filters to mappers whose table is *currently* a member of
+    `Base.metadata.tables` — not just "still has a live Python class
+    object". This matters because of how
+    `tests/test_drop_in_integration.py`'s throwaway packages clean up: a
+    dropped-in `TemplateItem` class can remain reachable in
+    `Base.registry.mappers` for a little while after its `with` block
+    exits (Python has no block-level scoping — a local variable assigned
+    inside a `with` statement stays alive until the *function* returns, not
+    until the `with` exits, so garbage collection of the class can lag
+    behind that fixture's own cleanup by one stack frame's worth of
+    locals). That fixture's cleanup is authoritative and immediate about
+    one specific thing regardless of GC timing: it removes the table from
+    `Base.metadata` synchronously via `Base.metadata.remove(table)`. So the
+    right thing to sweep here isn't "every mapper the registry happens to
+    still hold a reference to" but "every mapper whose table genuinely
+    still exists in the current schema" — a model that's been torn back
+    out from under its table should never be seeded with test rows,
+    because nothing created that table in the real database either.
+    """
     from coglib import Base
 
     return sorted(
@@ -49,6 +91,8 @@ def user_owned_models() -> list[type]:
             m.class_
             for m in Base.registry.mappers
             if issubclass(m.class_, UserOwnedMixin)
+            and m.local_table is not None
+            and m.local_table.name in Base.metadata.tables
         ),
         key=lambda c: c.__tablename__,
     )
@@ -81,12 +125,16 @@ def _value_for(col, marker: str):
     )
 
 
-def make_row(model: type, user_id: int, marker: str):
+def make_row(model: type, user_id: int, marker: str, fk_overrides: dict | None = None):
     """Build a model instance with required columns filled generically.
 
     Every String/Text column (required or not) carries the marker so the
     canary sweep can detect a leak through any serialized field. Unique
     columns stay unique because the marker differs per user.
+
+    `fk_overrides` (column name -> id) supplies values for required foreign
+    keys that point somewhere other than `users` — see `_ensure_fk_parents`.
+    Without it, a generic int filler (1) would only work by accident.
     """
     mapper = sa_inspect(model)
     kwargs = {}
@@ -96,6 +144,9 @@ def make_row(model: type, user_id: int, marker: str):
         if col.name == "user_id":
             kwargs["user_id"] = user_id
             continue
+        if fk_overrides and col.name in fk_overrides:
+            kwargs[col.name] = fk_overrides[col.name]
+            continue
         if isinstance(col.type, (String, Text)):
             kwargs[col.name] = _value_for(col, marker)
             continue
@@ -103,6 +154,55 @@ def make_row(model: type, user_id: int, marker: str):
             continue
         kwargs[col.name] = _value_for(col, marker)
     return model(**kwargs)
+
+
+def _minimal_row(model: type, marker: str):
+    """Build the smallest valid instance of a (usually shared, non-user-owned)
+    parent model — used to satisfy a required FK before seeding a user-owned
+    child row. Same generic filler as `make_row`, minus the user_id notion."""
+    mapper = sa_inspect(model)
+    kwargs = {}
+    for col in mapper.columns:
+        if col.primary_key:
+            continue
+        if col.nullable or col.default is not None or col.server_default is not None:
+            continue
+        kwargs[col.name] = _value_for(col, marker)
+    return model(**kwargs)
+
+
+def _ensure_fk_parents(session, model: type, marker: str) -> dict[str, int]:
+    """For every non-`user_id` foreign key column on `model`, seed one
+    minimal parent row (shared across both test users) and return
+    {column_name: parent_id}.
+
+    Some user-owned tables carry a required FK to a *shared* table (e.g.
+    `snag_source_messages.snag_id` -> `snags`, which has no owner of its
+    own). Without this, the generic scoping sweep fails on a FK violation
+    rather than actually exercising per-user scoping.
+    """
+    from coglib import Base
+
+    mapper = sa_inspect(model)
+    fk_ids: dict[str, int] = {}
+    for col in mapper.columns:
+        if col.name == "user_id":
+            continue
+        for fk in col.foreign_keys:
+            target_table = fk.column.table
+            if target_table.name == "users":
+                continue
+            target_cls = next(
+                (m.class_ for m in Base.registry.mappers if m.local_table is target_table),
+                None,
+            )
+            if target_cls is None:
+                continue
+            parent = _minimal_row(target_cls, marker)
+            session.add(parent)
+            session.flush()
+            fk_ids[col.name] = parent.id
+    return fk_ids
 
 
 def _timestamp_col(model: type) -> str:
@@ -116,8 +216,9 @@ def _timestamp_col(model: type) -> str:
 
 
 def _seed_both_users(session, model: type) -> None:
-    session.add(make_row(model, 1, U1_MARKER))
-    session.add(make_row(model, 2, U2_MARKER))
+    fk_overrides = _ensure_fk_parents(session, model, U1_MARKER)
+    session.add(make_row(model, 1, U1_MARKER, fk_overrides))
+    session.add(make_row(model, 2, U2_MARKER, fk_overrides))
     session.commit()
 
 
@@ -271,7 +372,6 @@ def test_readonly_tools_leak_no_cross_user_data(db_session, monkeypatch):
     """Seed user 2 canaries everywhere; no read-only tool output as user 1
     may ever contain the canary, regardless of how the tool queries."""
     from app.integrations import INTEGRATIONS, register_all
-    from app.mcp.annotations import TOOL_ANNOTATIONS
 
     # Live semantic search loads fastembed — stub the query embedder.
     from app.services import embedding as emb
@@ -298,7 +398,9 @@ def test_readonly_tools_leak_no_cross_user_data(db_session, monkeypatch):
             continue
         for tool_def in tools:
             name = tool_def["name"]
-            ann = tool_def.get("annotations") or TOOL_ANNOTATIONS.get(name) or {}
+            # V4 chunk 1.2: every tool now carries its own inline annotations
+            # (the centralized app/mcp/annotations.py fallback is gone).
+            ann = tool_def.get("annotations") or {}
             if not ann.get("readOnlyHint"):
                 continue
             if ann.get("openWorldHint"):

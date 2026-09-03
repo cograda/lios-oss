@@ -6,6 +6,16 @@ static catch-all (like the /mcp mount). No-op unless HOME_OAUTH_ISSUER is set.
 Phase 0 login is a UI-token gate — throwaway scaffolding to prove the handshake
 against the real claude.ai client before wiring Google federation (Phase 1).
 See vault Plans/mcp-oauth.md.
+
+V4 chunk 2.3 added an explicit kill switch: Phase 0 login used to accept
+any bearer matching `HOME_UI_TOKEN` and mint a session for user_id=1 no
+matter what — a standing impersonation path once `HOME_OAUTH_ISSUER` is
+set for real use. It now also requires `settings.oauth_phase0_enable`
+(`HOME_OAUTH_PHASE0_ENABLE`), off by default. This is a config flag rather
+than deleting the code outright because Phase 1 (Google federation)
+replaces the login step in place — the AS/RS routes, token minting, and
+refresh/revocation machinery below are already production-shaped and
+don't change; only `_login_post` needs to go away once Phase 1 lands.
 """
 
 import logging
@@ -66,6 +76,12 @@ async def _login_post(request: Request) -> Response:
     ui_token = str(form.get("ui_token", ""))
     if not session_id:
         return HTMLResponse("Missing login_session", status_code=400)
+    if not settings.oauth_phase0_enable:
+        logger.warning("OAuth Phase-0 login attempted while disabled (HOME_OAUTH_PHASE0_ENABLE=false)")
+        return HTMLResponse(
+            "Phase 0 sign-in is disabled on this server.",
+            status_code=403,
+        )
     if not (settings.ui_token and safe_token_check(ui_token, settings.ui_token)):
         return HTMLResponse(
             _LOGIN_FORM.format(

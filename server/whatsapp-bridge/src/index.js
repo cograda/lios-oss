@@ -23,25 +23,14 @@ import { createServer } from "http";
 import pino from "pino";
 import qrcode from "qrcode-terminal";
 
-import { initDb, ensureTables, upsertMessage, upsertContact, upsertMessageBatch, upsertContactBatch, getMessageCount, getRawMessage } from "./db.js";
+import { initDb, ensureTables, upsertMessage, upsertContact, upsertMessageBatch, upsertContactBatch, getMessageCount, getRawMessage, USER_ID } from "./db.js";
+import { setChatName, getChatName } from "./chatNameCache.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 const AUTH_DIR = process.env.AUTH_DIR || "/app/auth_state";
 const HEALTH_PORT = parseInt(process.env.HEALTH_PORT || "3100", 10);
 const SYNC_FULL_HISTORY = process.env.SYNC_FULL_HISTORY === "true";
-
-// Shared-secret header required on /download/:messageId — otherwise any
-// container on the shared Docker network can pull decrypted WhatsApp media
-// for any guessable message id. Unset = unauthenticated (dev mode), same
-// pattern as HOME_MCP_TOKEN on the main app.
-const BRIDGE_SHARED_SECRET = process.env.BRIDGE_SHARED_SECRET || "";
-if (!BRIDGE_SHARED_SECRET) {
-  logger.warn(
-    "BRIDGE_SHARED_SECRET is not set — /download/:messageId is unauthenticated. " +
-    "Set BRIDGE_SHARED_SECRET to require callers to send it as X-Bridge-Secret."
-  );
-}
 
 // Connection state
 let sock = null;
@@ -91,7 +80,7 @@ function extractMessage(msg) {
   } else if (m.reactionMessage) {
     messageType = "reaction";
     body = m.reactionMessage.text || null;
-  } else if (m.protocolMessage || m.senderKeyDistributionMessage) {
+  } else if (m.protoAlexessage || m.senderKeyDistributionMessage) {
     return null; // Internal protocol, skip
   } else {
     // Unknown message type — store what we can
@@ -118,7 +107,11 @@ function extractMessage(msg) {
   return {
     messageId: key.id,
     chatId,
-    chatName: null, // Filled from contact info
+    // extractMessage is a pure formatter with no DB/cache access — the real
+    // name is resolved by the caller from chatNameCache.js (populated by the
+    // contacts.update / messaging-history.set contacts handlers) right
+    // before the row is written.
+    chatName: null,
     senderId,
     senderName,
     isGroup,
@@ -213,6 +206,8 @@ async function connectWhatsApp() {
         const extracted = extractMessage(msg);
         if (!extracted) continue; // Protocol message, skip
 
+        extracted.chatName = getChatName(USER_ID, extracted.chatId);
+
         await upsertMessage(extracted);
         messageCount++;
 
@@ -255,9 +250,11 @@ async function connectWhatsApp() {
     for (const contact of updates) {
       if (!contact.id) continue;
       try {
+        const name = contact.name || contact.verifiedName || null;
+        setChatName(USER_ID, contact.id, name);
         await upsertContact({
           jid: contact.id,
-          name: contact.name || contact.verifiedName || null,
+          name,
           notifyName: contact.notify || null,
           isGroup: contact.id.endsWith("@g.us"),
           lastMessageAt: null,
@@ -277,13 +274,41 @@ async function connectWhatsApp() {
       "History sync batch received"
     );
 
+    // Process contacts from history FIRST so the chat-name cache is warm
+    // before messages in the same batch are resolved below.
+    if (contacts?.length) {
+      const contactData = contacts
+        .filter(c => c.id)
+        .map(c => {
+          const name = c.name || c.verifiedName || null;
+          setChatName(USER_ID, c.id, name);
+          return {
+            jid: c.id,
+            name,
+            notifyName: c.notify || null,
+            isGroup: c.id.endsWith("@g.us"),
+            lastMessageAt: null,
+          };
+        });
+
+      try {
+        await upsertContactBatch(contactData);
+        logger.info({ count: contactData.length }, "History contacts saved");
+      } catch (err) {
+        logger.error({ err }, "Failed to save history contacts");
+      }
+    }
+
     // Process messages
     if (messages?.length) {
       const extracted = [];
       for (const msg of messages) {
         try {
           const data = extractMessage(msg);
-          if (data) extracted.push(data);
+          if (data) {
+            data.chatName = getChatName(USER_ID, data.chatId);
+            extracted.push(data);
+          }
         } catch (err) {
           logger.debug({ err, messageId: msg.key?.id }, "Failed to extract history message");
         }
@@ -300,26 +325,6 @@ async function connectWhatsApp() {
         } catch (err) {
           logger.error({ err }, "Failed to save history message batch");
         }
-      }
-    }
-
-    // Process contacts from history
-    if (contacts?.length) {
-      const contactData = contacts
-        .filter(c => c.id)
-        .map(c => ({
-          jid: c.id,
-          name: c.name || c.verifiedName || null,
-          notifyName: c.notify || null,
-          isGroup: c.id.endsWith("@g.us"),
-          lastMessageAt: null,
-        }));
-
-      try {
-        await upsertContactBatch(contactData);
-        logger.info({ count: contactData.length }, "History contacts saved");
-      } catch (err) {
-        logger.error({ err }, "Failed to save history contacts");
       }
     }
 
@@ -411,15 +416,10 @@ async function handleDownload(messageId, res) {
     }
   }
 
-  // Allow-list: alphanumeric, dot, dash, underscore, space. Everything else
-  // (quotes, path separators, control chars, CRLF header-injection attempts)
-  // gets replaced rather than just stripping the one `"` character.
-  const safeFilename = (media.fileName || messageId).replace(/[^A-Za-z0-9._\- ]+/g, "_");
-
   res.writeHead(200, {
     "Content-Type": media.mimetype || "application/octet-stream",
     "Content-Length": buffer.length,
-    "Content-Disposition": `attachment; filename="${safeFilename}"`,
+    "Content-Disposition": `attachment; filename="${(media.fileName || messageId).replace(/"/g, "")}"`,
   });
   res.end(buffer);
 }
@@ -443,11 +443,6 @@ function startHealthServer() {
     }
     const dlMatch = req.method === "GET" && req.url?.match(/^\/download\/(.+)$/);
     if (dlMatch) {
-      if (BRIDGE_SHARED_SECRET && req.headers["x-bridge-secret"] !== BRIDGE_SHARED_SECRET) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "unauthorized" }));
-        return;
-      }
       await handleDownload(decodeURIComponent(dlMatch[1]), res);
       return;
     }
@@ -467,7 +462,9 @@ function startHealthServer() {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  logger.info("WhatsApp Bridge starting");
+  // USER_ID in the startup line so two bridges are distinguishable in logs —
+  // otherwise the only clue which session is which is the auth_state mount.
+  logger.info({ userId: USER_ID, authDir: AUTH_DIR }, "WhatsApp Bridge starting");
 
   initDb();
   await ensureTables();

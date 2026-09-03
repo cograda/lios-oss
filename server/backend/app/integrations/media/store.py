@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.integrations.media.models import MediaItem
 
-BRIDGE_URL = os.environ.get("WA_BRIDGE_URL", "http://comar-whatsapp:3100")
+BRIDGE_URL = os.environ.get("WA_BRIDGE_URL", "http://lios-whatsapp:3100")
 
 # Auto-download window for the scheduled sync. Anything older is 'expired' at
 # scan time anyway (see scan.py); this is a second guard so a stalled scheduler
@@ -87,13 +87,9 @@ def download_item(session: Session, item: MediaItem) -> bool:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / storage_filename(item)
 
-    headers = {}
-    if settings.wa_bridge_shared_secret:
-        headers["X-Bridge-Secret"] = settings.wa_bridge_shared_secret
-
     try:
         with httpx.stream(
-            "GET", f"{BRIDGE_URL}/download/{item.message_ref}", timeout=120.0, headers=headers,
+            "GET", f"{BRIDGE_URL}/download/{item.message_ref}", timeout=120.0
         ) as r:
             r.raise_for_status()
             sha = hashlib.sha256()

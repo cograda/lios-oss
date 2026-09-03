@@ -1,6 +1,6 @@
 """Inbox triage integration.
 
-The automation webhook at /api/inbox/ingest drops files into /inbox/<bucket>/.
+The Tines webhook at /api/inbox/ingest drops files into /inbox/<bucket>/.
 This integration is the *triage* layer on top of that drop zone:
 
   - The hourly worker (`scan.enrich_pending`) sniffs file kind and extracts
@@ -9,23 +9,39 @@ This integration is the *triage* layer on top of that drop zone:
     `inbox_dismiss`, `inbox_to_vault`, `inbox_to_corpus`) let skills surface
     the queue to the user and route each item interactively.
 
-State lives on disk, not in Postgres (same model as csv-inbox/archive):
-  /inbox/<bucket>/       — pending (incoming, text, image, audio, file)
-  /inbox/archive/        — handled (moved here when routed)
-  /inbox/dismissed/      — explicitly ignored
+State lives on disk, per-user (F6, 2026-08-08 — added an `InboxItem` DB
+ownership ledger, see models.py):
+  /inbox/u<user_id>/<bucket>/  — pending (incoming, text, image, audio, file)
+  /inbox/u<user_id>/archive/   — handled (moved here when routed)
+  /inbox/u<user_id>/dismissed/ — explicitly ignored
+  /inbox/<bucket>/             — legacy flat tree (pre-split); lazily
+                                  adopted into user 1's subtree by
+                                  `scan.adopt_legacy_files()`
 
-V1 supports PDF + plaintext/markdown enrichment. Images/audio land but get
-only size/dimension previews — no OCR or transcription yet.
+Enrichment is split by cost. PDF and plaintext/markdown previews are cheap and
+local, so they run inline in the ingest request. Audio and images are billable
+per call and depend on a third party, so each has its own bounded cron sweep
+(`transcribe_pending`, `describe_pending`) that records its outcome on the
+sidecar and never retries a file it has already paid for.
+
+`SourceIntegration` conversion (V4 chunk 4.3, batch A): the "external
+system" here is the filesystem drop zone rather than a remote API, so
+there's nothing meaningful to fetch-without-writing — `pull()` is a no-op
+and `store()` does the actual enrichment pass, exactly as the old `sync()`
+did. No multi-account concept — `accounts()` stays at the
+`SourceIntegration` default.
 """
 
 from typing import Any
 
-from app.integrations.base import BaseIntegration
-from app.integrations.inbox.scan import enrich_pending
+from sqlalchemy.orm import Session
+
+from app.integrations.inbox import scan
 from app.integrations.inbox.tools import get_mcp_tools
+from app.plugin.bases import PullResult, SourceIntegration
 
 
-class InboxIntegration(BaseIntegration):
+class InboxIntegration(SourceIntegration):
     @property
     def name(self) -> str:
         return "inbox"
@@ -34,25 +50,27 @@ class InboxIntegration(BaseIntegration):
     def display_name(self) -> str:
         return "Inbox"
 
-    def sync(self) -> None:
+    def pull(self, account: Any, session: Session, cursor: str | None) -> PullResult:
+        # Nothing to fetch remotely — the "source" is the local /inbox/
+        # drop zone. The actual enrichment work happens in `store()`.
+        return PullResult(records=[])
+
+    def store(self, session: Session, records: list[Any]) -> int:
         # Enrichment runs synchronously — fine inside the scheduler's
         # asyncio.to_thread wrapper. Cheap (≤a few hundred files, mostly
         # text reads + first-page PDF extract).
-        from app.db import get_db
-        with get_db().session() as session:
-            enrich_pending(session)
+        result = scan.enrich_pending(session)
+        return result["enriched"]
 
     def mcp_tools(self) -> list[dict[str, Any]]:
         return get_mcp_tools()
 
     async def dashboard_data(self) -> dict[str, Any]:
-        from app.integrations.inbox.scan import count_pending
-        return {"pending": count_pending()}
+        # Cross-user total — the dashboard is an admin/household view, not a
+        # per-caller tool response, so this deliberately doesn't scope to
+        # one user (matches the documented exception in server/CLAUDE.md's
+        # "Per-user request scoping" section).
+        return {"pending": len(scan.iter_all_pending_files())}
 
-    def sync_schedule(self) -> str | None:
-        # Every hour at :07 — offset from other integrations so we don't all
-        # wake at :00 and contend on the same DB/file resources.
-        return "7 * * * *"
-
-    def is_configured(self) -> bool:
-        return True
+    # is_configured(): default (inbox_token is optional in config_schema,
+    # so this stays vacuously True — matches prior behavior).

@@ -1,7 +1,9 @@
 """Capture structured snag reports from WhatsApp into the snag register.
 
-Sam's (and anyone's) convention: `Snag - <room> - [<element>] - [WindowCo] - <detail>`
-as a text message or a photo caption. Capture:
+Reporting convention: `Snag - <room> - [<element>] - [<trade>] - <detail>` as a
+text message or a photo caption. Room names are normalised through the
+`room_aliases` config map and trades through `trades` (see vocab.py) —
+both deployment-specific. Capture:
 
   1. finds snag-shaped messages not yet in snag_source_messages
   2. groups identical (room, normalised text) so a text message + N photos of
@@ -22,35 +24,38 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
-from app.integrations.media.models import MediaItem
-from app.integrations.snags.models import Snag, SnagMedia, SnagSourceMessage, TRADES
+from app.auth.context import current_user_id
+from app.integrations.snags.models import Snag, SnagMedia, SnagSourceMessage
+from app.integrations.snags.vocab import room_aliases, trades
+from app.plugin.capabilities import get_capability
+
+MediaItem = get_capability("media.store").Item
 
 logger = logging.getLogger(__name__)
 
-ROOM_ALIASES = {
-    "finns room": "Finn's room",
-    "finn's room": "Finn's room",
-    "islas room": "Isla's room",
-    "isla's room": "Isla's room",
-    "alex office": "Alex's office",
-    "alexs office": "Alex's office",
-    "sam office": "Sam's office",
-    "sams office": "Sam's office",
-    "guest wc": "Guest WC",
-    "main space": "Main space",
-    "all": "House-wide",
-    "all windows": "House-wide",
-    "utility": "Utility room",
-    "utility room": "Utility room",
-    "master": "Master bedroom",
-}
 
-_TRADE_TOKENS = {t.replace("-", " "): t for t in TRADES} | {"ken/fergal": "ken-fergal"}
+def _trade_tokens() -> dict[str, str]:
+    """Loose spellings of a trade → its canonical slug.
+
+    Read per call rather than computed at import: `trades()` is config, and
+    a config change should take effect without a restart. Slug-with-hyphens
+    is also accepted spelled with a space or a slash, since that's how
+    people type multi-name trades in a WhatsApp message.
+    """
+    out: dict[str, str] = {}
+    for slug in trades():
+        out[slug] = slug
+        out[slug.replace("-", " ")] = slug
+        out[slug.replace("-", "/")] = slug
+    return out
 
 
 def _normalise_room(token: str) -> str:
     key = token.strip().lower()
-    return ROOM_ALIASES.get(key, token.strip().capitalize() if token.islower() else token.strip())
+    aliases = room_aliases()
+    if key in aliases:
+        return aliases[key]
+    return token.strip().capitalize() if token.islower() else token.strip()
 
 
 def parse_snag_text(text: str) -> dict | None:
@@ -68,10 +73,11 @@ def parse_snag_text(text: str) -> dict | None:
 
     trade = "unknown"
     element_tokens = []
+    trade_tokens = _trade_tokens()
     for tok in middle:
         t = tok.strip().lower()
-        if t in _TRADE_TOKENS:
-            trade = _TRADE_TOKENS[t]
+        if t in trade_tokens:
+            trade = trade_tokens[t]
         else:
             element_tokens.append(tok.strip())
 
@@ -95,18 +101,34 @@ def _next_uid(session: Session) -> str:
 
 
 def capture_whatsapp_snags(session: Session, since_days: int = 7) -> dict:
-    """Scan whatsapp messages for snag-shaped text/captions and register them."""
+    """Scan whatsapp messages for snag-shaped text/captions and register them.
+
+    Idempotency (`snag_source_messages`) is per-user (F5): a group-chat
+    message ingested by both household members' WhatsApp bridges shares a
+    `message_ref` across their two `whatsapp_messages` rows, so the "already
+    captured" join must also match `user_id` — otherwise the second user's
+    capture run would silently see the first user's row as "already seen"
+    and skip a snag that, from their side, is new. Symmetrically, the source
+    scan itself is scoped to `w.user_id`: `whatsapp_messages` is per-user
+    data, and without that filter a capture run would also re-process the
+    OTHER user's copy of the same shared-group message, producing two
+    `snag_source_messages` inserts for one `(user_id, message_ref)` and a
+    unique-constraint violation.
+    """
+    uid = current_user_id()
     cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
     rows = session.execute(sa_text("""
         SELECT w.message_id, w.sender_name, w.timestamp, w.is_from_me,
                COALESCE(w.body, w.media_caption) AS snag_text
           FROM whatsapp_messages w
-          LEFT JOIN snag_source_messages s ON s.message_ref = w.message_id
-         WHERE w.timestamp >= :cutoff
+          LEFT JOIN snag_source_messages s
+                 ON s.message_ref = w.message_id AND s.user_id = :uid
+         WHERE w.user_id = :uid
+           AND w.timestamp >= :cutoff
            AND s.id IS NULL
            AND (w.body ILIKE 'snag%' OR w.media_caption ILIKE 'snag%')
          ORDER BY w.timestamp ASC
-    """), {"cutoff": cutoff}).all()
+    """), {"cutoff": cutoff, "uid": uid}).all()
 
     # Group identical (room, lowercased detail) → one snag, many messages
     groups: dict[tuple, dict] = {}
@@ -141,10 +163,19 @@ def capture_whatsapp_snags(session: Session, since_days: int = 7) -> dict:
 
         refs = [m.message_id for m in messages]
         for ref in refs:
-            session.add(SnagSourceMessage(message_ref=ref, snag_id=snag.id))
+            session.add(SnagSourceMessage(message_ref=ref, snag_id=snag.id, user_id=uid))
+        # F5: scope to the capturing user's own MediaItem rows. Without this,
+        # a message_ref shared across both bridges' whatsapp_messages rows
+        # could pull in the OTHER user's media item as "evidence" the
+        # current user never sent or received — a shared snag becoming an
+        # implicit channel for one user's WhatsApp media to reach the other.
         media = (
             session.query(MediaItem)
-            .filter(MediaItem.source == "whatsapp", MediaItem.message_ref.in_(refs))
+            .filter(
+                MediaItem.source == "whatsapp",
+                MediaItem.message_ref.in_(refs),
+                MediaItem.user_id == uid,
+            )
             .all()
         )
         for item in media:

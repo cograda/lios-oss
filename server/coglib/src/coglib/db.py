@@ -30,14 +30,18 @@ class Database:
         pool_recycle: int = 3600,
         pool_pre_ping: bool = True,
     ) -> None:
-        self.engine = create_engine(
-            url,
-            echo=echo,
-            pool_size=pool_size,
-            max_overflow=max_overflow,
-            pool_recycle=pool_recycle,
-            pool_pre_ping=pool_pre_ping,
-        )
+        engine_kwargs: dict[str, object] = {"echo": echo, "pool_size": pool_size}
+        # max_overflow / pool_recycle / pool_pre_ping are QueuePool-only —
+        # SQLite's SingletonThreadPool/NullPool reject them outright, and
+        # in-memory SQLite (used by this project's own tests, and likely by
+        # others) is the pool_size-only case that predates this change.
+        # Passing them unconditionally breaks every SQLite consumer of
+        # coglib.db.Database, so they only apply to real (pooled) backends.
+        if not url.startswith("sqlite"):
+            engine_kwargs["max_overflow"] = max_overflow
+            engine_kwargs["pool_recycle"] = pool_recycle
+            engine_kwargs["pool_pre_ping"] = pool_pre_ping
+        self.engine = create_engine(url, **engine_kwargs)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
 
     def create_tables(self) -> None:

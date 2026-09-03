@@ -78,24 +78,16 @@ class StreamManager:
         self,
         user: str,
         channel: str,
-        queue: asyncio.Queue | None = None,
+        queue: asyncio.Queue,
     ) -> None:
         """Remove a subscriber.
 
         `queue` identifies which subscriber to remove (multiple may exist
-        for the same key). If omitted, all subscribers for the key are
-        removed — kept for backwards compatibility, but new callers should
-        always pass the queue returned by subscribe().
+        for the same key) — always the queue returned by subscribe().
         """
         key = self._key(user, channel)
         async with self._lock:
             subs = self._subscribers.get(key, [])
-            if queue is None:
-                # Legacy path — remove everyone for the key.
-                if subs:
-                    del self._subscribers[key]
-                    logger.info("Subscriber disconnected: %s (all %d)", key, len(subs))
-                return
             before = len(subs)
             subs[:] = [s for s in subs if s.queue is not queue]
             removed = before - len(subs)

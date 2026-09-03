@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, Text, Boolean, func
+from sqlalchemy import DateTime, Index, String, Text, Boolean, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from coglib import Base
@@ -13,6 +13,9 @@ class CalendarEvent(SourcedRecordMixin, Base):
     """Cached Google Calendar event."""
 
     __tablename__ = "calendar_events"
+    __table_args__ = (
+        Index("ix_calendar_events_start_time", "start_time"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     google_event_id: Mapped[str] = mapped_column(String(255), unique=True)

@@ -451,6 +451,150 @@ class TestHealthWeeklySummary:
 
 
 # ---------------------------------------------------------------------------
+# Provisional same-day HRV/HR tests
+#
+# Real-world bug: on 2026-08-24, health_summary reported HRV 53 with
+# hr_min/avg/max all pinned to 56 — a same-day placeholder written before
+# the day settles — while yesterday's *settled* HRV was 18.2 against a
+# 7-day mean of 33.5. The placeholder didn't just err, it inverted the
+# training-readiness conclusion. These assert the fix flags a same-day
+# reading rather than silently serving it as final, and does NOT flag a
+# settled past reading.
+#
+# Detection is on the calendar date (target == today), not on
+# hr_min == hr_avg == hr_max: checked live via health_trends across
+# 2026-08-04..2026-08-24, that "collapsed" signature was present on every
+# settled day too, so it would have false-positived 100% of the time.
+# ---------------------------------------------------------------------------
+
+
+class TestProvisionalSameDayReadings:
+    _FIXED_TODAY = date(2026, 5, 12)  # arbitrary Tuesday
+
+    @pytest.fixture(autouse=True)
+    def _pin_today(self):
+        with unittest.mock.patch.object(_tools_mod, "_today", return_value=self._FIXED_TODAY):
+            yield
+
+    def test_health_today_flags_provisional_for_same_day_hrv(self, db_session):
+        sync_from_push(
+            [
+                {"date": self._FIXED_TODAY.isoformat(), "metric_type": "hrv_ms", "value": 53.9},
+                {"date": self._FIXED_TODAY.isoformat(), "metric_type": "hr_min_bpm", "value": 56},
+                {"date": self._FIXED_TODAY.isoformat(), "metric_type": "hr_avg_bpm", "value": 56},
+                {"date": self._FIXED_TODAY.isoformat(), "metric_type": "hr_max_bpm", "value": 56},
+            ],
+            [], [], db_session, user_id=1,
+        )
+        result = json.loads(_tools_mod.handle_health_today(db_session, {}))
+        assert result["provisional"] is True
+        assert "provisional_reason" in result
+
+    def test_health_today_not_provisional_for_settled_past_date(self, db_session):
+        """Same collapsed hr_min==hr_avg==hr_max shape, but a settled past
+        date — must NOT be flagged, proving detection is date-based."""
+        past = self._FIXED_TODAY - timedelta(days=1)
+        sync_from_push(
+            [
+                {"date": past.isoformat(), "metric_type": "hrv_ms", "value": 18.2},
+                {"date": past.isoformat(), "metric_type": "hr_min_bpm", "value": 81},
+                {"date": past.isoformat(), "metric_type": "hr_avg_bpm", "value": 81},
+                {"date": past.isoformat(), "metric_type": "hr_max_bpm", "value": 81},
+            ],
+            [], [], db_session, user_id=1,
+        )
+        result = json.loads(
+            _tools_mod.handle_health_today(db_session, {"date": past.isoformat()})
+        )
+        assert "provisional" not in result
+
+    def test_health_summary_flags_provisional_when_today_hrv_present(self, db_session):
+        yesterday = self._FIXED_TODAY - timedelta(days=1)
+        sync_from_push(
+            [{"date": yesterday.isoformat(), "metric_type": "hrv_ms", "value": 18.2}],
+            [], [], db_session, user_id=1,
+        )
+        sync_from_push(
+            [
+                {"date": self._FIXED_TODAY.isoformat(), "metric_type": "hrv_ms", "value": 53.9},
+                {"date": self._FIXED_TODAY.isoformat(), "metric_type": "hr_min_bpm", "value": 56},
+                {"date": self._FIXED_TODAY.isoformat(), "metric_type": "hr_avg_bpm", "value": 56},
+                {"date": self._FIXED_TODAY.isoformat(), "metric_type": "hr_max_bpm", "value": 56},
+            ],
+            [], [], db_session, user_id=1,
+        )
+        result = json.loads(_tools_mod.handle_health_summary(db_session, {}))
+        assert result["provisional"] is True
+        assert "hrv_ms" in result["provisional_fields"]
+        assert "(provisional" in result["summary"]
+        # the value itself must still be present, never suppressed
+        assert "53" in result["summary"]
+
+    def test_health_summary_not_provisional_with_only_settled_yesterday_data(self, db_session):
+        yesterday = self._FIXED_TODAY - timedelta(days=1)
+        sync_from_push(
+            [
+                {"date": yesterday.isoformat(), "metric_type": "hrv_ms", "value": 18.2},
+                {"date": yesterday.isoformat(), "metric_type": "hr_avg_bpm", "value": 81},
+            ],
+            [], [], db_session, user_id=1,
+        )
+        result = json.loads(_tools_mod.handle_health_summary(db_session, {}))
+        assert "provisional" not in result
+        assert "(provisional" not in result["summary"]
+
+    def test_health_trends_flags_provisional_date(self, db_session):
+        past = self._FIXED_TODAY - timedelta(days=1)
+        sync_from_push(
+            [{"date": past.isoformat(), "metric_type": "hrv_ms", "value": 18.2}],
+            [], [], db_session, user_id=1,
+        )
+        sync_from_push(
+            [{"date": self._FIXED_TODAY.isoformat(), "metric_type": "hrv_ms", "value": 53.9}],
+            [], [], db_session, user_id=1,
+        )
+        result = json.loads(_tools_mod.handle_health_trends(db_session, {"days": 7}))
+        assert result["provisional_dates"] == [self._FIXED_TODAY.isoformat()]
+
+    def test_health_trends_not_provisional_without_today_data(self, db_session):
+        past = self._FIXED_TODAY - timedelta(days=1)
+        sync_from_push(
+            [{"date": past.isoformat(), "metric_type": "hrv_ms", "value": 18.2}],
+            [], [], db_session, user_id=1,
+        )
+        result = json.loads(_tools_mod.handle_health_trends(db_session, {"days": 7}))
+        assert "provisional_dates" not in result
+
+    def test_health_weekly_summary_flags_provisional_when_week_includes_today(self, db_session):
+        week_start = self._FIXED_TODAY - timedelta(days=self._FIXED_TODAY.weekday())
+        sync_from_push(
+            [{"date": self._FIXED_TODAY.isoformat(), "metric_type": "hrv_ms", "value": 53.9}],
+            [], [], db_session, user_id=1,
+        )
+        result = json.loads(
+            _tools_mod.handle_health_weekly_summary(
+                db_session, {"week_start": week_start.isoformat()}
+            )
+        )
+        assert result["vitals"]["provisional"] is True
+
+    def test_health_weekly_summary_not_provisional_for_past_week(self, db_session):
+        past_week_start = self._FIXED_TODAY - timedelta(
+            days=self._FIXED_TODAY.weekday() + 14
+        )
+        sync_from_push(
+            [{"date": past_week_start.isoformat(), "metric_type": "hrv_ms", "value": 18.2}],
+            [], [], db_session, user_id=1,
+        )
+        result = json.loads(
+            _tools_mod.handle_health_weekly_summary(
+                db_session, {"week_start": past_week_start.isoformat()}
+            )
+        )
+        assert "provisional" not in result["vitals"]
+
+
+# ---------------------------------------------------------------------------
 # Aggregation tests
 # ---------------------------------------------------------------------------
 
@@ -527,3 +671,259 @@ class TestAggregateDailyMetrics:
 
     def test_empty_input(self):
         assert _aggregate_daily_metrics([]) == []
+
+
+# ---------------------------------------------------------------------------
+# Coverage gaps (facade capability `health.coverage`)
+# ---------------------------------------------------------------------------
+
+
+class TestCoverageGaps:
+    """Holes in the `date` axis — the thing the staleness probe cannot see.
+
+    The manifest's probe is MAX(synced_at): "did a push arrive". With Health
+    Auto Export re-sending a trailing window, that stays green even when an
+    off-network stretch left days missing in the middle. These tests pin the
+    distinction.
+    """
+
+    @staticmethod
+    def _seed(session, user_id, days_ago_list, *, synced_at=None):
+        today = date.today()
+        for n in days_ago_list:
+            session.add(HealthDailyMetric(
+                user_id=user_id,
+                date=today - timedelta(days=n),
+                metric_type="steps",
+                value=1000 + n,
+                synced_at=synced_at or datetime.now(timezone.utc),
+            ))
+        session.flush()
+
+    def test_no_gaps_when_every_day_present(self, db_session):
+        from app.integrations.apple_health.facade import FACADE
+
+        self._seed(db_session, 1, range(1, 15))
+        assert FACADE.coverage_gaps(db_session, days=14) == []
+
+    def test_reports_missing_days(self, db_session):
+        from app.integrations.apple_health.facade import FACADE
+
+        # Three days off-network in the middle of the window.
+        present = [n for n in range(1, 15) if n not in (5, 6, 7)]
+        self._seed(db_session, 1, present)
+
+        gaps = FACADE.coverage_gaps(db_session, days=14)
+        assert len(gaps) == 1
+        assert gaps[0]["user_id"] == 1
+        assert gaps[0]["checked_days"] == 14
+        today = date.today()
+        assert gaps[0]["missing_days"] == sorted(
+            (today - timedelta(days=n)).isoformat() for n in (5, 6, 7)
+        )
+
+    def test_fresh_synced_at_does_not_hide_a_gap(self, db_session):
+        """The regression this axis exists for.
+
+        Every row was re-pushed a minute ago — MAX(synced_at) is pristine — but
+        day 5 never arrived. The staleness probe would say "healthy".
+        """
+        from app.integrations.apple_health.facade import FACADE
+
+        just_now = datetime.now(timezone.utc)
+        self._seed(db_session, 1, [n for n in range(1, 15) if n != 5], synced_at=just_now)
+
+        gaps = FACADE.coverage_gaps(db_session, days=14)
+        assert len(gaps[0]["missing_days"]) == 1
+
+    def test_today_is_excluded(self, db_session):
+        """Today is legitimately incomplete until the scheduled export runs."""
+        from app.integrations.apple_health.facade import FACADE
+
+        self._seed(db_session, 1, range(1, 15))  # yesterday .. 14 days ago
+        gaps = FACADE.coverage_gaps(db_session, days=14)
+        assert gaps == []
+
+    def test_users_are_scoped_independently(self, db_session):
+        """One working phone must not mask another's dead one.
+
+        The kernel's freshness probe takes a table-wide MAX(), so this is
+        exactly the case it gets wrong.
+        """
+        from app.integrations.apple_health.facade import FACADE
+
+        self._seed(db_session, 1, range(1, 15))            # complete
+        self._seed(db_session, 2, [1, 2, 3])               # nothing older
+
+        gaps = FACADE.coverage_gaps(db_session, days=14)
+        assert [g["user_id"] for g in gaps] == [2]
+        assert len(gaps[0]["missing_days"]) == 11
+
+    def test_user_with_no_data_is_not_reported(self, db_session):
+        """Not set up is not the same as broken."""
+        from app.integrations.apple_health.facade import FACADE
+
+        self._seed(db_session, 1, range(1, 15))
+        gaps = FACADE.coverage_gaps(db_session, days=14)
+        assert all(g["user_id"] != 2 for g in gaps)
+
+    def test_user_id_filter(self, db_session):
+        from app.integrations.apple_health.facade import FACADE
+
+        self._seed(db_session, 1, [1])
+        self._seed(db_session, 2, [1])
+
+        gaps = FACADE.coverage_gaps(db_session, days=14, user_id=2)
+        assert [g["user_id"] for g in gaps] == [2]
+
+    def test_capability_is_resolvable(self):
+        """`system`'s alerts axis reaches this through the capability registry,
+        not a direct import — so the manifest wiring is part of the contract."""
+        from app.plugin.capabilities import get_capability
+
+        assert hasattr(get_capability("health.coverage"), "coverage_gaps")
+
+
+# ---------------------------------------------------------------------------
+# Parser resilience — one bad record must not reject the whole export
+# ---------------------------------------------------------------------------
+
+
+class TestParserResilience:
+    """A malformed record loses itself, not the payload.
+
+    Uniquely important for this source because Health Auto Export re-sends a
+    *trailing window*: if one bad record 422s the export, the next export
+    carries the same bad record and fails identically. The fault looks
+    transient and is actually permanent, and no data lands at all in the
+    meantime.
+    """
+
+    @staticmethod
+    def _payload(metrics=None, workouts=None):
+        return {"data": {"metrics": metrics or [], "workouts": workouts or []}}
+
+    def test_undated_metric_entry_does_not_lose_the_good_ones(self):
+        raw = self._payload(metrics=[{
+            "name": "step_count",
+            "data": [
+                {"date": "2026-08-20 00:00:00 +0000", "qty": 5000},
+                {"qty": 9999},  # no date at all
+                {"date": "2026-08-21 00:00:00 +0000", "qty": 6000},
+            ],
+        }])
+        metrics, _, _, skipped = _parse_mod.parse_health_auto_export(raw)
+
+        by_date = {m["date"]: m["value"] for m in metrics}
+        assert by_date == {"2026-08-20": 5000, "2026-08-21": 6000}
+        assert len(skipped) == 1
+        assert "step_count" in skipped[0]
+
+    def test_workout_without_start_is_skipped_not_fatal(self):
+        raw = self._payload(workouts=[
+            {"name": "Outdoor Walk", "end": "2026-08-20 10:00:00 +0000"},  # no start
+            {
+                "name": "Outdoor Run",
+                "start": "2026-08-20 11:00:00 +0000",
+                "end": "2026-08-20 11:30:00 +0000",
+            },
+        ])
+        _, workouts, _, skipped = _parse_mod.parse_health_auto_export(raw)
+
+        assert [w["workout_type"] for w in workouts] == ["running"]
+        assert len(skipped) == 1
+        assert "Outdoor Walk" in skipped[0]
+
+    def test_unparseable_date_format_is_skipped_not_fatal(self):
+        raw = self._payload(metrics=[{
+            "name": "step_count",
+            "data": [
+                {"date": "not-a-date", "qty": 1},
+                {"date": "2026-08-20 00:00:00 +0000", "qty": 5000},
+            ],
+        }])
+        metrics, _, _, skipped = _parse_mod.parse_health_auto_export(raw)
+
+        assert len(metrics) == 1 and metrics[0]["value"] == 5000
+        assert len(skipped) == 1
+
+    def test_metric_without_a_name_key_does_not_raise(self):
+        # `metrics_by_name` used to index m["name"] directly while building.
+        raw = self._payload(metrics=[
+            {"data": [{"date": "2026-08-20 00:00:00 +0000", "qty": 1}]},
+            {"name": "step_count",
+             "data": [{"date": "2026-08-20 00:00:00 +0000", "qty": 5000}]},
+        ])
+        metrics, _, _, _ = _parse_mod.parse_health_auto_export(raw)
+        assert [m["value"] for m in metrics] == [5000]
+
+    def test_clean_payload_reports_no_skips(self):
+        raw = self._payload(metrics=[{
+            "name": "step_count",
+            "data": [{"date": "2026-08-20 00:00:00 +0000", "qty": 5000}],
+        }])
+        _, _, _, skipped = _parse_mod.parse_health_auto_export(raw)
+        assert skipped == []
+
+
+# ---------------------------------------------------------------------------
+# Push silence — "is the phone still calling us at all"
+# ---------------------------------------------------------------------------
+
+
+class TestPushSilence:
+    """The axis that catches a source that has simply stopped.
+
+    Measured 2026-08-23: last push 09:00 on 08-22, and `system_alerts` still
+    reported `apple_health: status "ok"` 37 hours later, because every other
+    signal reasons about data comar *received*. This one reads the last push
+    attempt.
+    """
+
+    @staticmethod
+    def _state(session, *, hours_ago, status="ok"):
+        from app.models.tokens import SyncState
+
+        row = session.query(SyncState).filter_by(integration="apple_health").first()
+        if row is None:
+            row = SyncState(integration="apple_health")
+            session.add(row)
+        row.last_sync_at = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        row.last_sync_status = status
+        session.flush()
+        return row
+
+    def test_silent_when_pushes_are_recent(self, db_session):
+        from app.integrations.apple_health.facade import FACADE
+
+        self._state(db_session, hours_ago=2)
+        assert FACADE.push_silence(db_session, hours=12) is None
+
+    def test_reports_a_source_that_stopped_calling(self, db_session):
+        from app.integrations.apple_health.facade import FACADE
+
+        self._state(db_session, hours_ago=37)
+        out = FACADE.push_silence(db_session, hours=12)
+
+        assert out is not None
+        assert out["threshold_hours"] == 12
+        assert 36 < out["hours_silent"] < 38
+
+    def test_fires_well_before_the_36h_data_threshold(self, db_session):
+        """The whole point: catch it while the answer is still 'check Tailscale'.
+
+        At 13h silent the manifest's 36h staleness probe is still green, so if
+        this returned None too, nothing in comar would be saying anything.
+        """
+        from app.integrations.apple_health.facade import FACADE
+
+        self._state(db_session, hours_ago=13)
+        assert FACADE.push_silence(db_session, hours=12) is not None
+
+    def test_never_pushed_is_not_an_outage(self, db_session):
+        from app.integrations.apple_health.facade import FACADE
+        from app.models.tokens import SyncState
+
+        db_session.query(SyncState).filter_by(integration="apple_health").delete()
+        db_session.flush()
+        assert FACADE.push_silence(db_session, hours=12) is None

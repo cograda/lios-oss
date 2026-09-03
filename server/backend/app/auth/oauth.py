@@ -2,7 +2,7 @@
 
 Each account gets its own token row in the oauth_tokens table. The flow:
 
-1. User visits /api/auth/google/login?account=alex@example.com
+1. User visits /api/auth/google/login?account=user@gmail.com
 2. Redirected to Google consent screen
 3. Google redirects back to /api/auth/google/callback with code + state
 4. We exchange the code for tokens and store them
@@ -37,11 +37,27 @@ from app.errors import NeedsReauthError  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-# Scopes we request — Calendar and Gmail
-SCOPES = [
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/gmail.readonly",
-]
+def _oauth_scopes() -> list[str]:
+    """Union of every integration's declared Google OAuth scopes.
+
+    V4 chunk 3.3: replaces the single hard-coded `SCOPES` list — each
+    integration that needs Google OAuth now declares its own scopes in its
+    manifest (`oauth.scopes`; see google_calendar, google_mail, snags), and
+    a consent still requests all of them in one go (current actual
+    behavior, just relocated — a single Google account signs in once and
+    gets everything every integration needs, same as before).
+
+    Computed at request time, not cached, so a newly-added integration's
+    scopes take effect without a restart-order dependency.
+    """
+    from app.plugin.validate import discover_manifests
+
+    scopes: set[str] = set()
+    for manifest in discover_manifests().values():
+        if manifest.oauth is not None:
+            scopes.update(manifest.oauth.scopes)
+    return sorted(scopes)
+
 
 # Additional scopes to add as integrations are built
 PHOTOS_SCOPES = ["https://www.googleapis.com/auth/photoslibrary.readonly"]
@@ -127,7 +143,7 @@ def create_auth_url(
         "client_id": settings.google_client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": " ".join(SCOPES),
+        "scope": " ".join(_oauth_scopes()),
         "access_type": "offline",
         "include_granted_scopes": "true",
         "prompt": "consent",
@@ -195,7 +211,10 @@ def exchange_code(
     token.access_token = encrypt_token(token_data["access_token"])
     token.refresh_token = encrypt_token(token_data.get("refresh_token") or "") or token.refresh_token
     token.token_type = token_data.get("token_type", "Bearer")
-    token.scopes = token_data.get("scope", " ".join(SCOPES))
+    # `or`, not `.get(..., default)` — the latter evaluates the default
+    # eagerly (a discover_manifests() walk) even on the common path where
+    # Google's response already includes a `scope` field.
+    token.scopes = token_data.get("scope") or " ".join(_oauth_scopes())
     if "expires_in" in token_data:
         token.expires_at = datetime.now(timezone.utc) + timedelta(seconds=token_data["expires_in"])
     # Successful consent clears any prior revocation flag — the new tokens
@@ -246,7 +265,7 @@ def get_credentials(account_email: str, session: Session, *, user_id: int):
         token_uri=GOOGLE_TOKEN_URI,
         client_id=settings.google_client_id,
         client_secret=settings.google_client_secret,
-        scopes=token.scopes.split() if token.scopes else SCOPES,
+        scopes=token.scopes.split() if token.scopes else _oauth_scopes(),
         expiry=token.expires_at.replace(tzinfo=None) if token.expires_at else None,
     )
 

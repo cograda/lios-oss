@@ -1,16 +1,19 @@
 """System integration — cross-cutting diagnostic tools.
 
-Always configured, never syncs. Exposes tools that query across
-all integrations (alerts, health checks, etc.).
+A `CapabilityService` (V4 chunk 4.2): no external system, always
+configured, never syncs. Exposes composite tools that query across other
+integrations (alerts, morning briefing, week ahead, search everything) —
+strictly through their declared `app.plugin.capabilities.get_capability()`
+facades, never their internals (see `tools.py`'s module docstring).
 """
 
 from typing import Any
 
-from app.integrations.base import BaseIntegration
 from app.integrations.system.tools import get_mcp_tools
+from app.plugin.bases import CapabilityService
 
 
-class SystemIntegration(BaseIntegration):
+class SystemIntegration(CapabilityService):
     """Diagnostic tools that span all integrations."""
 
     @property
@@ -21,17 +24,10 @@ class SystemIntegration(BaseIntegration):
     def display_name(self) -> str:
         return "System"
 
-    def sync(self) -> None:
-        pass  # Nothing to sync
-
     def mcp_tools(self) -> list[dict[str, Any]]:
         return get_mcp_tools()
 
     async def dashboard_data(self) -> dict[str, Any]:
         return {"status": "ok"}
 
-    def sync_schedule(self) -> str | None:
-        return None  # No sync needed
-
-    def is_configured(self) -> bool:
-        return True
+    # is_configured(): default (empty config_schema -> vacuously True).

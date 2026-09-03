@@ -2,7 +2,7 @@
 
 Seeded with two rows by the multi-user migration:
     (1, 'alex',  'Alex')
-    (2, 'sam',  'Sam')
+    (2, 'sam', 'Sam')
 
 `name` is the canonical short identifier (lowercase, used in code paths
 like `Daily Notes/Alex/`). `display_name` is for UI rendering.
@@ -38,6 +38,15 @@ class User(Base):
     # from "daemon dead".
     reminders_verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # Tone for server-rendered prose (MCP instructions, morning briefing
+    # framing where such text exists): "direct" (default, Alex — concise,
+    # direct, current behavior) or "curious" (Sam — warm/curious, patterns
+    # surfaced as questions, no guilt-inducing framing around missed
+    # tasks/streaks). See sam-rollout Plan D2.
+    voice_profile: Mapped[str] = mapped_column(
+        String(20), default="direct", server_default="direct"
     )
 
     def __repr__(self) -> str:

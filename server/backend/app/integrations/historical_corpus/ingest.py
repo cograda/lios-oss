@@ -27,12 +27,15 @@ from app.integrations.historical_corpus.models import (
 from app.integrations.historical_corpus.parsers import ChunkRecord, DocMeta
 from app.integrations.historical_corpus.parsers import (
     boq as boq_parser,
+    claude_export as claude_export_parser,
     docx as docx_parser,
     email_json as email_parser,
+    manual as manual_parser,
     pdf as pdf_parser,
     voice_memo as voice_memo_parser,
     whatsapp as whatsapp_parser,
 )
+from app.plugin.config_store import plugin_config
 from app.services.embedding import EmbeddingService
 
 logger = logging.getLogger(__name__)
@@ -43,6 +46,16 @@ WHATSAPP_ROOT = "Comms Archive/WhatsApp Conversations"
 EMAIL_JSON_NAME = "email_conversations.json"
 VOICE_MEMO_ROOT = "Voice Memos"  # staged keeper transcripts (.md) from sandbox/voice-memos
 SKIP_DIRS = {"Archive"}  # lower priority per plan doc
+
+
+def default_project_tags() -> list[str]:
+    """Project tag(s) to apply when the caller doesn't specify any.
+
+    Deployment config, not a code constant — see the `default_project_tag`
+    key in this integration's manifest. Previously the literal "riverside"
+    (a family renovation project) hardcoded at four call sites.
+    """
+    return [plugin_config("historical_corpus").default_project_tag]
 
 
 def _hash(text: str) -> str:
@@ -226,6 +239,13 @@ def _dispatch_by_suffix(path: Path):
         # outside that root we skip.
         return None
     if suffix == ".md":
+        # Two different documents share this suffix. Route on content, not location: a
+        # manual carries a `manual_of:` frontmatter key. Before this check every .md went
+        # to voice_memo, so an equipment manual would have been stored with
+        # source_type="voice_memo" and chunked by the transcript word-windower — wrong
+        # label, wrong chunking, and invisible as a mislabelling because nothing errors.
+        if manual_parser.looks_like_manual(path):
+            return lambda: manual_parser.parse(path)
         return lambda: voice_memo_parser.parse(path)
     if suffix == ".pdf":
         return lambda: pdf_parser.parse(path)
@@ -252,7 +272,7 @@ def ingest_root(
     Commits in chunks (per source-type block) so a crash doesn't lose the full run.
     Embedding is handled by the background worker — we only enqueue here.
     """
-    project_tags = project_tags or ["renovation"]
+    project_tags = project_tags or default_project_tags()
     stats = {
         "whatsapp_docs": 0, "whatsapp_skipped": 0,
         "email_threads": 0,
@@ -412,9 +432,104 @@ def ingest_root(
     return stats
 
 
+def ingest_claude_export(
+    session: Session,
+    paths: list[Path],
+    *,
+    project_tags: list[str] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> dict:
+    """Ingest one or more claude.ai data-export conversations.json files.
+
+    Unlike ingest_root, this takes explicit file paths rather than walking a
+    directory tree — the export's conversations-NNN.json files don't live
+    under doc_corpus and aren't named predictably across re-exports.
+    """
+    project_tags = project_tags or ["claude-conversations"]
+    stats = {"conversations": 0, "skipped_empty": 0, "chunks": 0, "embeddings_enqueued": 0}
+
+    def _emit(msg: str) -> None:
+        if on_progress:
+            on_progress(msg)
+        logger.info(msg)
+
+    for conv_uuid, meta, chunks in claude_export_parser.iter_conversations(paths):
+        if not chunks:
+            stats["skipped_empty"] += 1
+            continue
+        rel = f"claude_export#conversation={conv_uuid}"
+        _, _, enq = _safe_upsert(
+            session, source_path=rel, meta=meta, chunks=chunks,
+            project_tags=project_tags,
+        )
+        stats["conversations"] += 1
+        stats["chunks"] += len(chunks)
+        stats["embeddings_enqueued"] += enq
+        if stats["conversations"] % 200 == 0:
+            session.commit()
+            _emit(f"[claude_export] {stats['conversations']} conversations processed…")
+
+    session.commit()
+    _emit(f"[claude_export] done: {stats['conversations']} conversations, {stats['chunks']} chunks")
+    return stats
+
+
+def ingest_manuals(
+    session: Session,
+    root: Path,
+    *,
+    project_tags: list[str] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> dict:
+    """Ingest a tree of normalised equipment manuals (markdown with `manual_of` frontmatter).
+
+    Separate from `ingest_root` because the manuals live in their own tree
+    (`Documents/Reference/Manuals/text/`) alongside the source PDFs they were built from.
+    Pointing `ingest_root` at that tree would ingest both — the same manual twice, once as
+    clean markdown and once as raw pypdf output, competing for every query.
+
+    ⚠️ Only the `text/` tree should ever be passed here. Its sibling `_not-ours/` holds
+    correct manuals for equipment that isn't ours, and indexing those produces confident
+    answers about hardware the house doesn't have.
+    """
+    project_tags = project_tags or ["manuals"]
+    stats = {"manual_docs": 0, "chunks": 0, "embeddings_enqueued": 0, "manual_failed": 0}
+
+    def _emit(msg: str) -> None:
+        if on_progress:
+            on_progress(msg)
+        logger.info(msg)
+
+    for path in sorted(root.rglob("*.md")):
+        if not manual_parser.looks_like_manual(path):
+            continue
+        try:
+            meta, chunks = manual_parser.parse(path)
+            if not chunks:
+                continue
+            rel = str(path.relative_to(root))
+            _, _, enq = _safe_upsert(
+                session, source_path=rel, meta=meta, chunks=chunks,
+                project_tags=project_tags,
+            )
+            stats["manual_docs"] += 1
+            stats["chunks"] += len(chunks)
+            stats["embeddings_enqueued"] += enq
+            _emit(f"[manual] {meta.title}: {len(chunks)} chunks (+{enq} embed)")
+        except Exception as e:
+            stats["manual_failed"] += 1
+            logger.exception(f"manual parse failed: {path}")
+            _emit(f"[manual] FAIL {path.name}: {e}")
+        if stats["manual_docs"] % 10 == 0:
+            session.commit()
+    session.commit()
+    _emit(f"[manual] done: {stats['manual_docs']} manuals, {stats['chunks']} chunks")
+    return stats
+
+
 def ingest_path(session: Session, path: Path, *, project_tags: list[str] | None = None) -> dict:
     """Ingest a single file. Handy for targeted re-runs."""
-    project_tags = project_tags or ["renovation"]
+    project_tags = project_tags or default_project_tags()
     producer = _dispatch_by_suffix(path)
     if producer is None:
         return {"skipped": str(path), "reason": "unsupported_or_no_heuristic"}

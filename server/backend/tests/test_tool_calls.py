@@ -49,10 +49,17 @@ def mcp_app(real_db, monkeypatch):
     """
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
+    from app.integrations import register_all
     from app.mcp import server as srv
 
+    # V4 chunk 3.4: embedding's tools are registered through the normal
+    # per-integration loop now (embedding is integration #20), not a
+    # standalone `_register_embedding_tools()` — guard stays so this only
+    # runs once across the test session (module-level registries persist
+    # across tests).
     if "search_semantic" not in srv._tool_handlers:
-        srv._register_embedding_tools()
+        register_all()
+        srv.register_mcp_tools()
 
     manager = StreamableHTTPSessionManager(
         app=srv.mcp_server, stateless=True, json_response=True,
@@ -66,7 +73,9 @@ def mcp_app(real_db, monkeypatch):
 def tokens(db_session):
     from app.models.clients import ClientToken
 
-    db_session.add(ClientToken(user_id=1, token="alex-client-token", label="test-alex"))
+    db_session.add(
+        ClientToken.for_token(user_id=1, token="alex-client-token", label="test-alex")
+    )
     db_session.commit()
 
 
@@ -108,6 +117,180 @@ async def test_dispatch_records_one_tool_calls_row(mcp_post, tokens, db_session)
     assert row.tool_call_id and len(row.tool_call_id) == 8  # secrets.token_hex(4)
     assert row.error is None
     assert row.called_at is not None
+
+
+# ---------------------------------------------------------------------------
+# V4 chunk 2.5: audit columns — args_summary/transport/source_ip on both
+# transports, and the optional `affected` field for opted-in write tools.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_mcp_dispatch_records_transport_and_args_summary(mcp_post, tokens, db_session):
+    import json
+
+    from app.models.tool_calls import ToolCall
+
+    resp = await mcp_post(
+        _call("search_stats", {"probe_field": "probe-value"}), bearer="alex-client-token",
+    )
+    assert resp.status_code == 200
+
+    row = (
+        db_session.query(ToolCall)
+        .filter(ToolCall.name == "search_stats")
+        .order_by(ToolCall.id.desc())
+        .first()
+    )
+    assert row is not None
+    assert row.transport == "mcp"
+    # httpx ASGITransport doesn't set a real client address; source_ip may
+    # be None in-process — the important thing is the column exists and the
+    # transport value made it through end to end.
+    assert row.args_summary is not None
+    parsed = json.loads(row.args_summary)
+    assert parsed.get("probe_field") == "probe-value"
+
+
+def test_http_dispatch_records_transport_and_source_ip(db_session, monkeypatch, tokens):
+    """Drives app.api.v1.call_tool directly via httpx ASGITransport against
+    a minimal FastAPI app carrying just the v1 router — proves the HTTP
+    adapter (not just MCP) threads transport/source_ip into dispatch_tool."""
+    import asyncio
+
+    import httpx
+    from fastapi import FastAPI
+
+    from app.api.v1 import router as v1_router
+    from app.integrations import register_all
+    from app.mcp import server as srv
+    from app.models.tool_calls import ToolCall
+
+    # This test builds its own bare FastAPI app rather than using the
+    # `mcp_app` fixture above, so it can't rely on that fixture's
+    # registration guard having already run — do it directly rather than
+    # depending on other tests in this file having executed first.
+    if "search_stats" not in srv._tool_handlers:
+        register_all()
+        srv.register_mcp_tools()
+
+    app = FastAPI()
+    app.include_router(v1_router)
+
+    async def _run():
+        transport = httpx.ASGITransport(app=app, client=("192.0.2.42", 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.post(
+                "/api/v1/tools/search_stats",
+                json={},
+                headers={
+                    "Authorization": "Bearer alex-client-token",
+                    "Content-Type": "application/json",
+                },
+            )
+
+    resp = asyncio.run(_run())
+    assert resp.status_code == 200
+
+    row = (
+        db_session.query(ToolCall)
+        .filter(ToolCall.name == "search_stats")
+        .order_by(ToolCall.id.desc())
+        .first()
+    )
+    assert row is not None
+    assert row.transport == "http"
+    assert row.source_ip == "192.0.2.42"
+
+
+@pytest.mark.anyio
+async def test_snag_add_records_affected(mcp_post, tokens, db_session, tmp_path, monkeypatch):
+    from app.config import settings
+    from app.models.tool_calls import ToolCall
+
+    # snag_add renders the vault note as part of the write (real behavior,
+    # not something to stub out) — give it a real directory to write into,
+    # matching a production deployment's actual vault mount, instead of the
+    # default /vaults which doesn't exist on a test runner.
+    (tmp_path / "alex").mkdir()
+    monkeypatch.setattr(settings, "vaults_root_path", str(tmp_path))
+
+    resp = await mcp_post(
+        _call("snag_add", {"title": "Cracked tile", "room": "Kitchen"}),
+        bearer="alex-client-token",
+    )
+    assert resp.status_code == 200
+
+    row = (
+        db_session.query(ToolCall)
+        .filter(ToolCall.name == "snag_add")
+        .order_by(ToolCall.id.desc())
+        .first()
+    )
+    assert row is not None
+    assert row.affected is not None
+    affected = json.loads(row.affected)
+    assert len(affected) == 1
+    assert affected[0].startswith("snag:")
+
+
+@pytest.mark.anyio
+async def test_tool_without_affected_leaves_it_null(mcp_post, tokens, db_session):
+    from app.models.tool_calls import ToolCall
+
+    resp = await mcp_post(_call("search_stats"), bearer="alex-client-token")
+    assert resp.status_code == 200
+
+    row = (
+        db_session.query(ToolCall)
+        .filter(ToolCall.name == "search_stats")
+        .order_by(ToolCall.id.desc())
+        .first()
+    )
+    assert row is not None
+    assert row.affected is None
+
+
+# ---------------------------------------------------------------------------
+# auth_events — a 401 (either transport) writes a row.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_mcp_401_writes_auth_events_row(mcp_post, db_session):
+    from app.models.auth_events import AuthEvent
+
+    resp = await mcp_post(_call("search_stats"), bearer="not-a-real-token")
+    assert resp.status_code == 401
+
+    rows = db_session.query(AuthEvent).filter(AuthEvent.outcome == "401").all()
+    assert len(rows) >= 1
+    assert any(r.transport == "mcp" for r in rows)
+
+
+def test_http_401_writes_auth_events_row(db_session):
+    import asyncio
+
+    import httpx
+    from fastapi import FastAPI
+
+    from app.api.v1 import router as v1_router
+    from app.models.auth_events import AuthEvent
+
+    app = FastAPI()
+    app.include_router(v1_router)
+
+    async def _run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get(
+                "/api/v1/heartbeat", headers={"Authorization": "Bearer bogus-token"},
+            )
+
+    resp = asyncio.run(_run())
+    assert resp.status_code == 401
+
+    rows = db_session.query(AuthEvent).filter(AuthEvent.outcome == "401").all()
+    assert len(rows) >= 1
+    assert any(r.transport == "http" for r in rows)
 
 
 @pytest.mark.anyio
@@ -243,3 +426,19 @@ def test_p95_ignores_calls_outside_24h_window(db_session):
 
     payload = json.loads(handle_alerts(db_session, {}))
     assert not any(a["tool"] == "old_slow_tool" for a in payload["tool_alerts"])
+
+
+def test_a_long_transport_label_is_truncated_not_dropped(db_session):
+    """2026-09-02: a script dispatched ~60 tool calls with
+    transport="script:backlog-review". The column is 10 chars; every audit
+    insert failed and was swallowed, so the calls ran unrecorded. A label
+    that does not fit is shortened; the row is never the thing that gives."""
+    from app.models.tool_calls import ToolCall
+    from app.services.tool_calls import record_tool_call
+
+    record_tool_call(
+        name="tasks_query", user_id=None, duration_ms=1, status="ok", error=None,
+        tool_call_id="tc-truncate", transport="script:backlog-review",
+    )
+    row = db_session.query(ToolCall).filter_by(tool_call_id="tc-truncate").one()
+    assert row.transport == "script:bac"

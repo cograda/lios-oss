@@ -13,6 +13,21 @@ _env_file = Path(__file__).resolve().parent.parent.parent / ".env"
 
 
 class HomeSettings(CogSettings):
+    """Kernel/bootstrap settings only (V4 chunk 3.3).
+
+    Every field here is either infra plumbing the app needs before it can
+    even reach the database (db connection lives in coglib's CogSettings;
+    ports, tokens gating auth middleware itself, the encryption key that
+    guards the config table this settles values *into*) or a Docker volume
+    mount path. Everything that used to live here per-integration (API
+    keys, feature toggles, per-account visibility maps, ...) now lives in
+    the `integration_config` DB table, declared by each integration's
+    manifest `config_schema` and read via `app.plugin.config_store.plugin_config()`.
+    See server/.env.example for the current full list of HOME_* env vars,
+    including the ones that only matter for the one-time
+    `python -m app.plugin.import_config` copy into that table.
+    """
+
     model_config = SettingsConfigDict(
         env_prefix="HOME_",
         env_nested_delimiter="__",
@@ -20,14 +35,13 @@ class HomeSettings(CogSettings):
         extra="ignore",
     )
 
-    app_name: str = "comar-server"
+    app_name: str = "lios-core"
     debug: bool = False
     port: int = 8400
 
-    # MCP bearer token
-    mcp_token: str = ""
-
-    # UI access token (simple auth for the web dashboard)
+    # UI access token (simple auth for the web dashboard, and the auth
+    # middleware that gates every /api/* route — must be readable before any
+    # integration-specific config lookup could even happen).
     ui_token: str = ""
 
     # Obsidian vault path (inside container).
@@ -41,7 +55,9 @@ class HomeSettings(CogSettings):
     # (single-user vaults; no cross-user Shared/ namespace).
     vaults_root_path: str = "/vaults"
 
-    # Google OAuth (shared app for Calendar, Gmail, Photos)
+    # Google OAuth (shared app registration for every Google-scoped
+    # integration — calendar, gmail, sheets/drive — hence kernel, not any
+    # one integration's own config)
     google_client_id: str = ""
     google_client_secret: str = ""
 
@@ -49,76 +65,65 @@ class HomeSettings(CogSettings):
     # Set to "http://localhost:8400" and use an SSH tunnel for auth.
     oauth_redirect_base: str = ""
 
-    # Health Auto Export push token (separate from UI token for least-privilege)
-    health_push_token: str = ""
-
-    # Home Assistant
-    ha_url: str = ""
-    ha_token: str = ""
-    # Record numeric→numeric transitions in ha_state_changes (off: HA's own
-    # recorder keeps numeric series; comar keeps the meaningful transitions)
-    ha_record_numeric_history: bool = False
-
-    # Last.fm
-    lastfm_api_key: str = ""
-    lastfm_username: str = ""
-
-    # Enable Banking
-    banking_api_key: str = ""
-
-    # Anthropic (for Haiku-powered task matching)
-    anthropic_api_key: str = ""
-
-    # OAuth token encryption (Fernet key, base64-encoded)
+    # OAuth token / integration_config secret encryption (Fernet key,
+    # base64-encoded). REQUIRED — app/auth/encryption.py is fail-closed
+    # (V4 chunk 3.3): unset, any encrypt/decrypt raises rather than passing
+    # secrets through in plaintext. Generate one:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     oauth_encryption_key: str = ""
-
-    # Shared secret sent as X-Bridge-Secret to the whatsapp-bridge's
-    # /download/:messageId endpoint. Must match BRIDGE_SHARED_SECRET on that
-    # container. Empty = no header sent (matches the bridge's dev-mode default).
-    wa_bridge_shared_secret: str = ""
 
     # MCP OAuth 2.1 authorization server (claude.ai connector sign-in).
     # Public issuer URL (the Tailscale host, e.g.
-    # https://your-server.your-tailnet.ts.net). Empty → OAuth routes disabled.
+    # https://ubuntudockerbox.tail78010b.ts.net). Empty → OAuth routes disabled.
     oauth_issuer: str = ""
 
-    # Inbox (automation webhook ingestion pipeline)
+    # Phase 0 OAuth login (app/auth/oauth_wire.py) is a throwaway UI-token
+    # gate that authenticates as user_id=1 (Alex) — fine on Tailnet, a
+    # landmine on public ingress. Explicit off-by-default kill switch (V4
+    # chunk 2.3): even with `oauth_issuer` set, /oauth/login refuses to
+    # mint anything until this is also true. Flip to true to keep the
+    # claude.ai connector working pre-Phase-1 (Google federation); off
+    # closes the impersonation path with zero code changes.
+    oauth_phase0_enable: bool = False
+
+    # Inbox (Tines webhook ingestion pipeline) — Docker volume mount path.
+    # inbox_token (the webhook's own bearer secret) moved to the inbox
+    # integration's config_schema.
     inbox_path: str = "/inbox"
-    inbox_token: str = ""
 
     # Media store (WhatsApp images/videos/audio) — volume-mounted host dir
     media_root: str = "/data/media"
 
-    # Server-side Syncthing — the comar app talks to it over the docker bridge
-    # gateway (so the REST API isn't exposed on Tailscale). API key is generated
-    # by Syncthing on first run and read from its config.xml.
+    # Server-side Syncthing — the comar app talks to it over the docker
+    # bridge gateway (so the REST API isn't exposed on Tailscale). Kernel,
+    # not any one integration's config: used both by the kernel's own
+    # /api/v1/syncthing/* pairing routes and by obsidian's vault_transfer
+    # tool. API key is generated by Syncthing on first run (its config.xml).
     syncthing_url: str = "http://172.21.0.1:8384"
     syncthing_api_key: str = ""
     # Folder ID that the server's Syncthing shares with every paired Mac.
-    # Cross-device contract; never rename without manually updating each client.
+    # Cross-device contract; never rename without manually updating each
+    # client.
     syncthing_folder_id: str = "vault"
 
-    # Calendar visibility per account: "full" | "busy" | "hidden"
-    # Unrecognised accounts default to "full". The hidden example is an
-    # extended-family calendar managed separately.
-    calendar_visibility: dict[str, str] = {
-        "alex@example.com": "full",
-        "alex@work.com": "busy",
-        "nana@example.com": "hidden",
-    }
-
-    # Weather location for the Open-Meteo integration (defaults: Dublin)
-    weather_latitude: float = 53.3498
-    weather_longitude: float = -6.2603
-
-    # Irish Rail home station (code + display name), e.g. Malahide
-    rail_station_code: str = "MHIDE"
-    rail_station_name: str = "Malahide"
-
-    # Account-holder names as they appear on bank statements, comma-separated.
-    # Used by finance transfer detection to recognise "Transfer to/from <NAME>"
-    # between the household's own Revolut accounts as internal.
-    transfer_match_names: str = ""
+    # Embedding provider(s) (V4 chunk 3.4; extended to a list in Phase 2) —
+    # governs the shared embedding infrastructure
+    # (app/plugin/embedding_provider.py) that every embedding-producing
+    # integration feeds into, so it's a kernel setting rather than any one
+    # integration's config_schema entry.
+    #
+    # Comma-separated and ORDERED: the first entry is the search default, the
+    # rest are fallbacks tried in order when it's unavailable. Every listed
+    # provider is written to, so each has full coverage and can actually serve
+    # as a fallback; each has its own table (see
+    # app/integrations/embedding/models.py) because pgvector fixes the
+    # dimension in the column type.
+    #
+    # Valid ids: "fastembed-bge-small" (384d, local, no key), "gemini-embedding-2"
+    # (1536d, needs embedding.gemini_api_key). Default stays local-only so a
+    # fresh deployment needs no API key; production sets
+    # HOME_EMBEDDING_PROVIDER="gemini-embedding-2,fastembed-bge-small".
+    embedding_provider: str = "fastembed-bge-small"
 
 
 settings = HomeSettings()

@@ -7,8 +7,9 @@ from typing import Any
 from sqlalchemy import func as sa_func
 from sqlalchemy.orm import Session
 
+from app.auth.context import current_user_id
 from app.integrations.lastfm.models import ArtistTag, Scrobble
-from app.tools import CustomTool, ListTool, SearchTool, StatsTool
+from app.tools import CustomTool, ListTool, SearchTool, StatsTool, ToolAnnotations
 from app.tools.helpers import iso_or_none, period_since, scoped_query, serialize, top_n_group_by
 
 logger = logging.getLogger(__name__)
@@ -66,13 +67,21 @@ def _compute_stats(session: Session, arguments: dict[str, Any]) -> dict:
         .all()
     )
 
+    # NB: built as a fresh query rather than from `base_query` (the join is
+    # the other way round), so it needs its own user filter — `artist_tags` is
+    # shared community metadata but `scrobbles` is per-user, and without this
+    # one person's plays would weight the other's genre breakdown.
     top_genres_q = (
         session.query(
             ArtistTag.tag,
             sa_func.count(Scrobble.id).label("play_count"),
         )
         .join(Scrobble, sa_func.lower(Scrobble.artist_name) == ArtistTag.artist_name_lower)
-        .filter(ArtistTag.tag != "_no_tags", ArtistTag.weight >= 10)
+        .filter(
+            ArtistTag.tag != "_no_tags",
+            ArtistTag.weight >= 10,
+            Scrobble.user_id == current_user_id(),
+        )
     )
     if since:
         top_genres_q = top_genres_q.filter(Scrobble.played_at >= since)
@@ -130,7 +139,11 @@ def handle_backfill(session: Session, arguments: dict[str, Any]) -> str:
     from app.integrations.lastfm.sync import backfill_scrobbles
     try:
         count = backfill_scrobbles(session)
-        total = session.query(sa_func.count(Scrobble.id)).scalar()
+        total = (
+            session.query(sa_func.count(Scrobble.id))
+            .filter(Scrobble.user_id == current_user_id())
+            .scalar()
+        )
         return json.dumps({"status": "ok", "new_scrobbles": count, "total_cached": total})
     except Exception as e:
         logger.exception("Last.fm backfill failed")
@@ -147,14 +160,20 @@ def handle_enrich(session: Session, arguments: dict[str, Any]) -> str:
             .filter(ArtistTag.tag != "_no_tags").scalar()
         ) or 0
         total_artists = (
-            session.query(sa_func.count(sa_func.distinct(Scrobble.artist_name))).scalar()
+            session.query(sa_func.count(sa_func.distinct(Scrobble.artist_name)))
+            .filter(Scrobble.user_id == current_user_id())
+            .scalar()
         ) or 0
         return json.dumps({
             "status": "ok",
             "artists_enriched": count,
             "total_tagged": total_tagged,
             "total_artists": total_artists,
-            "coverage": f"{total_tagged / total_artists * 100:.1f}%" if total_artists else "0%",
+            # None, not "0%" — with zero artists there is nothing to have
+            # coverage over; "0%" reads as "tagged none of them" when the
+            # true state is "there was nothing to tag". See the "honest
+            # numbers" hardening pass.
+            "coverage": f"{total_tagged / total_artists * 100:.1f}%" if total_artists else None,
         })
     except Exception as e:
         logger.exception("Artist tag enrichment failed")
@@ -245,6 +264,7 @@ def get_mcp_tools() -> list[dict]:
         # ── Custom tools (admin, stay hand-written) ────────────
         CustomTool(
             name="lastfm_backfill",
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True, open_world_hint=True),
             description=(
                 "Trigger a full Last.fm history backfill. Fetches ALL scrobbles from the "
                 "beginning and caches them. Admin tool — may take a while for large libraries. "
@@ -257,6 +277,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="lastfm_enrich",
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True, open_world_hint=True),
             description=(
                 "Enrich artists with genre/style tags from Last.fm API. Fetches top tags "
                 "for artists that don't have tags yet. Admin tool — rate-limited at ~0.2s "

@@ -1,6 +1,6 @@
-# comar-client
+# lios-sync
 
-Local side-car daemon for the Comar (Co-Managed Archive) family knowledge system. Runs on each Mac, doing the macOS-only jobs the server can't: watching the vault for changes, writing to Apple Reminders via EventKit, and pushing Apple Health data. **It is no longer an MCP server** — Claude Code talks directly to the comar server's `/mcp/` endpoint (Streamable HTTP, per-user bearer). The local MCP shim in `mcp_server.py` is legacy code awaiting deletion (see ISS-002).
+Local side-car daemon for the Comar (Co-Managed Archive) family knowledge system. Runs on each Mac, doing the macOS-only jobs the server can't: watching the vault for changes, writing to Apple Reminders via EventKit, and pushing Apple Health data. **It is not an MCP server** — Claude Code talks directly to the comar server's `/mcp/` endpoint (Streamable HTTP, per-user bearer). The daemon's old local MCP proxy (`mcp_server.py` / `mcp_https_shim.py`) was retired in Phase 4 (2026-07-14) after a 4-day canary logged zero non-health traffic; all that's left on the local port is a `GET /health` check.
 
 ## What it does
 
@@ -10,14 +10,14 @@ Local side-car daemon for the Comar (Co-Managed Archive) family knowledge system
 - **Auto-updates** — checks for a new client wheel on each heartbeat, installs and restarts
 - **Remote log shipping** — logs forwarded via `POST /api/v1/logs/push` for debugging from the server side
 
-Audio transcription has moved to a separate repo (`cograda/scribe`) and is no longer part of comar-client.
+Audio transcription has moved to a separate repo (`cograda/scribe`) and is no longer part of lios-sync.
 
 ## Install
 
 ### From PyPI / wheel
 
 ```bash
-pipx install comar-client
+pipx install lios-sync
 ```
 
 ### From source (development)
@@ -55,7 +55,7 @@ Interactive wizard that configures:
 | Server URL | `config.toml` → `server.url` | HTTP endpoint (e.g. `http://192.168.1.50:8400` or `https://comar.lab`) |
 | Client token | `config.toml` → `server.token` | Per-device bearer token (created on the server) |
 
-Config is saved to `~/.config/comar/config.toml`.
+Config is saved to `~/.config/lios/config.toml`.
 
 For non-interactive setup (scripting, second Mac):
 
@@ -91,10 +91,10 @@ curl localhost:9400/health     # HTTP health endpoint
 
 | Command | Description |
 |---------|-------------|
-| `comar setup` | Interactive first-time configuration |
-| `comar daemon` | Run daemon in foreground |
-| `comar status` | Show connection and tool status |
-| `comar install` | Install launchd agent |
+| `lios-sync setup` | Interactive first-time configuration |
+| `lios-sync daemon` | Run daemon in foreground |
+| `lios-sync status` | Show connection and tool status |
+| `lios-sync install` | Install launchd agent |
 | `comar uninstall` | Remove launchd agent |
 | `comar import-health <file>` | Import Apple Health Auto Export JSON |
 
@@ -132,36 +132,17 @@ comar daemon (side-car, NOT on the MCP path)
 
 Comar's MCP tools — vault search, calendar, email, finance, weather, Last.fm, WhatsApp, reminders, etc. — live on the comar server. Claude Code connects directly to the server's `/mcp/` endpoint with a per-user bearer. See `server/CLAUDE.md` in the comar repo for the full tool reference.
 
-The daemon used to expose its own MCP server with vault_read/vault_write/vault_edit/vault_grep and reminders_add/complete/update; that surface was retired during the multi-user collapse (2026-05-02). Vault file I/O now uses Claude Code's built-in Read/Write/Edit/Grep against the local vault path; reminders writes go via the server which dispatches over SSE to this daemon. The legacy `mcp_server.py` + `mcp_https_shim.py` code is unreferenced and tracked for deletion as ISS-002.
+The daemon used to expose its own MCP server with vault_read/vault_write/vault_edit/vault_grep and reminders_add/complete/update; that surface was retired during the multi-user collapse (2026-05-02). Vault file I/O now uses Claude Code's built-in Read/Write/Edit/Grep against the local vault path; reminders writes go via the server which dispatches over SSE to this daemon.
 
-## MCP prompts
-
-15 prompt workflows are bundled and automatically deployed to `~/.config/comar/prompts/`. They appear in Claude Desktop's prompt picker (the `/` menu). See the root [README](../README.md) for the full list.
-
-Prompts are YAML with Jinja-style template variables:
-
-```yaml
-name: daily_note
-title: "Morning Daily Note"
-description: "Create today's daily note with calendar, health, email, and task carry-forward"
-arguments:
-  - name: user
-    description: "Whose note: alex or sam"
-    required: false
-messages:
-  - role: user
-    content: |
-      Create today's daily note for {{ user }}.
-      ...orchestration instructions...
-```
+**Phase 4 (2026-07-14):** the daemon's remaining local MCP proxy (which merged those local tools with proxied server tools on `localhost:9400/mcp`) and its bundled MCP prompt mirroring (`~/.config/lios/prompts/`) were deleted outright — a `CanaryLoggingMiddleware` instrumented the proxy for 4 days and logged zero non-health requests, confirming nothing (not Claude Code, not Claude Desktop) was still calling it. The daemon is now a pure side-car: EventKit execution via server SSE commands, the vault fsevents watcher, heartbeat/auto-update, and remote log shipping. `GET /health` is the only thing left on the old `mcp_port`.
 
 ## Config file reference
 
-`~/.config/comar/config.toml`:
+`~/.config/lios/config.toml`:
 
 ```toml
 user = "alex"              # Used for vault paths and server identification
-mcp_port = 9400            # MCP server port (default 9400)
+mcp_port = 9400            # Local health-check port (GET /health only, default 9400). health_port also accepted.
 auto_update = true         # Auto-install new versions from the server
 
 [server]
@@ -179,11 +160,9 @@ Daemon logs land at `~/Library/Logs/comar/daemon.log`. They're also shipped to t
 ## Troubleshooting
 
 **Daemon won't start**: check `~/Library/Logs/comar/daemon.log`. Common issues:
-- Missing `config.toml` → run `comar setup`
+- Missing `config.toml` → run `lios-sync setup`
 - Port 9400 in use → check for a stale process (`lsof -i :9400`)
-- Can't reach server → verify URL/token, try `comar status`
-
-**No proxied tools**: the daemon starts with local tools only and fetches server tools on first heartbeat. If `tools_proxied` is 0, check server connectivity.
+- Can't reach server → verify URL/token, try `lios-sync status`
 
 **Reminders not working**: macOS requires explicit permission. System Settings → Privacy & Security → Reminders, grant access to Python/Terminal.
 

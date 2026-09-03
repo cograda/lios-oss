@@ -1,27 +1,53 @@
 coglib
-alembic>=1.13
-fastapi>=0.115
-uvicorn[standard]>=0.30
-pydantic>=2.0
-pydantic-settings>=2.0
-sqlalchemy>=2.0
-psycopg2-binary>=2.9
-apscheduler>=3.10
-mcp>=1.6
-httpx>=0.27
-google-api-python-client>=2.0
-google-auth-oauthlib>=1.0
-google-auth>=2.0
-python-dateutil>=2.9
-fastembed>=0.4
-numpy>=1.26
-pgvector>=0.3
-anthropic>=0.40
-sse-starlette>=2.1
-watchdog>=4.0
-cryptography>=42.0
-openpyxl>=3.1
-pypdf>=4.0
-pdfplumber>=0.11
-python-docx>=1.1
-websockets>=14.0
+# Below: every dep got an upper bound capping the major after the one
+# currently deployed (hardening-2026-08 Ops item — verified against
+# `docker exec comar-app pip list` on the running prod container 2026-08-08).
+# The `mcp` incident (2026-07-28: mcp 2.0.0 removed `Server.list_tools` and
+# broke the whole tool surface at import, same-day CI catch) is the
+# precedent — these caps buy the same warning for every other dep instead of
+# just the one that already bit us. Lower bounds are untouched; bumping a cap
+# after verifying compatibility with the new major is a deliberate edit, not
+# a side effect of this pass.
+alembic>=1.13,<2
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.0,<3
+pydantic-settings>=2.0,<3
+sqlalchemy>=2.0,<3
+psycopg2-binary>=2.9,<3
+apscheduler>=3.10,<4
+# Upper bound is load-bearing: mcp 2.0.0 (released 2026-07-28) removed
+# `Server.list_tools`, which app/mcp/server.py registers handlers through, so
+# the whole tool surface breaks at import. CI resolved it the same day and
+# built a broken image. Re-test app/mcp/server.py against 2.x before lifting.
+mcp>=1.27,<2
+httpx>=0.27,<1
+google-genai>=1.0,<3
+google-api-python-client>=2.0,<3
+google-auth-oauthlib>=1.0,<2
+google-auth>=2.0,<3
+python-dateutil>=2.9,<3
+packaging>=23.0,<27
+fastembed>=0.4,<1
+numpy>=1.26,<3
+pgvector>=0.3,<1
+anthropic>=0.40,<1
+sse-starlette>=2.1,<4
+watchdog>=4.0,<7
+cryptography>=42.0,<51
+openpyxl>=3.1,<4
+pypdf>=4.0,<7
+pdfplumber>=0.11,<1
+python-docx>=1.1,<2
+websockets>=14.0,<17
+gtfs-realtime-bindings>=1.0,<3  # commute integration: NTA bus TripUpdates (GTFS-RT protobuf)
+# Transitive via httpx, but commute/client.py imports it directly to build the
+# NTA trust store (certifi's GoDaddy root + our shipped intermediate).
+# certifi uses calendar versioning (YYYY.M.D) not semver, so "major" here is
+# the year — capped one year past the currently-installed release.
+certifi>=2024.2.2,<2027
+# Fitting only. `app/algo/estimators.py` keeps the serving path on numpy
+# alone — a model is stored as JSON parameters, never a pickle — so a
+# scikit-learn upgrade cannot change a live prediction. Upper bound per the
+# note at the top of this file.
+scikit-learn>=1.5,<2

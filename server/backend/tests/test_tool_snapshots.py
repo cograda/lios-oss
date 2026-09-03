@@ -154,6 +154,30 @@ def frozen_health_clock(monkeypatch):
 
 
 @pytest.fixture
+def frozen_commute_clock(monkeypatch):
+    """Pin commute.tools' `datetime.now()` and client.dublin_now() to
+    FIXED_NOW / its Dublin-naive equivalent, inside the weekday morning
+    window so window_active/stale are deterministic."""
+    from app.integrations.commute import client as commute_client
+    from app.integrations.commute import tools as commute_tools
+    from app.tools import helpers as tool_helpers
+
+    fixed_dublin_now = datetime(2026, 1, 15, 8, 30, 0)  # Thursday, inside 07:00-09:00
+
+    class _FrozenDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return FIXED_NOW if tz else FIXED_NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(commute_tools, "datetime", _FrozenDT)
+    monkeypatch.setattr(commute_client, "dublin_now", lambda: fixed_dublin_now)
+    # commute_tools.handle_status computes staleness via helpers.age_seconds(),
+    # which calls datetime.now() inside app/tools/helpers.py — freeze that
+    # module's clock too so the age calc is deterministic.
+    monkeypatch.setattr(tool_helpers, "datetime", _FrozenDT)
+
+
+@pytest.fixture
 def frozen_ha_clock(monkeypatch):
     """Pin homeassistant.tools' `datetime.now()` to FIXED_NOW (ha_history's
     `since` bound + `_freshness()` staleness calc both call it directly)."""
@@ -167,20 +191,35 @@ def frozen_ha_clock(monkeypatch):
     monkeypatch.setattr(ha_tools, "datetime", _FrozenDT)
 
 
-def _embedding_row(*, source, source_id, user_id, chunk_text, metadata=None):
-    from app.services.embedding import Embedding
+def _seed_embedding(session, *, source, source_id, user_id, chunk_text, metadata=None):
+    """Seed a chunk plus its vector in the local space.
 
-    return Embedding(
+    Takes the session because since Phase 2 this is two rows, not one: the
+    vector moved off `embeddings` into a per-space table keyed on the chunk id,
+    so the chunk has to be flushed before the vector can reference it.
+    """
+    from app.services.embedding import Embedding, EmbeddingVecBgeSmall384
+    from app.services.embedding import MODEL_NAME
+
+    row = Embedding(
         source=source,
         source_id=source_id,
         user_id=user_id,
         chunk_index=0,
         chunk_text=chunk_text,
-        embedding=FIXED_QUERY_VEC,
         content_hash="fixed-hash",
         metadata_json=json.dumps(metadata) if metadata is not None else None,
         created_at=FIXED_NOW,
     )
+    session.add(row)
+    session.flush()
+    session.add(EmbeddingVecBgeSmall384(
+        embedding_id=row.id,
+        embedding=FIXED_QUERY_VEC,
+        model_name=MODEL_NAME,
+        created_at=FIXED_NOW,
+    ))
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -243,10 +282,12 @@ class TestObsidianSnapshots:
 
         db_session.add_all([
             VaultChunk(
+                user_id=1,
                 path="Household/Renovation/Snags.md", file_hash="hash-1",
                 modified_at=FIXED_NOW, indexed_at=FIXED_NOW,
             ),
             VaultChunk(
+                user_id=1,
                 path="Daily Notes/Alex/2026-01-15.md", file_hash="hash-2",
                 modified_at=FIXED_NOW - timedelta(hours=2), indexed_at=FIXED_NOW,
             ),
@@ -268,10 +309,10 @@ class TestObsidianSnapshots:
     def test_vault_search(self, db_session, stub_embedding_model):
         from app.integrations.obsidian.tools import get_mcp_tools
 
-        db_session.add(_embedding_row(
+        _seed_embedding(db_session,
             source="vault", source_id="Household/Renovation/Snags.md",
             user_id=None, chunk_text="Snag register notes for the renovation.",
-        ))
+        )
         db_session.commit()
 
         tool = next(t for t in get_mcp_tools() if t["name"] == "vault_search")
@@ -290,6 +331,9 @@ class TestWhatsappSnapshots:
 
         db_session.add_all([
             WhatsAppContact(
+                # Contacts became per-user when a second bridge landed; the
+                # snapshot user is 1, matching the messages below.
+                user_id=1,
                 jid="353851234567@s.whatsapp.net", name="Sam", notify_name="Sam",
                 is_group=False, last_message_at=FIXED_NOW,
                 created_at=FIXED_NOW, updated_at=FIXED_NOW,
@@ -353,7 +397,7 @@ class TestWhatsappSnapshots:
     def test_whatsapp_semantic_search(self, db_session, stub_embedding_model):
         from app.integrations.whatsapp.tools import get_mcp_tools
 
-        db_session.add(_embedding_row(
+        _seed_embedding(db_session,
             source="whatsapp", source_id="segment-1", user_id=1,
             chunk_text="Sam: Snags list is updated\nAlex: Thanks, will check it tonight",
             metadata={
@@ -362,7 +406,7 @@ class TestWhatsappSnapshots:
                 "end": FIXED_NOW.isoformat(), "message_count": 2,
                 "participants": ["Sam", "Alex"],
             },
-        ))
+        )
         db_session.commit()
 
         tool = next(t for t in get_mcp_tools() if t["name"] == "whatsapp_semantic_search")
@@ -426,10 +470,10 @@ class TestGoogleMailSnapshots:
     def test_gmail_semantic_search(self, db_session, stub_embedding_model):
         from app.integrations.google_mail.tools import get_mcp_tools
 
-        db_session.add(_embedding_row(
+        _seed_embedding(db_session,
             source="email", source_id="gm1", user_id=1,
             chunk_text="Your annual boiler service is due for renewal next month.",
-        ))
+        )
         db_session.commit()
 
         tool = next(t for t in get_mcp_tools() if t["name"] == "gmail_semantic_search")
@@ -457,7 +501,7 @@ class TestCoffeeSnapshots:
         # favourite (see `favourite` below) collapses those sets to a single
         # element, which is order-stable regardless of hash seed.
         current = Coffee(
-            name="Honey Granada", roaster="Hillside Roasters", origin_country="Colombia",
+            name="Honey Granada", roaster="Cloud Picker", origin_country="Colombia",
             region_farm="Granada", process="Honey", fermentation=None, variety="Castillo",
             altitude_masl="1700", roast_date=date(2026, 1, 1), purchase_date=date(2026, 1, 5),
             roaster_tasting_notes="Red apple, honey, caramel", category="Light",
@@ -466,7 +510,7 @@ class TestCoffeeSnapshots:
             created_at=long_ago, updated_at=long_ago,
         )
         favourite = Coffee(
-            name="Yirgacheffe Natural", roaster="Hillside Roasters", origin_country="Ethiopia",
+            name="Yirgacheffe Natural", roaster="Cloud Picker", origin_country="Ethiopia",
             region_farm="Yirgacheffe", process="Natural", fermentation=None, variety="Heirloom",
             altitude_masl="2000", roast_date=date(2020, 1, 1), purchase_date=date(2020, 1, 3),
             roaster_tasting_notes="Blueberry, stone fruit", category="Light",
@@ -548,10 +592,10 @@ class TestCoffeeSnapshots:
     def test_coffee_similar(self, db_session, stub_embedding_model):
         from app.integrations.coffee.tools import get_mcp_tools
 
-        db_session.add(_embedding_row(
+        _seed_embedding(db_session,
             source="coffee", source_id=str(self.favourite_id), user_id=None,
-            chunk_text="Yirgacheffe Natural | Hillside Roasters | Ethiopia | Yirgacheffe | Natural",
-        ))
+            chunk_text="Yirgacheffe Natural | Cloud Picker | Ethiopia | Yirgacheffe | Natural",
+        )
         db_session.commit()
 
         tool = next(t for t in get_mcp_tools() if t["name"] == "coffee_similar")
@@ -792,7 +836,7 @@ class TestMediaSnapshots:
             MediaItem(
                 user_id=1, source="whatsapp", message_ref="WA-MEDIA-1", media_type="image",
                 mime_type="image/jpeg", size_bytes=204800, caption="Snag - Kitchen - tile crack",
-                sender_name="WindowCo", chat_or_thread="Snags", is_from_me=False,
+                sender_name="Northgate", chat_or_thread="Snags", is_from_me=False,
                 message_ts=FIXED_NOW, status="stored", skip_reason=None,
                 storage_path="/data/media/wa-media-1.jpg", sha256="fixed-sha-1",
                 downloaded_at=FIXED_NOW, detected_at=FIXED_NOW,
@@ -827,7 +871,7 @@ class TestAttachmentsSnapshots:
         db_session.add_all([
             MessageAttachment(
                 user_id=1, source="whatsapp", message_ref="WA-ATT-1", filename="BoQ.pdf",
-                mime_type="application/pdf", size_bytes=204800, sender_name="WindowCo",
+                mime_type="application/pdf", size_bytes=204800, sender_name="Northgate",
                 chat_or_thread="Snags", message_ts=FIXED_NOW, parse_status="pending",
                 skip_reason=None, storage_path=None, historical_doc_id=None,
                 detected_at=FIXED_NOW, processed_at=None,
@@ -913,6 +957,78 @@ class TestHomeAssistantSnapshots:
         out = tool["handler"](db_session, {"entity_id": "person.alex", "days": 7})
         assert_snapshot("ha_history", out)
 
+    def test_ha_events(self, db_session, frozen_ha_clock):
+        from app.integrations.homeassistant.models import HAStateChange
+        from app.integrations.homeassistant.tools import get_mcp_tools
+
+        db_session.add(HAStateChange(
+            entity_id="sensor.dishwasher_operation_state",
+            old_state="run", new_state="finished",
+            changed_at=FIXED_NOW - timedelta(minutes=10), recorded_at=FIXED_NOW,
+            attributes={},
+        ))
+        db_session.commit()
+
+        tool = next(t for t in get_mcp_tools() if t["name"] == "ha_events")
+        out = tool["handler"](db_session, {"hours": 24})
+        assert_snapshot("ha_events", out)
+
+
+# ---------------------------------------------------------------------------
+# commute
+# ---------------------------------------------------------------------------
+
+class TestCommuteSnapshots:
+    @pytest.fixture(autouse=True)
+    def _seed(self, db_session):
+        from app.integrations.commute.models import CommuteDecision
+
+        db_session.add_all([
+            CommuteDecision(
+                decided_at=FIXED_NOW - timedelta(minutes=1),
+                state="comfortable", status_text="Leave in 5 min — 08:12 L2 → Central 08:54 — comfortable",
+                leave_in_min=5, confidence="live", degraded=False, reason=None,
+                target_bus_trip_id="L2_0812", target_bus_route="L2",
+                target_bus_dep_home=datetime(2026, 1, 15, 8, 12),
+                target_bus_arr_interchange=datetime(2026, 1, 15, 8, 27),
+                target_train_code="E123",
+                target_train_interchange_dep=datetime(2026, 1, 15, 8, 35),
+                target_train_dest_arr=datetime(2026, 1, 15, 8, 54),
+                interchange_delay_min=1.5,
+                bus_feed_ts=FIXED_NOW - timedelta(minutes=1),
+                dart_feed_ts=FIXED_NOW - timedelta(minutes=1),
+                bus_count=3, dart_count=2, ha_pushed=True,
+            ),
+            CommuteDecision(
+                decided_at=FIXED_NOW - timedelta(days=1),
+                state="tight", status_text="Leave in 2 min — 08:10 L1 → Central 08:56 — tight (2 min spare)",
+                leave_in_min=2, confidence="propagated", degraded=False, reason=None,
+                target_bus_trip_id="L1_0810", target_bus_route="L1",
+                target_bus_dep_home=datetime(2026, 1, 14, 8, 10),
+                target_bus_arr_interchange=datetime(2026, 1, 14, 8, 26),
+                target_train_code="E120",
+                target_train_interchange_dep=datetime(2026, 1, 14, 8, 34),
+                target_train_dest_arr=datetime(2026, 1, 14, 8, 56),
+                interchange_delay_min=4.0,
+                bus_feed_ts=FIXED_NOW - timedelta(days=1),
+                dart_feed_ts=FIXED_NOW - timedelta(days=1),
+                bus_count=2, dart_count=2, ha_pushed=False,
+            ),
+        ])
+        db_session.commit()
+
+    def test_commute_status(self, db_session, frozen_commute_clock):
+        from app.integrations.commute.tools import get_mcp_tools
+        tool = next(t for t in get_mcp_tools() if t["name"] == "commute_status")
+        out = tool["handler"](db_session, {})
+        assert_snapshot("commute_status", out)
+
+    def test_commute_history(self, db_session, frozen_commute_clock):
+        from app.integrations.commute.tools import get_mcp_tools
+        tool = next(t for t in get_mcp_tools() if t["name"] == "commute_history")
+        out = tool["handler"](db_session, {"days": 14})
+        assert_snapshot("commute_history", out)
+
 
 # ---------------------------------------------------------------------------
 # snags
@@ -926,7 +1042,7 @@ class TestSnagSnapshots:
         db_session.add_all([
             Snag(
                 uid="SNAG-0001", title="Cracked kitchen floor tile", description="Corner tile cracked during move-in",
-                room="Kitchen", element="Floor tile", trade="windowco", severity="minor",
+                room="Kitchen", element="Floor tile", trade="northgate", severity="minor",
                 status="open", reported_by="Alex", reported_at=FIXED_NOW,
                 source_ref=None, reported_to_trade_at=None, external_ref=None,
                 resolution_note=None, resolved_at=None,
@@ -954,3 +1070,103 @@ class TestSnagSnapshots:
         tool = next(t for t in mcp_tools() if t["name"] == "snag_list")
         out = tool["handler"](db_session, {"include_closed": True})
         assert_snapshot("snag_list_all", out)
+
+
+# ---------------------------------------------------------------------------
+# Disabled-integration gating (V4 chunk 5.1) — no snapshot files touched;
+# this proves the *registration-time* effect of the enable/disable switch,
+# not any tool's serialized output.
+# ---------------------------------------------------------------------------
+
+class TestDisabledIntegrationGating:
+    """`is_integration_enabled()` reads a real `integration_config` row
+    (real Postgres, hence living in this db-tier module rather than a unit
+    test with a faked session) — set it False for `lastfm` and prove the
+    tool registry and scheduler job set both drop it, then restore.
+
+    Both tests seed `lastfm`'s own required config directly via
+    `set_config_value()` rather than relying on `HOME_LASTFM_API_KEY`/
+    `HOME_LASTFM_USERNAME` being set in the environment — this suite must
+    be hermetic regardless of what's configured on the machine/CI runner
+    it happens to run on (fixup, was a latent env-dependency bug in the
+    original 5.1 commit).
+    """
+
+    def _configure_lastfm(self):
+        from app.plugin.config_store import set_config_value
+
+        set_config_value("lastfm", "lastfm_api_key", "test-key")
+        set_config_value("lastfm", "lastfm_username", "test-user")
+
+    def test_disabled_integration_tools_absent_from_registry(self, real_db, db_session):
+        from app.integrations import register_all
+        from app.mcp import server as srv
+        from app.plugin.config_store import set_integration_enabled
+
+        self._configure_lastfm()
+
+        # Registry is module-level/session-wide (same convention as
+        # test_mcp_transport.py / test_tool_calls.py's `mcp_app` fixture).
+        # Always rebuild here (rather than the usual "populate once" guard)
+        # since we just seeded lastfm's config above and need its tools to
+        # actually be present for the sanity assert below, regardless of
+        # what any earlier test already registered.
+        register_all()
+        srv._tool_handlers.clear()
+        srv._tool_definitions.clear()
+        srv._tool_metadata.clear()
+        srv.register_mcp_tools()
+        assert "lastfm_recent" in srv._tool_handlers, "sanity: lastfm registers normally once configured"
+
+        # Remove only lastfm's existing entries (leave every other
+        # integration's registration untouched) so re-running
+        # register_mcp_tools() with lastfm disabled proves it *stays* out —
+        # register_mcp_tools() only adds entries, it never removes stale
+        # ones for a now-skipped integration.
+        lastfm_names = [n for n, (_, integ) in srv._tool_handlers.items() if integ == "lastfm"]
+        for n in lastfm_names:
+            del srv._tool_handlers[n]
+            srv._tool_metadata.pop(n, None)
+        srv._tool_definitions[:] = [t for t in srv._tool_definitions if t.name not in lastfm_names]
+
+        set_integration_enabled("lastfm", False)
+        try:
+            srv.register_mcp_tools()
+            assert not any(
+                integ == "lastfm" for _, integ in srv._tool_handlers.values()
+            ), "lastfm tools registered despite being disabled"
+            assert "lastfm_recent" not in srv._tool_handlers
+        finally:
+            set_integration_enabled("lastfm", True)
+            srv.register_mcp_tools()  # restore lastfm's tools for any later test
+            assert "lastfm_recent" in srv._tool_handlers
+
+    @pytest.fixture
+    def anyio_backend(self):
+        return "asyncio"
+
+    @pytest.mark.anyio
+    async def test_disabled_integration_job_absent_from_scheduler(self, real_db, db_session, monkeypatch):
+        # AsyncIOScheduler.start() requires a running event loop (it grabs
+        # asyncio.get_running_loop()) — same reason test_scheduler_jobs.py's
+        # pinned-snapshot test is itself async, not a plain `def`.
+        from app import scheduler as scheduler_module
+        from app.integrations import register_all
+        from app.plugin.config_store import set_integration_enabled
+
+        self._configure_lastfm()
+        register_all()
+        for integration in scheduler_module.get_all().values():
+            monkeypatch.setattr(integration, "is_configured", lambda: True, raising=False)
+
+        set_integration_enabled("lastfm", False)
+        scheduler_module.scheduler.remove_all_jobs()
+        try:
+            scheduler_module.setup_scheduler()
+            jobs = {job.id for job in scheduler_module.scheduler.get_jobs()}
+            assert "sync_lastfm" not in jobs
+        finally:
+            set_integration_enabled("lastfm", True)
+            scheduler_module.scheduler.remove_all_jobs()
+            if scheduler_module.scheduler.running:
+                scheduler_module.scheduler.shutdown(wait=False)

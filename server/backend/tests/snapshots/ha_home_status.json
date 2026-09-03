@@ -2,7 +2,8 @@
   "attention": {
     "low_battery": [],
     "offline": [],
-    "offline_count": 0
+    "offline_count": 0,
+    "personal_device_battery": []
   },
   "entity_count": 2,
   "sections": {

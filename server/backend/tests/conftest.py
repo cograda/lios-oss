@@ -5,7 +5,7 @@ Two tiers, selected by marker:
   unit  (default) — no database, no external services; DB interactions
         mocked. Fast and infrastructure-free. Everything not explicitly
         marked `db` gets this marker automatically.
-  db    — real Postgres (pgvector). Uses COMAR_TEST_DATABASE_URL if set
+  db    — real Postgres (pgvector). Uses LIOS_TEST_DATABASE_URL (or the pre-rename COMAR_TEST_DATABASE_URL) if set
         (CI service container), else spins up a throwaway
         pgvector/pgvector:pg16 via testcontainers (needs Docker locally).
         Schema is built exactly the way production builds a fresh DB
@@ -24,10 +24,10 @@ import pytest
 # Add backend to sys.path so `from app.xxx import ...` works
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Add vendored coglib (shared package — installed in Docker, but needs a
-# path hint for local pytest runs)
+# Add coglib from alexunism monorepo (shared package — installed in Docker,
+# but needs path hint for local pytest runs)
 _coglib_candidates = [
-    Path(__file__).resolve().parent.parent.parent / "coglib" / "src",  # server/coglib
+    Path.home() / "Desktop" / "Code" / "alexunism" / "coglib" / "src",
     Path(__file__).resolve().parent.parent / "coglib" / "src",  # if synced locally
     Path(__file__).resolve().parent.parent / "coglib",  # flat layout
 ]
@@ -46,6 +46,31 @@ for _candidate in _coglib_candidates:
 import importlib  # noqa: E402
 
 importlib.import_module("app")
+
+
+_TEST_ENCRYPTION_KEY = None
+
+
+@pytest.fixture(autouse=True)
+def _default_encryption_key(monkeypatch):
+    """Give every test a working Fernet key by default.
+
+    V4 chunk 3.3 made `app.auth.encryption` fail-closed: encrypt/decrypt
+    raises if `HOME_OAUTH_ENCRYPTION_KEY` is unset. Without this fixture,
+    every test that touches an OAuthToken or a secret `integration_config`
+    value would need to set a key itself just to collect/run. Tests that
+    specifically want the "key unset" fail-closed path (test_encryption.py)
+    override this within the test via their own patch/monkeypatch, which
+    layers on top of (and is torn down before) this one.
+    """
+    global _TEST_ENCRYPTION_KEY
+    if _TEST_ENCRYPTION_KEY is None:
+        from cryptography.fernet import Fernet
+        _TEST_ENCRYPTION_KEY = Fernet.generate_key().decode()
+
+    from app.config import settings
+    monkeypatch.setattr(settings, "oauth_encryption_key", _TEST_ENCRYPTION_KEY)
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -109,7 +134,7 @@ def pg_url():
     testcontainers (local Docker). Skips the db tier with a loud reason
     if neither is available — never silently passes.
     """
-    env_url = os.environ.get("COMAR_TEST_DATABASE_URL")
+    env_url = os.environ.get("LIOS_TEST_DATABASE_URL") or os.environ.get("COMAR_TEST_DATABASE_URL")
     if env_url:
         yield env_url
         return

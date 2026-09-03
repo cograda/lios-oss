@@ -12,6 +12,7 @@ from app.auth.context import current_user_id
 from app.integrations.apple_reminders.commands import dispatch_command
 from app.integrations.apple_reminders.models import Reminder
 from app.models.users import User
+from app.tools import CustomTool, ToolAnnotations
 
 logger = logging.getLogger(__name__)
 
@@ -179,15 +180,22 @@ def handle_lists(session: Session, arguments: dict[str, Any]) -> str:
 
 
 def handle_backlog_sync(session: Session, arguments: dict[str, Any]) -> str:
-    """Trigger vault backlog <-> Reminders sync using local fuzzy matching."""
-    from app.config import settings
+    """Trigger vault backlog <-> Reminders sync using local fuzzy matching,
+    scoped to the calling user's own vault (sam-rollout A3)."""
+    from app.services import vault_paths
 
-    if not settings.obsidian_vault_path:
-        return json.dumps({"error": "HOME_OBSIDIAN_VAULT_PATH not configured"})
+    uid = current_user_id()
+    user = session.get(User, uid)
+    if not user:
+        return json.dumps({"error": f"user_id={uid} not found"})
+
+    vault_dir = vault_paths.user_vault_path(user.name)
+    if not vault_dir.is_dir():
+        return json.dumps({"error": f"No vault directory for {user.name}"})
 
     from app.integrations.apple_reminders.backlog_sync import sync_backlogs
 
-    result = sync_backlogs(session, settings.obsidian_vault_path)
+    result = sync_backlogs(session, str(vault_dir), uid)
     return json.dumps(result, indent=2)
 
 
@@ -223,6 +231,12 @@ def handle_add_reminder(session: Session, arguments: dict[str, Any]) -> str:
     result = dispatch_command(
         session, user_id=user_id, user_name=user_name, action="add", args=args,
     )
+
+    from app.plugin.dispatch import set_affected
+    cmd_id = result.get("command_id")
+    if cmd_id is not None:
+        set_affected([f"reminder:cmd-{cmd_id}"])
+
     return json.dumps(result)
 
 
@@ -241,6 +255,10 @@ def handle_complete_reminder(session: Session, arguments: dict[str, Any]) -> str
         session, user_id=user_id, user_name=user_name,
         action="complete", args={"uid": uid},
     )
+
+    from app.plugin.dispatch import set_affected
+    set_affected([f"reminder:{uid}"])
+
     return json.dumps(result)
 
 
@@ -250,16 +268,20 @@ def get_mcp_tools() -> list[dict]:
     reminders_add / reminders_complete were client-side EventKit tools from
     2026-03-30 onward; in V3 D.5 (2026-05-02) they returned to the server as
     SSE-dispatched commands, so a single MCP server can serve both Macs.
+
+    All six built via `CustomTool` (V4 chunk 4.3, batch C) — none of these
+    handlers fit `ListTool`/`SearchTool`/`StatsTool`'s shape, so this is a
+    pure dict-literal -> DSL-builder conversion with identical output.
     """
     return [
-        {
-            "name": "reminders_list",
-            "description": (
+        CustomTool(
+            name="reminders_list",
+            description=(
                 "List incomplete Apple Reminders with titles, due dates, priorities, "
                 "and which list they belong to. Sorted by priority (urgent first) then "
                 "due date. Use this to check what tasks are outstanding."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "list": {
@@ -268,17 +290,19 @@ def get_mcp_tools() -> list[dict]:
                     },
                 },
             },
-            "handler": handle_list_reminders,
-            "category": "tasks",
-            "examples": [
+            handler=handle_list_reminders,
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+            category="tasks",
+            examples=[
                 "What reminders do I have?",
                 "Show my shopping list",
                 "What's overdue?",
             ],
-        },
-        {
-            "name": "reminders_sync",
-            "description": (
+        ).build(),
+
+        CustomTool(
+            name="reminders_sync",
+            description=(
                 "Return open reminders plus what changed since a given timestamp "
                 "(completed, added, edited). Use this instead of reminders_list "
                 "at the start of a daily note or any multi-day catch-up — it "
@@ -290,7 +314,7 @@ def get_mcp_tools() -> list[dict]:
                 "comar-client pings it every ~30s) — warn if more than a few "
                 "minutes stale, that means the EventKit bridge is offline."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "since": {
@@ -302,38 +326,42 @@ def get_mcp_tools() -> list[dict]:
                     },
                 },
             },
-            "handler": handle_sync_reminders,
-            "category": "tasks",
-            "examples": [
+            handler=handle_sync_reminders,
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True),
+            category="tasks",
+            examples=[
                 "What reminders were completed since yesterday?",
                 "Show open reminders plus recent changes",
                 "Sync reminders and catch me up",
             ],
-        },
-        {
-            "name": "reminders_lists",
-            "description": (
+        ).build(),
+
+        CustomTool(
+            name="reminders_lists",
+            description=(
                 "List all Apple Reminder lists with the count of incomplete items in each. "
                 "Use this to see which lists have items that need attention."
             ),
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": handle_lists,
-            "category": "tasks",
-            "examples": [
+            input_schema={"type": "object", "properties": {}},
+            handler=handle_lists,
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+            category="tasks",
+            examples=[
                 "What reminder lists do I have?",
                 "How many reminders in each list?",
             ],
-        },
-        {
-            "name": "reminders_add",
-            "description": (
+        ).build(),
+
+        CustomTool(
+            name="reminders_add",
+            description=(
                 "Create a new Apple Reminder via the user's connected daemon "
                 "(EventKit). Appears on all the user's Apple devices within "
                 "seconds via iCloud. Returns synced=true if the daemon "
                 "acknowledged in time, queued=true otherwise (it will run "
                 "when the daemon reconnects)."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "summary": {
@@ -368,20 +396,22 @@ def get_mcp_tools() -> list[dict]:
                 },
                 "required": ["summary"],
             },
-            "handler": handle_add_reminder,
-            "category": "tasks",
-            "examples": [
-                "Remind me to pick up Finn at 3pm",
+            handler=handle_add_reminder,
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=False),
+            category="tasks",
+            examples=[
+                "Remind me to pick up the kids at 3pm",
                 "Add bread to the shopping list",
             ],
-        },
-        {
-            "name": "reminders_complete",
-            "description": (
+        ).build(),
+
+        CustomTool(
+            name="reminders_complete",
+            description=(
                 "Mark a reminder as completed via the user's connected daemon "
                 "(EventKit). Use the UID from reminders_list."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "uid": {
@@ -391,21 +421,24 @@ def get_mcp_tools() -> list[dict]:
                 },
                 "required": ["uid"],
             },
-            "handler": handle_complete_reminder,
-            "category": "tasks",
-            "examples": [
+            handler=handle_complete_reminder,
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True),
+            category="tasks",
+            examples=[
                 "Mark that reminder done",
             ],
-        },
-        {
-            "name": "reminders_sync_backlog",
-            "description": (
+        ).build(),
+
+        CustomTool(
+            name="reminders_sync_backlog",
+            description=(
                 "Sync vault task backlogs with Apple Reminders using AI matching. "
                 "New vault tasks create reminders; completed reminders mark vault tasks done. "
                 "Admin tool — run during daily notes or manually, not frequently."
             ),
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": handle_backlog_sync,
-            "category": "tasks",
-        },
+            input_schema={"type": "object", "properties": {}},
+            handler=handle_backlog_sync,
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True),
+            category="tasks",
+        ).build(),
     ]

@@ -87,6 +87,16 @@ def _run_migrations(db: Database) -> None:
             # Truly fresh DB — create all tables, then stamp
             logger.info("Fresh database — creating tables and stamping baseline")
             db.create_tables()
+            # create_tables() only knows ORM-mapped objects. A handful of
+            # migrations create plain Postgres objects via raw op.execute()
+            # that have no ORM representation at all — this fast path has
+            # to recreate those by hand, or a from-scratch DB (every test's
+            # fixture path) silently lacks them even though a real
+            # `alembic upgrade head` run would have them. Currently just
+            # snag_uid_seq (see 2026_07_07_d0e1f2a3b4c5_snags.py).
+            with db.session() as session:
+                session.execute(text("CREATE SEQUENCE IF NOT EXISTS snag_uid_seq START 1"))
+                session.commit()
             command.stamp(alembic_cfg, "head")
 
 

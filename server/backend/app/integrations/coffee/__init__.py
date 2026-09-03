@@ -12,14 +12,19 @@ from typing import Any
 from sqlalchemy import func as sa_func
 
 from app.db import get_db
-from app.integrations.base import BaseIntegration
 from app.integrations.coffee.models import Coffee, CoffeeBrew
 from app.integrations.coffee.tools import get_mcp_tools
+from app.plugin.bases import CapabilityService
 
 logger = logging.getLogger(__name__)
 
 
-class CoffeeIntegration(BaseIntegration):
+class CoffeeIntegration(CapabilityService):
+    """No external system — coffees and brews are entirely user-entered via
+    MCP tools (coffee_log, coffee_brew). `sync()` is fully inherited
+    (no-op) from CapabilityService; this package is a pure tool surface
+    over its own tables, not a puller of anything."""
+
     @property
     def name(self) -> str:
         return "coffee"
@@ -27,13 +32,6 @@ class CoffeeIntegration(BaseIntegration):
     @property
     def display_name(self) -> str:
         return "Coffee"
-
-    def sync(self) -> None:
-        """No external API — coffees and brews are user-entered."""
-        return
-
-    def sync_schedule(self) -> str | None:
-        return None
 
     def mcp_tools(self) -> list[dict[str, Any]]:
         return get_mcp_tools()

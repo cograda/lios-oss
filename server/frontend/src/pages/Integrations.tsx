@@ -71,6 +71,94 @@ export default function Integrations() {
     })
   }
 
+  // Group by manifest `type` (V4 chunk 5.1) — untyped/legacy integrations
+  // (no manifest yet) fall into "other" rather than disappearing.
+  const groups = new Map<string, IntegrationStatus[]>()
+  for (const int of integrations) {
+    const key = int.type ?? 'other'
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key)!.push(int)
+  }
+  const sortedGroups = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+
+  function renderIntegrationCard(int: IntegrationStatus) {
+    const nextSync = nextSyncIn(int.next_sync_at)
+    return (
+      <Card key={int.name} className={!int.enabled ? 'opacity-50' : ''}>
+        <CardHeader className="flex-row items-center justify-between">
+          <div className="flex items-center gap-3">
+            <CardTitle className="text-sm normal-case tracking-normal">
+              <Link to={`/integrations/${int.name}`} className="hover:underline">{int.display_name}</Link>
+            </CardTitle>
+            {!int.enabled && <Badge variant="default">Disabled</Badge>}
+            {int.configured ? (
+              <Badge variant="success">Connected</Badge>
+            ) : (
+              <Badge variant="default">Not configured</Badge>
+            )}
+            {int.consecutive_failures >= 3 && (
+              <Badge variant="destructive">Failing ({int.consecutive_failures}x)</Badge>
+            )}
+            {int.type && <Badge variant="default">{int.type}</Badge>}
+            {int.version && (
+              <Badge variant="default" className="font-mono">v{int.version}</Badge>
+            )}
+          </div>
+          {int.configured && int.enabled && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => handleSync(int.name)}
+              disabled={syncing.has(int.name)}
+            >
+              <RefreshCw className={`h-4 w-4 mr-1.5 ${syncing.has(int.name) ? 'animate-spin' : ''}`} />
+              Sync
+            </Button>
+          )}
+        </CardHeader>
+        <CardContent>
+          <div className="flex items-center gap-4 text-sm">
+            <StatusDot variant={statusVariant(int.last_sync_status)} label={int.last_sync_status} />
+            {int.last_sync_at && (
+              <span className="flex items-center gap-1 text-muted-foreground">
+                <Clock className="h-3 w-3" />
+                {timeAgo(int.last_sync_at)}
+              </span>
+            )}
+            {int.last_sync_duration_ms != null && (
+              <span className="flex items-center gap-1 text-muted-foreground">
+                <Timer className="h-3 w-3" />
+                {formatDuration(int.last_sync_duration_ms)}
+              </span>
+            )}
+            {int.schedule && (
+              <span className="text-xs text-muted-foreground font-mono">{int.schedule}</span>
+            )}
+            {nextSync && (
+              <span className="text-xs text-muted-foreground ml-auto">
+                next: {nextSync}
+              </span>
+            )}
+          </div>
+          {int.last_error && (
+            <button
+              onClick={() => toggleExpanded(int.name)}
+              className="mt-2 flex items-start gap-2 text-xs text-destructive hover:text-destructive/80 w-full text-left"
+            >
+              <AlertCircle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+              <span className={expanded.has(int.name) ? '' : 'truncate'}>{int.last_error}</span>
+              {expanded.has(int.name) ? (
+                <ChevronUp className="h-3.5 w-3.5 mt-0.5 shrink-0 ml-auto" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5 mt-0.5 shrink-0 ml-auto" />
+              )}
+            </button>
+          )}
+        </CardContent>
+      </Card>
+    )
+  }
+
   return (
     <div className="space-y-6">
       <div>
@@ -84,79 +172,15 @@ export default function Integrations() {
         </div>
       )}
 
-      <div className="space-y-3">
-        {integrations.map((int: IntegrationStatus) => {
-          const nextSync = nextSyncIn(int.next_sync_at)
-          return (
-            <Card key={int.name}>
-              <CardHeader className="flex-row items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <CardTitle className="text-sm normal-case tracking-normal">
-                    <Link to={`/integrations/${int.name}`} className="hover:underline">{int.display_name}</Link>
-                  </CardTitle>
-                  {int.configured ? (
-                    <Badge variant="success">Connected</Badge>
-                  ) : (
-                    <Badge variant="default">Not configured</Badge>
-                  )}
-                  {int.consecutive_failures >= 3 && (
-                    <Badge variant="destructive">Failing ({int.consecutive_failures}x)</Badge>
-                  )}
-                </div>
-                {int.configured && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => handleSync(int.name)}
-                    disabled={syncing.has(int.name)}
-                  >
-                    <RefreshCw className={`h-4 w-4 mr-1.5 ${syncing.has(int.name) ? 'animate-spin' : ''}`} />
-                    Sync
-                  </Button>
-                )}
-              </CardHeader>
-              <CardContent>
-                <div className="flex items-center gap-4 text-sm">
-                  <StatusDot variant={statusVariant(int.last_sync_status)} label={int.last_sync_status} />
-                  {int.last_sync_at && (
-                    <span className="flex items-center gap-1 text-muted-foreground">
-                      <Clock className="h-3 w-3" />
-                      {timeAgo(int.last_sync_at)}
-                    </span>
-                  )}
-                  {int.last_sync_duration_ms != null && (
-                    <span className="flex items-center gap-1 text-muted-foreground">
-                      <Timer className="h-3 w-3" />
-                      {formatDuration(int.last_sync_duration_ms)}
-                    </span>
-                  )}
-                  {int.schedule && (
-                    <span className="text-xs text-muted-foreground font-mono">{int.schedule}</span>
-                  )}
-                  {nextSync && (
-                    <span className="text-xs text-muted-foreground ml-auto">
-                      next: {nextSync}
-                    </span>
-                  )}
-                </div>
-                {int.last_error && (
-                  <button
-                    onClick={() => toggleExpanded(int.name)}
-                    className="mt-2 flex items-start gap-2 text-xs text-destructive hover:text-destructive/80 w-full text-left"
-                  >
-                    <AlertCircle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
-                    <span className={expanded.has(int.name) ? '' : 'truncate'}>{int.last_error}</span>
-                    {expanded.has(int.name) ? (
-                      <ChevronUp className="h-3.5 w-3.5 mt-0.5 shrink-0 ml-auto" />
-                    ) : (
-                      <ChevronDown className="h-3.5 w-3.5 mt-0.5 shrink-0 ml-auto" />
-                    )}
-                  </button>
-                )}
-              </CardContent>
-            </Card>
-          )
-        })}
+      <div className="space-y-6">
+        {sortedGroups.map(([type, group]) => (
+          <div key={type} className="space-y-3">
+            <h2 className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">{type}</h2>
+            <div className="space-y-3">
+              {group.map(renderIntegrationCard)}
+            </div>
+          </div>
+        ))}
 
         {isLoading && integrations.length === 0 && (
           <p className="text-muted-foreground text-center py-8">Loading...</p>

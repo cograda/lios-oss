@@ -7,7 +7,8 @@ from typing import Any
 
 import httpx
 
-from app.errors import PermanentError, TransientError
+from app.errors import PermanentError
+from app.plugin.sync_runtime import classify_exc
 
 logger = logging.getLogger(__name__)
 
@@ -17,25 +18,16 @@ REQUEST_TIMEOUT = 30  # seconds per API request
 MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 5, 15]  # seconds between retries
 
+# Last.fm has no OAuth — a 401/403 here means a bad/missing API key, a config
+# problem, not something a re-auth flow fixes. Override keeps 401/403 as a
+# plain PermanentError (classify_exc's provider="generic" default already
+# does this — kept explicit for clarity and parity with the old message).
+_OVERRIDES = {401: PermanentError, 403: PermanentError}
+
 
 def _classify_httpx_error(exc: Exception, context: str) -> Exception:
-    """Map an httpx failure to TransientError or PermanentError.
-
-    Returns the exception to raise (chained `from exc` by the caller).
-    Last.fm has no OAuth — a 401/403 here means a bad/missing API key, a
-    config problem, not something a re-auth flow fixes, but still not worth
-    retrying with the same (broken) key.
-    """
-    if isinstance(exc, httpx.HTTPStatusError):
-        status = exc.response.status_code
-        if status in (401, 403):
-            return PermanentError(f"{context}: HTTP {status} (check HOME_LASTFM_API_KEY)")
-        if status == 429 or status >= 500:
-            return TransientError(f"{context}: HTTP {status}")
-        return exc
-    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.RequestError)):
-        return TransientError(f"{context}: {exc}")
-    return exc
+    """Map an httpx failure to TransientError or PermanentError."""
+    return classify_exc(exc, context, provider="lastfm", overrides=_OVERRIDES)
 
 
 def fetch_recent_tracks(

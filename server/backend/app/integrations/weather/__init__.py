@@ -1,19 +1,26 @@
-"""Weather integration — Open-Meteo forecast for the configured home location."""
+"""Weather integration — Open-Meteo forecast for the configured location.
+
+`SourceIntegration` conversion (V4 chunk 4.3, batch A). No multi-account
+concept — `accounts()`/`account_user_id()`/`account_label()` stay at their
+`SourceIntegration` defaults. `sync()` itself is entirely inherited; this
+class supplies only `pull()`/`store()`, tool wiring, and dashboard data.
+"""
 
 import logging
 from datetime import date
 from typing import Any
 
-from app.db import get_db
-from app.integrations.base import BaseIntegration
+from sqlalchemy.orm import Session
+
 from app.integrations.weather.models import WeatherCurrent, WeatherForecast
-from app.integrations.weather.sync import sync_weather
+from app.integrations.weather.sync import pull_weather, store_weather
 from app.integrations.weather.tools import get_mcp_tools, _weather_description
+from app.plugin.bases import PullResult, SourceIntegration
 
 logger = logging.getLogger(__name__)
 
 
-class WeatherIntegration(BaseIntegration):
+class WeatherIntegration(SourceIntegration):
     @property
     def name(self) -> str:
         return "weather"
@@ -22,17 +29,19 @@ class WeatherIntegration(BaseIntegration):
     def display_name(self) -> str:
         return "Weather"
 
-    def sync(self) -> None:
-        """Fetch current weather and forecast from Open-Meteo."""
-        db = get_db()
-        with db.session() as session:
-            sync_weather(session)
+    def pull(self, account: Any, session: Session, cursor: str | None) -> PullResult:
+        return pull_weather(session, cursor)
+
+    def store(self, session: Session, records: list[dict]) -> int:
+        return store_weather(session, records)
 
     def mcp_tools(self) -> list[dict[str, Any]]:
         return get_mcp_tools()
 
     async def dashboard_data(self) -> dict[str, Any]:
         """Return current conditions and today's forecast for the dashboard."""
+        from app.db import get_db
+
         db = get_db()
         with db.session() as session:
             current = session.query(WeatherCurrent).first()
@@ -65,8 +74,5 @@ class WeatherIntegration(BaseIntegration):
 
             return result
 
-    def sync_schedule(self) -> str | None:
-        return "*/30 * * * *"  # Every 30 minutes
-
-    def is_configured(self) -> bool:
-        return True  # No API key needed for Open-Meteo
+    # is_configured(): default (empty config_schema -> vacuously True; no
+    # API key needed for Open-Meteo).

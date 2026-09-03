@@ -1,7 +1,6 @@
-"""REST routes for Apple Reminders push sync.
+"""REST routes for Apple Reminders backlog sync.
 
-The Mac agent calls these endpoints:
-  POST /api/reminders/sync         — push full reminder state
+The Mac agent calls:
   POST /api/reminders/backlog-sync — trigger vault <-> Reminders sync
 
 The EventKit command dispatch/ack path (queue a command, SSE-push it to the
@@ -12,80 +11,40 @@ legacy GET /api/reminders/commands endpoint; despite the "legacy" label on
 the reminder_commands table in server/CLAUDE.md, dispatch_command()/
 complete_command() are the live implementation of the current SSE push
 path, not a superseded one.
+
+sam-rollout A2 (2026-07-26): this route used to gate on the shared
+`HOME_UI_TOKEN` secret and hardcode user_id=1 (it predates client_tokens).
+It now resolves the caller via the same per-user bearer dependency the V3
+API uses (`app.auth.client_token.get_current_user`) and rejects (401) rather
+than defaulting.
+
+The legacy `POST /api/reminders/sync` push-sync route (the other half of
+this pair, superseded by the per-user `/api/v1/reminders/push` the client
+daemon actually calls) was removed 2026-08-08 as confirmed dead code —
+nothing in client/ or server/ posted to it.
 """
 
 import asyncio
 import logging
 
-from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends
 
-from app.auth.utils import safe_token_check
-from app.config import settings
 from app.db import get_db
-from app.integrations.apple_reminders.models import Reminder
-from app.integrations.apple_reminders.sync import sync_from_push
+from app.models.users import User
+from app.auth.client_token import get_current_user
+from app.services import vault_paths
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/reminders", tags=["reminders"])
 
 
-def _check_token(authorization: str | None):
-    """Verify the Mac agent is authenticated (constant-time compare)."""
-    if not settings.mcp_token:
-        return  # No auth configured
-    token = ""
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization[7:].strip()
-    if not safe_token_check(token, settings.mcp_token):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-# --- Push sync ---
-
-
-class ReminderPush(BaseModel):
-    uid: str
-    list_name: str
-    summary: str
-    notes: str | None = None
-    due_date: str | None = None
-    priority: int = 0
-    completed: bool = False
-    completed_date: str | None = None
-    flagged: bool = False
-
-
-class SyncRequest(BaseModel):
-    reminders: list[ReminderPush]
-
-
-@router.post("/sync")
-async def push_sync(body: SyncRequest, authorization: str | None = Header(None)):
-    """Receive full reminder state from the Mac agent."""
-    _check_token(authorization)
-
-    # Legacy REST endpoint authed via shared MCP token, not per-user bearer.
-    # Default to Alex (user_id=1). New per-user V3 path is /api/v1/reminders/push
-    # which derives user_id from the bearer.
-    db = get_db()
-    with db.session() as session:
-        count = sync_from_push(
-            [r.model_dump() for r in body.reminders],
-            session,
-            user_id=1,
-        )
-    return {"status": "ok", "synced": count}
-
-
 @router.post("/backlog-sync")
-async def trigger_backlog_sync(authorization: str | None = Header(None)):
-    """Manually trigger vault backlog <-> Reminders sync."""
-    _check_token(authorization)
-
-    if not settings.obsidian_vault_path:
-        return {"status": "error", "message": "HOME_OBSIDIAN_VAULT_PATH not configured"}
+async def trigger_backlog_sync(user: User = Depends(get_current_user)):
+    """Manually trigger vault backlog <-> Reminders sync for the calling user."""
+    vault_dir = vault_paths.user_vault_path(user.name)
+    if not vault_dir.is_dir():
+        return {"status": "error", "message": f"No vault directory for {user.name}"}
 
     from app.integrations.apple_reminders.backlog_sync import sync_backlogs
 
@@ -97,7 +56,8 @@ async def trigger_backlog_sync(authorization: str | None = Header(None)):
         result = await asyncio.to_thread(
             sync_backlogs,
             session,
-            settings.obsidian_vault_path,
+            str(vault_dir),
+            user.id,
         )
-    logger.info(f"Backlog sync (manual): {result}")
+    logger.info(f"Backlog sync (manual) [{user.name}]: {result}")
     return {"status": "ok", **result}

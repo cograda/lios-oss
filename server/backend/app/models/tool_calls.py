@@ -11,6 +11,14 @@ run without a resolved user — defensive, not expected in practice) and
 this table is an admin/ops audit log, not per-user application data.
 `ON DELETE SET NULL` so a user row can be removed without cascading into
 the audit trail.
+
+V4 chunk 2.5 adds `args_summary` (redacted arguments — see
+`app.services.redaction.scrub_args`, called from the dispatcher),
+`affected` (optional list of entity refs a write touched, e.g.
+`["snag:SNAG-0042"]` — set via `app.plugin.dispatch.set_affected`, null for
+tools that don't opt in), `source_ip`, and `transport` (`mcp`|`http`), so a
+row answers "who, what tool, with what (redacted) args, from where, over
+which transport" — not just "a tool ran".
 """
 
 from datetime import datetime, timezone
@@ -41,3 +49,12 @@ class ToolCall(Base):
         default=lambda: datetime.now(timezone.utc),
         server_default=func.now(),
     )
+    # Redacted, size-capped JSON string (app.services.redaction.scrub_args).
+    # Text rather than a native JSON column — matches the existing
+    # pattern for JSON-ish blobs in this codebase (e.g. ClientToken.task_health).
+    args_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # JSON-encoded list of entity refs the call touched, e.g.
+    # '["snag:SNAG-0042"]'. Null for tools that don't set it (most tools).
+    affected: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    transport: Mapped[str | None] = mapped_column(String(10), nullable=True)  # mcp|http

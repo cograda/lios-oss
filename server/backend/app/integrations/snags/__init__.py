@@ -12,11 +12,17 @@ Capture is idempotent over WhatsApp 'Snag - …' messages — the /triage and
 
 from typing import Any
 
-from app.integrations.base import BaseIntegration
 from app.integrations.snags import tools as snag_tools
+from app.plugin.bases import CapabilityService
 
 
-class SnagsIntegration(BaseIntegration):
+class SnagsIntegration(CapabilityService):
+    """No external system polled on a schedule — capture is entirely
+    user-gated (snag_capture) so snags aren't silently created from
+    mid-conversation messages. `sync()` is fully inherited (no-op) from
+    CapabilityService; the manifest's own `schedule=None` already meant it
+    was never called by the scheduler."""
+
     @property
     def name(self) -> str:
         return "snags"
@@ -24,11 +30,6 @@ class SnagsIntegration(BaseIntegration):
     @property
     def display_name(self) -> str:
         return "Snag Register"
-
-    def sync(self) -> None:
-        """No scheduled sync — capture is user-gated (snag_capture) so snags
-        aren't silently created from mid-conversation messages."""
-        return None
 
     def mcp_tools(self) -> list[dict[str, Any]]:
         return snag_tools.mcp_tools()
@@ -50,8 +51,6 @@ class SnagsIntegration(BaseIntegration):
             )
         return {"by_status": by_status, "by_trade": by_trade}
 
-    def sync_schedule(self) -> str | None:
-        return None
-
-    def is_configured(self) -> bool:
-        return True
+    # is_configured(): default (empty required set -> vacuously True; sheets
+    # export config is optional — snags itself always works, exports just
+    # no-op until sheets_owner_account is set).

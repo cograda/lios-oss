@@ -1,4 +1,14 @@
-"""MCP tool definitions and handlers for Google Calendar."""
+"""MCP tool definitions and handlers for Google Calendar.
+
+Tool dicts are built via the declarative DSL's `CustomTool` wrapper (V4
+chunk 4.1) rather than hand-assembled — each `handle_*` function below is
+unchanged (they don't fit `ListTool`'s after/before-date shape: `days`-ahead
+windows, OR-across-columns search, and visibility-filtering post-processing
+are all bespoke), so `CustomTool` is the right DSL builder: it wraps an
+existing handler without forcing it into a shape it doesn't have. Every tool
+still declares its own inline `annotations` (unchanged values — pinned by
+`tests/test_plugin_discovery.py`'s frozen `OLD_TOOL_ANNOTATIONS`).
+"""
 
 import json
 from datetime import datetime, timedelta, timezone
@@ -8,8 +18,11 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.services.text import ILIKE_ESCAPE_CHAR, escape_ilike
+
 from app.integrations.google_calendar.models import CalendarEvent
+from app.plugin.config_store import plugin_config
+from app.tools import CustomTool, ToolAnnotations
 
 
 def _apply_visibility(events: list[dict]) -> list[dict]:
@@ -18,7 +31,7 @@ def _apply_visibility(events: list[dict]) -> list[dict]:
     Keyed by the calendar the event lives on (e.g. a shared/subscribed
     family calendar), falling back to the authenticated account.
     """
-    visibility = settings.calendar_visibility
+    visibility = plugin_config("google_calendar").calendar_visibility
     filtered = []
     for e in events:
         vis = visibility.get(e.get("calendar")) or visibility.get(e.get("account"), "full")
@@ -55,11 +68,11 @@ def query_events(
         terms = search.split()
         term_filters = []
         for term in terms:
-            pattern = f"%{term}%"
+            pattern = f"%{escape_ilike(term)}%"
             term_filters.append(
                 or_(
-                    CalendarEvent.summary.ilike(pattern),
-                    CalendarEvent.description.ilike(pattern),
+                    CalendarEvent.summary.ilike(pattern, escape=ILIKE_ESCAPE_CHAR),
+                    CalendarEvent.description.ilike(pattern, escape=ILIKE_ESCAPE_CHAR),
                 )
             )
         if term_filters:
@@ -67,8 +80,12 @@ def query_events(
 
     query = query.order_by(CalendarEvent.start_time)
 
-    if limit:
-        query = query.limit(limit)
+    # Bound even when no explicit limit was requested — `days` is caller-
+    # controlled (handle_next_events passes 90) and an unbounded `.all()` on a
+    # busy multi-account household calendar has no natural cap otherwise.
+    # 500 events comfortably covers a month of a heavily-booked calendar
+    # across 4+ accounts without truncating any realistic week/month view.
+    query = query.limit(limit if limit else 500)
 
     events = query.all()
 
@@ -118,6 +135,10 @@ def handle_today(session: Session, arguments: dict[str, Any]) -> str:
             CalendarEvent.status == "confirmed",
         )
         .order_by(CalendarEvent.start_time)
+        # A single calendar day, even across every family account, will never
+        # realistically exceed this — bound it anyway so a data anomaly (e.g.
+        # a mis-synced recurring event exploding) can't return unbounded rows.
+        .limit(500)
     )
     events = query.all()
 
@@ -181,6 +202,20 @@ def handle_create_event(session: Session, arguments: dict[str, Any]) -> str:
             return json.dumps({"error": "no Google account connected for current user"})
         account = owned.account_email
 
+    # Attendees leave the house — a typo either bounces or invites a stranger to
+    # a family appointment. Reject the whole call rather than silently dropping a
+    # malformed address, which would report success having invited fewer people.
+    attendees = arguments.get("attendees") or None
+    if attendees is not None:
+        if isinstance(attendees, str):
+            attendees = [attendees]
+        if not isinstance(attendees, list):
+            return json.dumps({"error": "attendees must be a list of email addresses"})
+        attendees = [str(a).strip() for a in attendees if str(a).strip()]
+        bad = [a for a in attendees if a.count("@") != 1 or a.startswith("@") or a.endswith("@")]
+        if bad:
+            return json.dumps({"error": f"not valid email addresses: {bad}"})
+
     result = create_event(
         account_email=account,
         session=session,
@@ -191,6 +226,8 @@ def handle_create_event(session: Session, arguments: dict[str, Any]) -> str:
         all_day=arguments.get("all_day", False),
         description=arguments.get("description"),
         location=arguments.get("location"),
+        attendees=attendees,
+        send_invites=arguments.get("send_invites", True),
     )
 
     if result is None:
@@ -198,17 +235,128 @@ def handle_create_event(session: Session, arguments: dict[str, Any]) -> str:
     return json.dumps(result, indent=2)
 
 
+def handle_update_event(session: Session, arguments: dict[str, Any]) -> str:
+    """Update fields on an existing event (PATCH semantics — see
+    `client.update_event`'s docstring for the full merge-vs-replace and
+    recurring-event rationale). Mirrors `handle_create_event`'s account
+    ownership check and attendee validation.
+    """
+    from app.auth.context import current_user_id
+    from app.integrations.google_calendar.client import update_event
+    from app.models.tokens import OAuthToken
+
+    account = arguments.get("account")
+    if not account:
+        return json.dumps({"error": "account is required"})
+
+    event_id = arguments.get("event_id")
+    if not event_id:
+        return json.dumps({"error": "event_id is required"})
+
+    uid = current_user_id()
+
+    # Decision A: never guess which account/calendar an event id belongs to
+    # — verify the requesting user actually owns the named account first,
+    # exactly as handle_create_event does.
+    owned = (
+        session.query(OAuthToken)
+        .filter_by(user_id=uid, provider="google", account_email=account)
+        .first()
+    )
+    if not owned:
+        return json.dumps({"error": f"account {account} not owned by current user"})
+
+    attendees = arguments.get("attendees") or None
+    if attendees is not None:
+        if isinstance(attendees, str):
+            attendees = [attendees]
+        if not isinstance(attendees, list):
+            return json.dumps({"error": "attendees must be a list of email addresses"})
+        attendees = [str(a).strip() for a in attendees if str(a).strip()]
+        bad = [a for a in attendees if a.count("@") != 1 or a.startswith("@") or a.endswith("@")]
+        if bad:
+            return json.dumps({"error": f"not valid email addresses: {bad}"})
+
+    # Any classified error (404 unknown event, 403 read-only calendar, etc.)
+    # raises a ComarError here — deliberately NOT caught: `app.plugin.dispatch`
+    # is the single chokepoint that turns a PermanentError/TransientError into
+    # a structured tool-call error (and records it in the audit trail with
+    # the right status), so re-catching it here would just duplicate that and
+    # mis-record the call as a successful one.
+    result = update_event(
+        account_email=account,
+        session=session,
+        event_id=event_id,
+        user_id=uid,
+        calendar_id=arguments.get("calendar_id", "primary"),
+        summary=arguments.get("summary"),
+        start_time=arguments.get("start_time"),
+        end_time=arguments.get("end_time"),
+        all_day=arguments.get("all_day"),
+        description=arguments.get("description"),
+        location=arguments.get("location"),
+        attendees=attendees,
+        send_invites=arguments.get("send_invites", True),
+    )
+
+    if result is None:
+        return json.dumps({"error": f"Failed to update event on {account}"})
+    return json.dumps(result, indent=2)
+
+
+def handle_delete_event(session: Session, arguments: dict[str, Any]) -> str:
+    """Delete an event, returning captured detail (title/time/calendar) of
+    what was removed — see `client.delete_event`'s docstring (decision D).
+    """
+    from app.auth.context import current_user_id
+    from app.integrations.google_calendar.client import delete_event
+    from app.models.tokens import OAuthToken
+
+    account = arguments.get("account")
+    if not account:
+        return json.dumps({"error": "account is required"})
+
+    event_id = arguments.get("event_id")
+    if not event_id:
+        return json.dumps({"error": "event_id is required"})
+
+    uid = current_user_id()
+
+    owned = (
+        session.query(OAuthToken)
+        .filter_by(user_id=uid, provider="google", account_email=account)
+        .first()
+    )
+    if not owned:
+        return json.dumps({"error": f"account {account} not owned by current user"})
+
+    # See handle_update_event: classified errors deliberately propagate to
+    # app.plugin.dispatch rather than being caught here.
+    result = delete_event(
+        account_email=account,
+        session=session,
+        event_id=event_id,
+        user_id=uid,
+        calendar_id=arguments.get("calendar_id", "primary"),
+        send_updates=arguments.get("send_updates", True),
+    )
+
+    if result is None:
+        return json.dumps({"error": f"Failed to delete event on {account}"})
+    return json.dumps(result, indent=2)
+
+
 def get_mcp_tools() -> list[dict]:
     """Return MCP tool definitions with handler functions."""
     return [
-        {
-            "name": "calendar_list_events",
-            "description": (
+        CustomTool(
+            name="calendar_list_events",
+            description=(
                 "List upcoming calendar events across all family calendars. "
                 "Returns event title, time, location, and which calendar/account it's from. "
                 "Defaults to the next 7 days. Optionally filter by account email or search text."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "days": {
@@ -226,36 +374,42 @@ def get_mcp_tools() -> list[dict]:
                     },
                 },
             },
-            "handler": handle_list_events,
-            "category": "calendar",
-            "examples": [
+            handler=handle_list_events,
+            annotations=ToolAnnotations(
+                read_only_hint=True, idempotent_hint=True, open_world_hint=True,
+            ),
+            category="calendar",
+            examples=[
                 "What's on this week?",
                 "Any events next Thursday?",
                 "Search for dentist appointments",
             ],
-        },
-        {
-            "name": "calendar_today",
-            "description": (
+        ).build(),
+        CustomTool(
+            name="calendar_today",
+            description=(
                 "Show today's calendar events with times, locations, and which calendar "
                 "they're from. Work events show as '(busy)' for privacy. "
                 "Use this to check what's on today."
             ),
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": handle_today,
-            "category": "calendar",
-            "examples": [
+            input_schema={"type": "object", "properties": {}},
+            handler=handle_today,
+            annotations=ToolAnnotations(
+                read_only_hint=True, idempotent_hint=True, open_world_hint=True,
+            ),
+            category="calendar",
+            examples=[
                 "What's on today?",
                 "Do I have any meetings today?",
             ],
-        },
-        {
-            "name": "calendar_next_events",
-            "description": (
+        ).build(),
+        CustomTool(
+            name="calendar_next_events",
+            description=(
                 "Get the next N upcoming events across all calendars, regardless of date. "
                 "Useful for a quick glance at what's coming up soon."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "count": {
@@ -265,21 +419,24 @@ def get_mcp_tools() -> list[dict]:
                     },
                 },
             },
-            "handler": handle_next_events,
-            "category": "calendar",
-            "examples": [
+            handler=handle_next_events,
+            annotations=ToolAnnotations(
+                read_only_hint=True, idempotent_hint=True, open_world_hint=True,
+            ),
+            category="calendar",
+            examples=[
                 "What's coming up next?",
                 "Show me the next 5 events",
             ],
-        },
-        {
-            "name": "calendar_create_event",
-            "description": (
+        ).build(),
+        CustomTool(
+            name="calendar_create_event",
+            description=(
                 "Create a new event on a Google Calendar. Use for scheduling appointments, "
-                "reminders with calendar entries, or blocking time. Defaults to the primary "
-                "personal account (alex@example.com)."
+                "reminders with calendar entries, or blocking time. Defaults to the "
+                "calling user's first connected Google account."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "summary": {
@@ -309,17 +466,172 @@ def get_mcp_tools() -> list[dict]:
                     },
                     "account": {
                         "type": "string",
-                        "description": "Google account email to create event on (default: alex@example.com)",
+                        "description": "Google account email to create event on (default: the caller's first connected account)",
+                    },
+                    "attendees": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Email addresses to invite. Each attendee is emailed a "
+                            "calendar invitation unless send_invites is false."
+                        ),
+                    },
+                    "send_invites": {
+                        "type": "boolean",
+                        "description": (
+                            "Email the attendees an invitation (default true). Set false "
+                            "to attach people without notifying them — e.g. recording who "
+                            "was at something after the fact."
+                        ),
+                        "default": True,
                     },
                 },
                 "required": ["summary", "start_time"],
             },
-            "handler": handle_create_event,
-            "category": "calendar",
-            "examples": [
+            handler=handle_create_event,
+            annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True),
+            category="calendar",
+            examples=[
                 "Create a calendar event for the dentist on April 15th at 2pm",
                 "Block time for house viewing on the 20th",
-                "Add an all-day reminder for Sam's birthday",
+                "Add an all-day reminder for a birthday",
             ],
-        },
+        ).build(),
+        CustomTool(
+            name="calendar_update_event",
+            description=(
+                "Update fields on an existing Google Calendar event — only the fields you "
+                "pass are changed, everything else (attendees, description, location, "
+                "recurrence) is left exactly as it was. You must specify the account the "
+                "event lives on and its event id (from calendar_list_events/calendar_today) "
+                "— this tool never guesses which account or calendar an event id belongs "
+                "to. Not supported: events that are part of a recurring series (they have "
+                "a 'recurrence' or 'recurringEventId' field) — edit those directly in "
+                "Google Calendar."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "account": {
+                        "type": "string",
+                        "description": "Google account email the event lives on (required — e.g. 'user@example.com')",
+                    },
+                    "event_id": {
+                        "type": "string",
+                        "description": "The event's Google event id, as returned by calendar_list_events/calendar_today",
+                    },
+                    "calendar_id": {
+                        "type": "string",
+                        "description": "Calendar id the event lives on (default 'primary' — events created by calendar_create_event are always on 'primary')",
+                        "default": "primary",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "New event title (optional — omit to leave unchanged)",
+                    },
+                    "start_time": {
+                        "type": "string",
+                        "description": (
+                            "New start time as ISO 8601 datetime, or YYYY-MM-DD for "
+                            "all-day events (optional — omit to leave unchanged). If "
+                            "given without end_time, only the start moves; pass both "
+                            "to shift the whole event."
+                        ),
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "description": "New end time (optional — omit to leave unchanged)",
+                    },
+                    "all_day": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether the event should be all-day (optional — only needed "
+                            "when switching between timed and all-day; otherwise inferred "
+                            "from start_time)"
+                        ),
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New event description/notes (optional — omit to leave unchanged)",
+                    },
+                    "location": {
+                        "type": "string",
+                        "description": "New event location (optional — omit to leave unchanged)",
+                    },
+                    "attendees": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Full replacement list of attendee email addresses (optional — "
+                            "omit to leave the current attendee list unchanged)"
+                        ),
+                    },
+                    "send_invites": {
+                        "type": "boolean",
+                        "description": "Email attendees about this change (default true)",
+                        "default": True,
+                    },
+                },
+                "required": ["account", "event_id"],
+            },
+            handler=handle_update_event,
+            annotations=ToolAnnotations(
+                read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
+            ),
+            category="calendar",
+            examples=[
+                "Move the dentist appointment to 3pm instead of 2pm",
+                "Fix the typo in the title of tomorrow's meeting",
+                "Add a location to the house viewing event",
+            ],
+        ).build(),
+        CustomTool(
+            name="calendar_delete_event",
+            description=(
+                "Permanently delete a Google Calendar event. Returns the title, time, and "
+                "calendar of what was removed so the caller can confirm what happened — "
+                "Google's own trash/recovery window is limited, so this is not fully "
+                "reversible after that window passes. You must specify the account the "
+                "event lives on and its event id (from calendar_list_events/calendar_today) "
+                "— this tool never guesses which account or calendar an event id belongs "
+                "to, and never deletes an event you haven't identified precisely. An "
+                "unknown event id raises a clear error rather than doing nothing silently. "
+                "Not supported: events that are part of a recurring series (they have a "
+                "'recurrence' or 'recurringEventId' field) — cancel those directly in "
+                "Google Calendar."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "account": {
+                        "type": "string",
+                        "description": "Google account email the event lives on (required — e.g. 'user@example.com')",
+                    },
+                    "event_id": {
+                        "type": "string",
+                        "description": "The event's Google event id, as returned by calendar_list_events/calendar_today",
+                    },
+                    "calendar_id": {
+                        "type": "string",
+                        "description": "Calendar id the event lives on (default 'primary' — events created by calendar_create_event are always on 'primary')",
+                        "default": "primary",
+                    },
+                    "send_updates": {
+                        "type": "boolean",
+                        "description": "Email existing attendees that the event was cancelled (default true)",
+                        "default": True,
+                    },
+                },
+                "required": ["account", "event_id"],
+            },
+            handler=handle_delete_event,
+            annotations=ToolAnnotations(
+                read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True,
+            ),
+            category="calendar",
+            examples=[
+                "Cancel the dentist appointment",
+                "Delete the house viewing event, it fell through",
+            ],
+        ).build(),
     ]

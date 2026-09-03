@@ -2,14 +2,14 @@
 
 Flow per id:
   1. Load MessageAttachment row, validate it's pending + parseable
-  2. GET http://comar-whatsapp:3100/download/{message_ref}  → bytes
+  2. GET http://lios-whatsapp:3100/download/{message_ref}  → bytes
   3. Stage to /tmp/wa_attachments/{id}_{filename}
   4. Dispatch to the corpus parser (pdf / docx / xlsx)
   5. Upsert HistoricalDocument + chunks (reuse corpus._upsert_document)
   6. Link attachment → doc, flip parse_status='ingested'
 
 Same historical_corpus embedding source, so these are returned by
-`renovation_context` with no extra wiring.
+`corpus_search` with no extra wiring.
 """
 
 from __future__ import annotations
@@ -24,18 +24,21 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.integrations.attachments.models import MessageAttachment
-from app.integrations.historical_corpus.ingest import _upsert_document
-from app.integrations.historical_corpus.parsers import (
-    boq as boq_parser,
-    docx as docx_parser,
-    pdf as pdf_parser,
+from app.integrations.attachments.sources import (
+    SUPPORTED_INGEST_SOURCES,
+    unsupported_source_reason,
 )
-from app.integrations.historical_corpus.parsers.types import DocMeta
-from app.tools.helpers import scoped_query
+from app.plugin.capabilities import get_capability
+
+_corpus = get_capability("corpus.ingest")
+boq_parser = _corpus.boq_parser
+docx_parser = _corpus.docx_parser
+pdf_parser = _corpus.pdf_parser
+DocMeta = _corpus.DocMeta
 
 logger = logging.getLogger(__name__)
 
-BRIDGE_URL = os.environ.get("HOME_WA_BRIDGE_URL", "http://comar-whatsapp:3100")
+BRIDGE_URL = os.environ.get("HOME_WA_BRIDGE_URL", "http://lios-whatsapp:3100")
 STAGING_DIR = Path(os.environ.get("HOME_ATTACHMENT_STAGING", "/tmp/wa_attachments"))
 
 # Skip anything bigger than this — anything over 25 MB on WhatsApp is
@@ -60,14 +63,7 @@ def _sanitize(name: str | None) -> str:
 
 
 def _download(message_ref: str, dest: Path) -> int:
-    from app.config import settings
-
-    headers = {}
-    if settings.wa_bridge_shared_secret:
-        headers["X-Bridge-Secret"] = settings.wa_bridge_shared_secret
-    with httpx.stream(
-        "GET", f"{BRIDGE_URL}/download/{message_ref}", timeout=120.0, headers=headers,
-    ) as r:
+    with httpx.stream("GET", f"{BRIDGE_URL}/download/{message_ref}", timeout=120.0) as r:
         r.raise_for_status()
         size = 0
         with dest.open("wb") as f:
@@ -80,13 +76,13 @@ def _download(message_ref: str, dest: Path) -> int:
 def ingest_one(session: Session, attachment_id: int) -> dict:
     """Ingest a single attachment. Safe to re-run: content-hash dedup upstream
     skips no-op re-embeds."""
-    att = scoped_query(session, MessageAttachment).filter_by(id=attachment_id).one_or_none()
+    att = session.get(MessageAttachment, attachment_id)
     if not att:
         return {"id": attachment_id, "status": "error", "detail": "not found"}
     if att.parse_status == "ingested" and att.historical_doc_id:
         return {"id": attachment_id, "status": "already_ingested", "historical_doc_id": att.historical_doc_id}
-    if att.source != "whatsapp":
-        return {"id": attachment_id, "status": "error", "detail": f"source {att.source!r} not supported yet"}
+    if att.source not in SUPPORTED_INGEST_SOURCES:
+        return {"id": attachment_id, "status": "error", "detail": unsupported_source_reason(att.source)}
     if att.size_bytes and att.size_bytes > MAX_BYTES:
         att.parse_status = "skipped"
         att.skip_reason = f"over size cap ({att.size_bytes} > {MAX_BYTES})"
@@ -143,9 +139,11 @@ def ingest_one(session: Session, attachment_id: int) -> dict:
     # Unique source_path so this doesn't collide with any on-disk copy of the same file.
     source_path = f"wa_attachment/{att.id}/{att.filename or 'unnamed'}"
 
-    doc, created, enq = _upsert_document(
+    # No project_tags: the corpus applies this deployment's configured
+    # default (historical_corpus.default_project_tag). Previously hardcoded
+    # to the literal "riverside".
+    doc, created, enq = _corpus.upsert_document(
         session, source_path=source_path, meta=enriched, chunks=chunks,
-        project_tags=["renovation"],
     )
     att.historical_doc_id = doc.id
     att.storage_path = str(stage_path)

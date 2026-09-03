@@ -1,8 +1,13 @@
 """MCP tools for querying the historical corpus.
 
-Primary tool: renovation_context — semantic search pre-filtered to the
-renovation corpus with enrichment from HistoricalDocument (title, date,
-source_type, author, participants, breadcrumb).
+Primary tool: corpus_search — semantic search over the ingested document
+corpus with enrichment from HistoricalDocument (title, date, source_type,
+author, participants, breadcrumb).
+
+Renamed from `riverside_context` on 2026-07-28: the old name put a family
+renovation project into the public tool surface. The project a document
+belongs to is now data (`HistoricalDocument.project_tags`, defaulted from
+the `default_project_tag` config key), not part of the tool's identity.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from app.integrations.historical_corpus.models import (
     HistoricalDocument, HistoricalDocumentChunk,
 )
 from app.services.embedding import EmbeddingService
+from app.tools import CustomTool, ToolAnnotations
 
 
 def _enrich_hits(
@@ -102,7 +108,7 @@ def _enrich_hits(
     return enriched
 
 
-def renovation_context_handler(session: Session, arguments: dict[str, Any]) -> str:
+def corpus_search_handler(session: Session, arguments: dict[str, Any]) -> str:
     query = (arguments.get("query") or "").strip()
     if not query:
         return json.dumps({"error": "query is required"})
@@ -116,6 +122,19 @@ def renovation_context_handler(session: Session, arguments: dict[str, Any]) -> s
         session, query, sources=[EMBEDDING_SOURCE], limit=raw_limit,
     )
     enriched = _enrich_hits(session, hits, source_types)[:limit]
+    return json.dumps({"query": query, "count": len(enriched), "results": enriched}, default=str)
+
+
+def claude_history_search_handler(session: Session, arguments: dict[str, Any]) -> str:
+    query = (arguments.get("query") or "").strip()
+    if not query:
+        return json.dumps({"error": "query is required"})
+
+    limit = int(arguments.get("limit") or 20)
+    hits = EmbeddingService.search(
+        session, query, sources=[EMBEDDING_SOURCE], limit=min(limit * 3, 50),
+    )
+    enriched = _enrich_hits(session, hits, ["claude_conversation"])[:limit]
     return json.dumps({"query": query, "count": len(enriched), "results": enriched}, default=str)
 
 
@@ -160,18 +179,22 @@ def corpus_stats_handler(session: Session, arguments: dict[str, Any]) -> str:
     }, default=str)
 
 
+_READ_ONLY = ToolAnnotations(read_only_hint=True, idempotent_hint=True)
+
+
 def mcp_tools() -> list[dict[str, Any]]:
     return [
-        {
-            "name": "renovation_context",
-            "description": (
-                "Search the historical renovation corpus (WhatsApp, email, "
-                "BoQ, PDFs, docx) with semantic retrieval. Returns chunks with "
-                "document title, date, breadcrumb, and source_path. Use this when "
-                "the user asks about historical renovation decisions, prior "
-                "correspondence, BoQ rates, or site-meeting context."
+        CustomTool(
+            name="corpus_search",
+            description=(
+                "Search the ingested historical document corpus (WhatsApp exports, "
+                "email, bills of quantities, PDFs, docx) with semantic retrieval. "
+                "Returns chunks with document title, date, breadcrumb, and "
+                "source_path. Use this when the user asks about past decisions, "
+                "prior correspondence, quoted rates, or meeting context that "
+                "predates the live integrations."
             ),
-            "inputSchema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Natural language search query"},
@@ -189,12 +212,34 @@ def mcp_tools() -> list[dict[str, Any]]:
                 },
                 "required": ["query"],
             },
-            "handler": renovation_context_handler,
-        },
-        {
-            "name": "corpus_stats",
-            "description": "Report what's been ingested into the historical corpus.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "handler": corpus_stats_handler,
-        },
+            handler=corpus_search_handler,
+            annotations=_READ_ONLY,
+        ).build(),
+        CustomTool(
+            name="claude_history_search",
+            description=(
+                "Semantic search over Alex's archived Claude.ai conversation history "
+                "(5,000+ chats going back to 2024, exported from claude.ai). Use this "
+                "when the user asks what they discussed with Claude previously, wants "
+                "to recall a past chat, or references something they remember asking "
+                "an AI about before comar existed."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural language search query"},
+                    "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50},
+                },
+                "required": ["query"],
+            },
+            handler=claude_history_search_handler,
+            annotations=_READ_ONLY,
+        ).build(),
+        CustomTool(
+            name="corpus_stats",
+            description="Report what's been ingested into the historical corpus.",
+            input_schema={"type": "object", "properties": {}},
+            handler=corpus_stats_handler,
+            annotations=_READ_ONLY,
+        ).build(),
     ]

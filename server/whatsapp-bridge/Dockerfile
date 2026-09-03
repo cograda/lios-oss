@@ -13,14 +13,9 @@ RUN npm install --omit=dev
 
 COPY src/ src/
 
-# Auth state persisted via Docker volume at /app/auth_state. node:22-slim
-# already ships an unprivileged `node` user (uid 1000) — reuse it instead of
-# running the Baileys socket as root. chown before switching so the `node`
-# user can write session/auth state (and re-pairing on logout needs to
-# delete/rewrite files there).
-RUN mkdir -p /app/auth_state && chown -R node:node /app
+# Auth state persisted via Docker volume at /app/auth_state
+RUN mkdir -p /app/auth_state
 
 EXPOSE 3100
 
-USER node
 CMD ["node", "src/index.js"]
