@@ -33,5 +33,9 @@
     "resting_hr_bpm": 58.0,
     "steps": 7600.0
   },
+  "provisional_dates": [
+    "2026-01-15"
+  ],
+  "provisional_reason": "same-day reading \u2014 today hasn't finished, so Apple Health may only have a single early sample for heart rate/HRV; it can differ substantially from the settled value once the day ends. See the vault's Health Profile note: don't programme training off a same-day reading.",
   "to": "2026-01-15"
 }

@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Key, ExternalLink, CheckCircle, XCircle, Monitor, Plus, Copy, ShieldOff,
-  Database, RefreshCw, Trash2,
+  Database, RefreshCw, Trash2, SlidersHorizontal,
 } from 'lucide-react'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -9,19 +10,28 @@ import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select } from '@/components/ui/select'
+import { Textarea } from '@/components/ui/textarea'
+import { Toggle } from '@/components/ui/toggle'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { StatCard } from '@/components/ui/stat-card'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
+import { api, type PreferenceSchemaEntry } from '@/lib/api'
+import { useAuth } from '@/lib/auth'
 import {
   useTokens, useClients, useCreateClient, useDeactivateClient,
   useDataStats, useReindexEmbeddings, usePurgeIntegration, useSystemInfo,
 } from '@/hooks/use-api'
 
+// `user` attributes the resulting OAuth token to that User row — required by
+// google/login since it no longer defaults to "alex". Finn and Isla don't
+// have their own comar User rows (only alex/sam do), so their household
+// calendar accounts are attributed to alex, the household admin.
 const ACCOUNTS = [
-  { email: 'alex@example.com', label: 'Alex' },
-  { email: 'sam@example.com', label: 'Sam' },
-  { email: 'finn@example.com', label: 'Finn' },
-  { email: 'isla@example.com', label: 'Isla' },
+  { email: 'user@gmail.com', label: 'User', user: 'alex' },
+  { email: 'sam@example.com', label: 'Sam', user: 'sam' },
+  { email: 'finn@example.com', label: 'Finn', user: 'alex' },
+  { email: 'isla@example.com', label: 'Isla', user: 'alex' },
 ]
 
 // Integration display names for the purge UI
@@ -50,6 +60,7 @@ function relativeTime(iso: string | null): string {
 // ─── Clients & Accounts Tab ───
 
 function ClientsTab() {
+  const { isAdmin } = useAuth()
   const { data: tokenData, error: tokenError } = useTokens()
   const { data: clientData, error: clientError } = useClients()
   const createMutation = useCreateClient()
@@ -64,17 +75,21 @@ function ClientsTab() {
   const [newLabel, setNewLabel] = useState('')
   const [createdToken, setCreatedToken] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  const [showInactive, setShowInactive] = useState(false)
+
+  const activeClients = clients.filter((c) => c.is_active)
+  const inactiveClients = clients.filter((c) => !c.is_active)
+  const visibleClients = showInactive ? [...activeClients, ...inactiveClients] : activeClients
 
   const connectedEmails = new Set(tokens.map((t) => t.account))
 
-  function handleConnect(email: string) {
-    window.location.href = `/api/auth/google/login?account=${encodeURIComponent(email)}`
+  async function handleConnect(email: string, user: string) {
+    // The login route needs a signed `start`; only the server can mint it.
+    const { url } = await api.getGoogleLoginUrl(email, user)
+    window.location.href = url
   }
 
   async function handleCreateToken() {
-    if (!window.confirm(
-      `Create a new bearer token for "${newUser}"? Anyone holding this token can read and write ${newUser}'s data.`,
-    )) return
     try {
       const res = await createMutation.mutateAsync({ user: newUser, label: newLabel })
       setCreatedToken(res.token)
@@ -119,10 +134,12 @@ function ClientsTab() {
             <Monitor className="h-4 w-4" />
             Connected Clients
           </CardTitle>
-          <Button size="sm" onClick={() => setShowCreate(true)}>
-            <Plus className="h-3.5 w-3.5 mr-1.5" />
-            New Token
-          </Button>
+          {isAdmin && (
+            <Button size="sm" onClick={() => setShowCreate(true)}>
+              <Plus className="h-3.5 w-3.5 mr-1.5" />
+              New Token
+            </Button>
+          )}
         </CardHeader>
         <CardContent>
           {clients.length === 0 ? (
@@ -134,18 +151,46 @@ function ClientsTab() {
                   <TableHead>User</TableHead>
                   <TableHead>Label</TableHead>
                   <TableHead>Token</TableHead>
+                  <TableHead>Scope</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Last Seen</TableHead>
                   <TableHead>Version</TableHead>
+                  <TableHead>Tasks</TableHead>
                   <TableHead />
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {clients.map((c) => (
+                {visibleClients.map((c) => {
+                  const tasks = Object.entries(c.task_health ?? {})
+                  const unhealthy = tasks.filter(
+                    ([, t]) => (t.restarts ?? 0) > 3 || Boolean(t.last_error) || Boolean(t.finished)
+                  )
+                  const taskTooltip = tasks
+                    .map(([name, t]) => {
+                      const bits = [`${t.restarts ?? 0} restarts`]
+                      if (t.alive_seconds_ago != null) bits.push(`alive ${t.alive_seconds_ago}s ago`)
+                      if (t.finished) bits.push('finished')
+                      if (t.last_error) bits.push(`error: ${t.last_error}`)
+                      return `${name}: ${bits.join(', ')}`
+                    })
+                    .join('\n')
+                  return (
                   <TableRow key={c.id} className={!c.is_active ? 'opacity-40' : ''}>
                     <TableCell className="font-medium">{c.user}</TableCell>
                     <TableCell>{c.label}</TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">{c.token_preview}</TableCell>
+                    <TableCell>
+                      <Badge
+                        variant={c.scope === 'readonly' ? 'warning' : 'default'}
+                        title={
+                          c.scope === 'readonly'
+                            ? 'Read-only: GET requests and readOnlyHint tools only — enforced by the server'
+                            : 'Full: the user\'s whole authority'
+                        }
+                      >
+                        {c.scope === 'readonly' ? 'read-only' : 'full'}
+                      </Badge>
+                    </TableCell>
                     <TableCell>
                       <Badge variant={c.is_active ? 'success' : 'default'}>
                         {c.is_active ? 'Active' : 'Inactive'}
@@ -153,17 +198,46 @@ function ClientsTab() {
                     </TableCell>
                     <TableCell className="text-muted-foreground">{relativeTime(c.last_seen_at)}</TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">{c.client_version || '—'}</TableCell>
+                    <TableCell title={taskTooltip || undefined}>
+                      {tasks.length === 0 ? (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      ) : (
+                        <Badge variant={unhealthy.length > 0 ? 'destructive' : 'success'}>
+                          {unhealthy.length > 0 ? `${unhealthy.length}/${tasks.length} unhealthy` : `${tasks.length} ok`}
+                        </Badge>
+                      )}
+                    </TableCell>
                     <TableCell>
                       {c.is_active && (
-                        <Button variant="ghost" size="sm" onClick={() => handleDeactivate(c.id, c.label)}>
-                          <ShieldOff className="h-3.5 w-3.5" />
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title="Revoke this token — the device can no longer connect"
+                          className="text-muted-foreground hover:text-destructive"
+                          onClick={() => handleDeactivate(c.id, c.label)}
+                        >
+                          <ShieldOff className="h-3.5 w-3.5 mr-1" />
+                          Revoke
                         </Button>
                       )}
                     </TableCell>
                   </TableRow>
-                ))}
+                  )
+                })}
               </TableBody>
             </Table>
+          )}
+          {inactiveClients.length > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="mt-3 text-muted-foreground"
+              onClick={() => setShowInactive((v) => !v)}
+            >
+              {showInactive
+                ? 'Hide revoked tokens'
+                : `Show ${inactiveClients.length} revoked token${inactiveClients.length === 1 ? '' : 's'}`}
+            </Button>
           )}
         </CardContent>
       </Card>
@@ -231,48 +305,32 @@ function ClientsTab() {
         </DialogContent>
       </Dialog>
 
-      {/* Google Accounts */}
+      {/* Google Accounts — per-integration Credentials panels (V4 chunk 5.1)
+          moved this to each integration's detail page (calendar/mail/sheets),
+          scoped to that integration's own manifest.oauth. This tab keeps only
+          a raw connect-a-new-account action and the flat token list, since
+          neither is tied to any one integration. */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Key className="h-4 w-4" />
-            Google Accounts
+            Connect a Google Account
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
-          {ACCOUNTS.map((acc) => {
-            const token = tokens.find((t) => t.account === acc.email)
-            const connected = connectedEmails.has(acc.email)
-
-            return (
-              <div key={acc.email} className="flex items-center justify-between py-2 border-b border-border last:border-0">
-                <div>
-                  <p className="text-sm font-medium">{acc.label}</p>
-                  <p className="text-xs text-muted-foreground font-mono">{acc.email}</p>
-                  {token && (
-                    <div className="flex items-center gap-2 mt-1">
-                      {token.expired ? (
-                        <Badge variant="destructive">Expired</Badge>
-                      ) : (
-                        <Badge variant="success">Active</Badge>
-                      )}
-                      {token.has_refresh_token && (
-                        <span className="text-xs text-muted-foreground">Auto-refresh</span>
-                      )}
-                    </div>
-                  )}
-                </div>
-                <Button
-                  variant={connected ? 'ghost' : 'default'}
-                  size="sm"
-                  onClick={() => handleConnect(acc.email)}
-                >
-                  <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
-                  {connected ? 'Reconnect' : 'Connect'}
-                </Button>
-              </div>
-            )
-          })}
+          <p className="text-sm text-muted-foreground">
+            Per-integration credential status (reauth state, scopes) now lives on each
+            integration's own page — see Calendar, Gmail, or Sheets under Integrations.
+            Use this to connect a new account.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {ACCOUNTS.map((acc) => (
+              <Button key={acc.email} variant="ghost" size="sm" onClick={() => handleConnect(acc.email, acc.user)}>
+                <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
+                {connectedEmails.has(acc.email) ? `Reconnect ${acc.label}` : `Connect ${acc.label}`}
+              </Button>
+            ))}
+          </div>
         </CardContent>
       </Card>
 
@@ -383,7 +441,7 @@ function DataTab() {
         />
         <StatCard
           label="Disk Used"
-          value={systemInfo?.disk && !('error' in systemInfo.disk)
+          value={systemInfo?.disk && !('error' in systemInfo.disk) && systemInfo.disk.percent_used !== null
             ? `${systemInfo.disk.percent_used}%`
             : '—'}
           trend={systemInfo?.disk && !('error' in systemInfo.disk)
@@ -540,9 +598,185 @@ function DataTab() {
   )
 }
 
+// ─── Preferences Tab ───
+
+function PreferencesTab() {
+  const { user: me, isAdmin } = useAuth()
+  const { data: clientData } = useClients()
+  const { data: schemaData, isLoading: schemaLoading } = useQuery({
+    queryKey: ['preferences-schema'],
+    queryFn: () => api.getPreferencesSchema(),
+  })
+  const qc = useQueryClient()
+
+  // Derive the user list from the clients list the page already fetches —
+  // there's no dedicated /users endpoint, and every client token row is
+  // already tied to a real User (id + name).
+  // A non-admin edits their own preferences only (the server 403s anyone
+  // else's), so the picker collapses to themselves.
+  const users = useMemo(() => {
+    if (!isAdmin) return [{ id: me.id, name: me.name }]
+    const seen = new Map<number, string>()
+    seen.set(me.id, me.name)
+    for (const c of clientData?.clients ?? []) {
+      if (!seen.has(c.user_id)) seen.set(c.user_id, c.user)
+    }
+    return Array.from(seen, ([id, name]) => ({ id, name }))
+  }, [clientData, isAdmin, me.id, me.name])
+
+  const [userId, setUserId] = useState<number | null>(null)
+  useEffect(() => {
+    if (userId === null && users.length > 0) setUserId(users[0].id)
+  }, [users, userId])
+
+  const { data: prefsData, isLoading: prefsLoading } = useQuery({
+    queryKey: ['user-preferences', userId],
+    queryFn: () => api.getUserPreferences(userId as number),
+    enabled: userId !== null,
+  })
+
+  const [form, setForm] = useState<Record<string, unknown>>({})
+  useEffect(() => {
+    if (prefsData) setForm(prefsData.preferences)
+  }, [prefsData])
+
+  const saveMutation = useMutation({
+    mutationFn: (values: Record<string, unknown>) => api.putUserPreferences(userId as number, values),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['user-preferences', userId] })
+    },
+  })
+
+  const schema = schemaData?.preferences ?? []
+  const groups = useMemo(() => {
+    const byGroup: Record<string, PreferenceSchemaEntry[]> = {}
+    for (const entry of schema) {
+      if (!byGroup[entry.group]) byGroup[entry.group] = []
+      byGroup[entry.group].push(entry)
+    }
+    return byGroup
+  }, [schema])
+
+  function updateField(key: string, value: unknown) {
+    setForm((f) => ({ ...f, [key]: value }))
+  }
+
+  function renderField(entry: PreferenceSchemaEntry) {
+    const value = form[entry.key]
+    switch (entry.type) {
+      case 'bool':
+        return <Toggle checked={Boolean(value)} onChange={(v) => updateField(entry.key, v)} />
+      case 'int':
+        return (
+          <Input
+            type="number"
+            value={typeof value === 'number' ? value : ''}
+            onChange={(e) => updateField(entry.key, e.target.value === '' ? 0 : Number(e.target.value))}
+            className="w-32"
+          />
+        )
+      case 'list_str': {
+        const list = Array.isArray(value) ? (value as unknown[]).map(String) : []
+        return (
+          <Textarea
+            value={list.join('\n')}
+            onChange={(e) =>
+              updateField(
+                entry.key,
+                e.target.value.split('\n').map((s) => s.trim()).filter(Boolean)
+              )
+            }
+            className="font-mono text-xs"
+            rows={Math.min(8, Math.max(2, list.length || 2))}
+          />
+        )
+      }
+      case 'str':
+      default:
+        return (
+          <Input
+            value={typeof value === 'string' ? value : ''}
+            onChange={(e) => updateField(entry.key, e.target.value)}
+          />
+        )
+    }
+  }
+
+  if (users.length === 0) {
+    return (
+      <Card>
+        <CardContent className="pt-6">
+          <p className="text-sm text-muted-foreground">
+            No users found yet — create a client token first (Clients & Accounts tab).
+          </p>
+        </CardContent>
+      </Card>
+    )
+  }
+
+  return (
+    <div className="space-y-6">
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
+          <CardTitle className="flex items-center gap-2">
+            <SlidersHorizontal className="h-4 w-4" />
+            Preferences
+          </CardTitle>
+          <div className="w-40">
+            <Select
+              value={userId !== null ? String(userId) : ''}
+              onChange={(e) => setUserId(Number(e.target.value))}
+            >
+              {users.map((u) => (
+                <option key={u.id} value={u.id}>{u.name}</option>
+              ))}
+            </Select>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          {(schemaLoading || prefsLoading) && (
+            <p className="text-sm text-muted-foreground">Loading...</p>
+          )}
+          {Object.entries(groups).map(([group, entries]) => (
+            <div key={group} className="space-y-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{group}</p>
+              <div className="space-y-4">
+                {entries.map((entry) => (
+                  <div key={entry.key} className="grid gap-1.5 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] sm:items-start">
+                    <div>
+                      <Label className="text-xs">{entry.key}</Label>
+                      <p className="text-xs text-muted-foreground">{entry.description}</p>
+                    </div>
+                    {renderField(entry)}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+
+          <div className="flex items-center gap-3 pt-2">
+            <Button
+              size="sm"
+              onClick={() => saveMutation.mutate(form)}
+              disabled={saveMutation.isPending || userId === null}
+            >
+              {saveMutation.isPending ? 'Saving...' : 'Save Preferences'}
+            </Button>
+            {saveMutation.isSuccess && <p className="text-xs text-success">Saved.</p>}
+            {saveMutation.isError && (
+              <p className="text-xs text-destructive">{(saveMutation.error as Error).message}</p>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
 // ─── Main Settings Page ───
 
 export default function Settings() {
+  const { isAdmin } = useAuth()
   const [tab, setTab] = useState('clients')
 
   return (
@@ -558,9 +792,15 @@ export default function Settings() {
             <Monitor className="h-3.5 w-3.5 mr-1.5" />
             Clients & Accounts
           </TabsTrigger>
-          <TabsTrigger value="data">
-            <Database className="h-3.5 w-3.5 mr-1.5" />
-            Data
+          {isAdmin && (
+            <TabsTrigger value="data">
+              <Database className="h-3.5 w-3.5 mr-1.5" />
+              Data
+            </TabsTrigger>
+          )}
+          <TabsTrigger value="preferences">
+            <SlidersHorizontal className="h-3.5 w-3.5 mr-1.5" />
+            Preferences
           </TabsTrigger>
         </TabsList>
 
@@ -568,8 +808,14 @@ export default function Settings() {
           <ClientsTab />
         </TabsContent>
 
-        <TabsContent value="data">
-          <DataTab />
+        {isAdmin && (
+          <TabsContent value="data">
+            <DataTab />
+          </TabsContent>
+        )}
+
+        <TabsContent value="preferences">
+          <PreferencesTab />
         </TabsContent>
       </Tabs>
     </div>

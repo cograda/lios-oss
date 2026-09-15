@@ -39,16 +39,28 @@ class BaseIntegration(ABC):
     async def dashboard_data(self) -> dict[str, Any]:
         """Return summary data for the web dashboard."""
 
-    def sync_schedule(self) -> str | None:
-        """Cron expression for automatic sync. None = manual only.
-
-        Examples: '*/15 * * * *' (every 15 min), '0 * * * *' (hourly).
-        """
-        return None
+    # Schedule (cron expression + optional IANA timezone) used to live here
+    # as `sync_schedule()`/`sync_timezone()` overrides. V4 chunk 3.1 made the
+    # integration manifest (`manifest.py::MANIFEST.schedule` /
+    # `schedule_timezone`) the single source of truth — the kernel scheduler
+    # reads those fields directly and no longer calls back into the ABC.
 
     def is_configured(self) -> bool:
         """Return True if this integration has the required config to run.
 
-        Override to check for required API keys, tokens, etc.
+        Default (V4 chunk 3.3): true iff every `required` key in this
+        integration's manifest `config_schema` resolves to a truthy value
+        (DB-backed `integration_config`, falling back to the like-named
+        `HomeSettings` env field during the transition period). Integrations
+        with an empty `config_schema` are vacuously "configured" — same as
+        the old unconditional `True` default.
+
+        Override only when a real connectivity/liveness probe is needed
+        beyond "is the key present" (e.g. `obsidian` checks the vault mount
+        actually exists on disk; `google_mail` checks a token with the right
+        OAuth scope is actually stored, not just that client_id/secret are
+        set).
         """
-        return True
+        from app.plugin.config_store import is_configured_from_schema
+
+        return is_configured_from_schema(self.name)

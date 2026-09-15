@@ -17,12 +17,14 @@ frontend/dist/
 # Data
 *.csv
 *.json
+*.zip
 !package.json
 !package-lock.json
 !tsconfig.json
 !docker-compose.yml
 !scripts/**/*.json
 !backend/tests/snapshots/*.json
+!backend/app/integrations/commute/data/*.json
 *.db
 *.pkl
 
@@ -45,3 +47,8 @@ certs/*.p12
 
 # Docker
 pgdata/
+
+# `make stage-libs` copies lios/libs/coglib in here so the Dockerfile can COPY
+# it (the build context cannot see ../../libs). Never commit a copy of a shared
+# lib: the vendored copy this replaced was a second editable copy of coglib.
+.libs/

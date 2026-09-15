@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session
 
 from app.auth.context import current_user_id
 from app.integrations.coffee.models import Coffee, CoffeeBrew, CoffeeEquipmentProfile
-from app.tools import CustomTool, ListTool, SearchTool, StatsTool
+from app.services.text import ILIKE_ESCAPE_CHAR, escape_ilike
+from app.tools import CustomTool, ListTool, SearchTool, StatsTool, ToolAnnotations
 from app.tools.helpers import iso_or_none, scoped_query, serialize, top_n_group_by
 
 logger = logging.getLogger(__name__)
@@ -134,9 +135,13 @@ def _resolve_coffee(session: Session, arguments: dict) -> Coffee | None:
     roaster = (arguments.get("roaster") or "").strip()
     if not name:
         return None
-    q = session.query(Coffee).filter(Coffee.name.ilike(f"%{name}%"))
+    q = session.query(Coffee).filter(
+        Coffee.name.ilike(f"%{escape_ilike(name)}%", escape=ILIKE_ESCAPE_CHAR)
+    )
     if roaster:
-        q = q.filter(Coffee.roaster.ilike(f"%{roaster}%"))
+        q = q.filter(
+            Coffee.roaster.ilike(f"%{escape_ilike(roaster)}%", escape=ILIKE_ESCAPE_CHAR)
+        )
     return q.order_by(Coffee.created_at.desc()).first()
 
 
@@ -365,11 +370,20 @@ def handle_brew(session: Session, arguments: dict[str, Any]) -> str:
 
 
 def handle_delete_brew(session: Session, arguments: dict[str, Any]) -> str:
-    """Delete a brew session by id."""
+    """Delete a brew session by id.
+
+    N5: was `session.get(CoffeeBrew, brew_id)` — no `user_id` filter at
+    all, so any caller could look up (the response echoes the full deleted
+    row) and delete ANY user's brew by guessing a small integer id. Every
+    other CoffeeBrew query in this module goes through `scoped_query`
+    (`app/tools/helpers.py`'s "one user-scoping impl" — see server/CLAUDE.md);
+    this was the one that didn't. Found by extending
+    `tests/test_user_scoping.py`'s canary sweep to write tools.
+    """
     brew_id = _to_int(arguments.get("brew_id"))
     if not brew_id:
         return json.dumps({"error": "brew_id is required"})
-    brew = scoped_query(session, CoffeeBrew).filter_by(id=brew_id).one_or_none()
+    brew = scoped_query(session, CoffeeBrew).filter(CoffeeBrew.id == brew_id).first()
     if not brew:
         return json.dumps({"error": f"brew {brew_id} not found"})
     deleted = _brew_to_dict(brew)
@@ -497,8 +511,13 @@ def handle_similar(session: Session, arguments: dict[str, Any]) -> str:
     limit = min(int(arguments.get("limit", 10)), 50)
     raw_limit = limit + 5  # overfetch so we can drop anchor + missing rows
 
+    # R4 decay decision: OFF. This matches on flavor profile (free-text query,
+    # or an anchor coffee's tasting notes) — recency is not a signal of a
+    # better flavor match, and a bag logged a year ago that matches perfectly
+    # must not lose to a middling match logged today.
     hits = EmbeddingService.search(
         session, query, sources=[EMBEDDING_SOURCE], limit=raw_limit,
+        apply_recency_decay=False,
     )
     if not hits:
         return json.dumps({
@@ -657,7 +676,7 @@ def get_mcp_tools() -> list[dict]:
             category="coffee",
             examples=[
                 "Find Ethiopian naturals I've tried",
-                "Search Hillside Roasters coffees",
+                "Search Cloud Picker coffees",
                 "Coffees with stone fruit notes",
             ],
         ).build(),
@@ -707,6 +726,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="coffee_log",
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=False),
             description=(
                 "Add or update a coffee bag. Upserts by (name, roaster). Pass any subset "
                 "of fields — only provided fields are updated. Use status='current' for "
@@ -746,6 +766,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="coffee_brew",
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=False),
             description=(
                 "Log a brew session. Resolve coffee by coffee_id OR coffee_name (+ optional "
                 "roaster). For cafe brews set brew_context='cafe', cafe_name, drink_type — "
@@ -792,6 +813,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="coffee_delete_brew",
+            annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True),
             description=(
                 "Delete a brew session by id. Use to remove duplicates or mistakes. "
                 "Returns the deleted row so the action is auditable."
@@ -809,6 +831,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="coffee_rate",
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True),
             description=(
                 "Update a coffee's overall rating (0-10), append notes, or change status. "
                 "Resolve by coffee_id OR coffee_name (+ optional roaster)."
@@ -833,6 +856,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="coffee_recommend",
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
             description=(
                 "Suggest what to try next. Returns favourites (rating ≥ 8), favourite "
                 "processes/roasters, origin coverage, and stale favourite roasters (loved "
@@ -850,6 +874,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="coffee_current",
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
             description=(
                 "List coffees marked status='current' — the bag(s) you're actively "
                 "drinking. Used by the daily-note morning briefing."
@@ -861,6 +886,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="coffee_similar",
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
             description=(
                 "Semantic search across the coffee library. Two modes: pass query=\"...\" "
                 "for free-text search (e.g. \"juicy washed Ethiopian with stone fruit\"), "
@@ -888,6 +914,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="coffee_embed",
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True),
             description=(
                 "Backfill embeddings for coffees lacking one. Admin tool — run once after "
                 "import_brewhaha or after bulk edits. By default only embeds coffees that "
@@ -906,6 +933,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="coffee_dial_in",
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
             description=(
                 "Returns structured context (coffee profile + recent brews + equipment) "
                 "for the model to synthesise a one-variable-at-a-time dial-in suggestion. "

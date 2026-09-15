@@ -4,46 +4,68 @@ When a tool is called, check when its integration last synced. If the data
 is older than the integration's staleness threshold, run a sync inline
 before returning results. This keeps the "scheduled sync" as the baseline
 but ensures interactive queries always get reasonably fresh data.
+
+V4 chunk 1.3: thresholds come from each integration's own manifest
+(`freshness_threshold_minutes`) instead of a hand-maintained kernel dict.
+`None` (either an explicit manifest value, or an integration with no
+manifest entry at all — e.g. `embedding`, which isn't an integration)
+means "never auto-refresh".
 """
 
 import concurrent.futures
 import logging
 from datetime import datetime, timezone
+from functools import lru_cache
 
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-# Per-integration staleness thresholds in seconds.
-# If last_sync_at is older than this, sync before answering.
-# None = never auto-refresh (manual-only integrations).
-FRESHNESS_THRESHOLDS: dict[str, int | None] = {
-    "google_calendar": 120,   # 2 min — events change during the day
-    "google_mail": 120,       # 2 min — new mail matters
-    "whatsapp": 60,           # 1 min — real-time messaging
-    "apple_reminders": 120,   # 2 min — pushed from client, but check staleness
-    "weather": 1800,          # 30 min — slow-moving
-    "lastfm": 900,            # 15 min — not urgent
-    "obsidian": 600,          # 10 min — vault watcher handles real-time
-    "finance": None,          # never — manual CSV import only
-    "irish_rail": None,       # never — live API, no caching
-    "embedding": None,        # never — background worker
-}
+
+@lru_cache(maxsize=1)
+def _threshold_seconds_by_integration() -> dict[str, int | None]:
+    """{integration name: freshness threshold in seconds, or None}.
+
+    Sourced from every integration's manifest via
+    `app.plugin.validate.discover_manifests()` — the same registry chunk
+    1.2 uses to drive model discovery. Cached for the process lifetime;
+    manifests are static, imported once at startup.
+    """
+    from app.plugin.validate import discover_manifests
+
+    return {
+        name: (
+            manifest.freshness_threshold_minutes * 60
+            if manifest.freshness_threshold_minutes is not None
+            else None
+        )
+        for name, manifest in discover_manifests().items()
+    }
+
+
+def threshold_seconds(integration_name: str) -> int | None:
+    """Freshness threshold for `integration_name`, in seconds.
+
+    None means "never auto-refresh" — either the manifest says so
+    explicitly, or the name isn't a registered integration at all (matches
+    the old dict's `.get()` fallback behavior for absent keys).
+    """
+    return _threshold_seconds_by_integration().get(integration_name)
 
 
 def ensure_fresh(integration_name: str, session: Session) -> None:
     """Check if integration data is stale and sync if needed.
 
-    Called from the tool dispatch layer (gRPC CallTool / MCP call_tool)
-    before executing the tool handler. Runs the integration's sync()
-    method inline if the cached data exceeds the staleness threshold.
+    Called from the tool dispatch layer (MCP call_tool) before executing
+    the tool handler. Runs the integration's sync() method inline if the
+    cached data exceeds the staleness threshold.
 
-    This runs in a thread (gRPC ThreadPoolExecutor or asyncio.to_thread).
+    This runs in a thread (asyncio.to_thread).
     integration.sync() is itself a plain blocking function; we hand it to a
     dedicated worker thread so we can still enforce the 30s timeout without
     blocking this thread indefinitely on a hung sync.
     """
-    threshold = FRESHNESS_THRESHOLDS.get(integration_name)
+    threshold = threshold_seconds(integration_name)
     if threshold is None:
         return  # No freshness check for this integration
 

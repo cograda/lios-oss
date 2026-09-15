@@ -2,7 +2,7 @@
 
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, Float, Integer, String, UniqueConstraint, func
+from sqlalchemy import Date, DateTime, Float, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from coglib import Base
@@ -45,6 +45,11 @@ class HealthWorkout(UserOwnedMixin, SourcedRecordMixin, Base):
     distance_km: Mapped[float] = mapped_column(Float, default=0.0)
     active_energy_kcal: Mapped[float] = mapped_column(Float, default=0.0)
     avg_heart_rate_bpm: Mapped[float] = mapped_column(Float, default=0.0)
+    # NULL for every row synced from the Health Auto Export push (it carries
+    # no such field); `health_workout_add` (issue #185) is the only writer
+    # that sets these, so their presence itself marks a manually-entered row.
+    source: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     # synced_at inherited from SourcedRecordMixin
 
 

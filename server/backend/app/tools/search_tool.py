@@ -8,6 +8,7 @@ from typing import Any, Callable
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.services.text import ILIKE_ESCAPE_CHAR, escape_ilike
 from app.tools.base import ExtraFilter, ToolAnnotations, ToolBuilder, parse_iso_date
 
 
@@ -108,8 +109,11 @@ class SearchTool(ToolBuilder):
             terms = search.split() if multi_term else [search]
             term_filters = []
             for term in terms:
-                pattern = f"%{term}%"
-                col_filters = [getattr(model, col).ilike(pattern) for col in search_columns]
+                pattern = f"%{escape_ilike(term)}%"
+                col_filters = [
+                    getattr(model, col).ilike(pattern, escape=ILIKE_ESCAPE_CHAR)
+                    for col in search_columns
+                ]
                 term_filters.append(or_(*col_filters))
 
             from app.tools.helpers import scoped_query

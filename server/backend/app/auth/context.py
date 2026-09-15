@@ -68,3 +68,37 @@ def use_user(user_id: int):
         yield
     finally:
         _current_user_id.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# Folder scope of a cross-user vault read grant (2026-09-06)
+# ---------------------------------------------------------------------------
+#
+# Bound by `app/plugin/dispatch.py` alongside `use_user(...)` when a read-only
+# obsidian tool runs `as_user` under a grant that names folders. `None` means
+# "no folder restriction in force" — which is every ordinary call AND an
+# `as_user` call under a whole-vault (NULL folders) grant. The restriction
+# itself is applied in exactly one place, `app.services.vault_scope.restrict`;
+# this module only carries the value from the access decision to the query.
+_vault_folders: ContextVar[tuple[str, ...] | None] = ContextVar(
+    "vault_folders", default=None
+)
+
+
+def current_vault_folders() -> tuple[str, ...] | None:
+    """Folder prefixes the in-flight call may read, or None for unrestricted."""
+    return _vault_folders.get()
+
+
+@contextmanager
+def use_vault_folders(folders: tuple[str, ...] | list[str] | None):
+    """Bind the folder scope for the duration of the with-block.
+
+    Same get/reset discipline as `use_user` — a binding that outlived its call
+    would restrict (or, worse, fail to restrict) the next caller on the loop.
+    """
+    token = _vault_folders.set(tuple(folders) if folders else None)
+    try:
+        yield
+    finally:
+        _vault_folders.reset(token)

@@ -2,7 +2,7 @@
 
 Each account gets its own token row in the oauth_tokens table. The flow:
 
-1. User visits /api/auth/google/login?account=alex@example.com
+1. User visits /api/auth/google/login?account=user@gmail.com
 2. Redirected to Google consent screen
 3. Google redirects back to /api/auth/google/callback with code + state
 4. We exchange the code for tokens and store them
@@ -37,11 +37,27 @@ from app.errors import NeedsReauthError  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-# Scopes we request — Calendar and Gmail
-SCOPES = [
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/gmail.readonly",
-]
+def _oauth_scopes() -> list[str]:
+    """Union of every integration's declared Google OAuth scopes.
+
+    V4 chunk 3.3: replaces the single hard-coded `SCOPES` list — each
+    integration that needs Google OAuth now declares its own scopes in its
+    manifest (`oauth.scopes`; see google_calendar, google_mail, snags), and
+    a consent still requests all of them in one go (current actual
+    behavior, just relocated — a single Google account signs in once and
+    gets everything every integration needs, same as before).
+
+    Computed at request time, not cached, so a newly-added integration's
+    scopes take effect without a restart-order dependency.
+    """
+    from app.plugin.validate import discover_manifests
+
+    scopes: set[str] = set()
+    for manifest in discover_manifests().values():
+        if manifest.oauth is not None:
+            scopes.update(manifest.oauth.scopes)
+    return sorted(scopes)
+
 
 # Additional scopes to add as integrations are built
 PHOTOS_SCOPES = ["https://www.googleapis.com/auth/photoslibrary.readonly"]
@@ -63,16 +79,76 @@ _HARD_REFRESH_FAILURES = (
 )
 
 
-def _state_signing_key() -> bytes:
-    """Derive a stable signing key from the UI token.
+_STATE_KEY_INFO = b"lios oauth-state-signing v2"
 
-    Using ui_token (server-only secret) means we don't need a separate config
-    knob, and the signature is invalidated automatically if it's rotated.
+
+def _state_signing_key() -> bytes:
+    """Derive the OAuth `state` HMAC key from the at-rest encryption key.
+
+    2026-09-06 — one credential: the per-user bearer. This used to be
+    `sha256("oauth-state-v1:" + HOME_UI_TOKEN)`, which tied the Google consent
+    flow's integrity to the dashboard's shared password: rotate or retire that
+    token and every in-flight consent broke, and the state signature was only
+    as secret as a cookie value typed into a browser. `HOME_OAUTH_ENCRYPTION_KEY`
+    is the one secret the server already *must* hold (it decrypts the very
+    refresh tokens this flow produces — `app/auth/encryption.py` is
+    fail-closed on it), so the state key is derived from it with HKDF under a
+    fixed, purpose-naming `info` string. HKDF rather than reusing the Fernet
+    key bytes directly, so the signing key and the encryption key are
+    independent values even though they share a root — a leak of one does not
+    hand over the other.
+
+    A missing key still raises, never signs with an empty secret: an
+    unsigned/forgeable state is exactly the tampering `_sign_state`'s
+    docstring describes.
     """
-    secret = (settings.ui_token or "").encode()
-    if not secret:
-        raise RuntimeError("HOME_UI_TOKEN must be set to sign OAuth state")
-    return hashlib.sha256(b"oauth-state-v1:" + secret).digest()
+    root = (settings.oauth_encryption_key or "").encode()
+    if not root:
+        raise RuntimeError("HOME_OAUTH_ENCRYPTION_KEY must be set to sign OAuth state")
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32, salt=None, info=_STATE_KEY_INFO,
+    ).derive(root)
+
+
+def _b64(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def _unb64(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _sign_payload(payload: dict, key: bytes) -> str:
+    """`<payload_b64>.<sig_b64>` — HMAC-SHA256 over the canonical JSON."""
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    sig = hmac.new(key, raw, hashlib.sha256).digest()
+    return f"{_b64(raw)}.{_b64(sig)}"
+
+
+def _verify_payload(token: str, key: bytes) -> dict:
+    """Inverse of `_sign_payload`. Raises ValueError on any tamper/malformation."""
+    try:
+        payload_b64, sig_b64 = token.split(".", 1)
+    except ValueError as e:
+        raise ValueError("malformed signed token") from e
+    try:
+        raw = _unb64(payload_b64)
+        sig = _unb64(sig_b64)
+    except (ValueError, TypeError) as e:  # bad base64 / non-ascii
+        raise ValueError("malformed signed token") from e
+    expected = hmac.new(key, raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(sig, expected):
+        raise ValueError("signature invalid")
+    try:
+        payload = json.loads(raw)
+    except ValueError as e:
+        raise ValueError("malformed signed token") from e
+    if not isinstance(payload, dict):
+        raise ValueError("malformed signed token")
+    return payload
 
 
 def _sign_state(payload: dict) -> str:
@@ -82,28 +158,103 @@ def _sign_state(payload: dict) -> str:
     a tailnet attacker could forge `{"user":"alex"}` and burn a token meant
     for them into Alex's row.
     """
-    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-    sig = hmac.new(_state_signing_key(), raw, hashlib.sha256).digest()
-    enc = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-    return f"{enc(raw)}.{enc(sig)}"
+    return _sign_payload(payload, _state_signing_key())
 
 
 def _verify_state(state: str) -> dict:
     """Parse and verify a signed state token. Raises ValueError on tamper."""
     try:
-        payload_b64, sig_b64 = state.split(".", 1)
+        return _verify_payload(state, _state_signing_key())
     except ValueError as e:
+        # Keep the historical wording callers/tests match on.
+        msg = str(e)
+        if "signature" in msg:
+            raise ValueError("state signature invalid") from e
         raise ValueError("malformed state token") from e
 
-    def _pad(s: str) -> bytes:
-        return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
-    raw = _pad(payload_b64)
-    sig = _pad(sig_b64)
-    expected = hmac.new(_state_signing_key(), raw, hashlib.sha256).digest()
-    if not hmac.compare_digest(sig, expected):
-        raise ValueError("state signature invalid")
-    return json.loads(raw)
+# ---------------------------------------------------------------------------
+# Signed `start` for GET /api/auth/google/login (2026-09-07)
+# ---------------------------------------------------------------------------
+#
+# `google/login` is exempt from the dashboard session on purpose (the re-auth
+# link is followed on the Tailscale hostname, where the `comar.lab` cookie is
+# not sent — see `AUTH_EXEMPT` in app/main.py). Exempt used to mean *anyone on
+# the tailnet could START a Google grant naming any user*; only the callback
+# was protected. Now the route also requires `start`: a short-lived HMAC over
+# (account, user, expiry) that only a session-authenticated route (or an MCP
+# tool running as a bearer-authenticated user) can mint. The link still works
+# across domains because the proof travels in the URL, not in a cookie.
+#
+# Its own HKDF `info` label, so a `state` token can never be replayed as a
+# `start` token or vice versa even though both derive from the same root.
+
+_LOGIN_START_KEY_INFO = b"lios oauth-login-start v1"
+
+#: How long a minted `start` stays valid. A banner link is clicked within
+#: seconds; ten minutes matches the strava `state` TTL and bounds replay.
+LOGIN_START_TTL_SECONDS = 600
+
+
+def _login_start_signing_key() -> bytes:
+    root = (settings.oauth_encryption_key or "").encode()
+    if not root:
+        raise RuntimeError("HOME_OAUTH_ENCRYPTION_KEY must be set to sign OAuth login start")
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    return HKDF(
+        algorithm=hashes.SHA256(), length=32, salt=None, info=_LOGIN_START_KEY_INFO,
+    ).derive(root)
+
+
+def sign_login_start(account_email: str, user_name: str, *, now: datetime | None = None) -> str:
+    """Mint the `start` proof for `google/login?account=&user=`.
+
+    Call this ONLY from a context that has already authenticated the person
+    building the link (a session-gated route, or an MCP tool running as a
+    bearer user) — the proof is what stands in for the session on the
+    exempt route.
+    """
+    now = now or datetime.now(timezone.utc)
+    exp = int(now.timestamp()) + LOGIN_START_TTL_SECONDS
+    return _sign_payload(
+        {"account": account_email, "user": user_name, "exp": exp},
+        _login_start_signing_key(),
+    )
+
+
+def verify_login_start(
+    start: str, *, account_email: str, user_name: str, now: datetime | None = None,
+) -> None:
+    """Raise ValueError unless `start` is a valid, unexpired proof for exactly
+    this (account, user) pair. Returns None on success."""
+    if not start:
+        raise ValueError("start is required")
+    payload = _verify_payload(start, _login_start_signing_key())
+    exp = payload.get("exp")
+    if not isinstance(exp, int):
+        raise ValueError("start has no expiry")
+    now = now or datetime.now(timezone.utc)
+    if int(now.timestamp()) >= exp:
+        raise ValueError("start has expired")
+    if payload.get("account") != account_email or payload.get("user") != user_name:
+        raise ValueError("start does not match account/user")
+
+
+def google_login_url(account_email: str, user_name: str) -> str:
+    """The one place a `google/login` link is built — with its signed `start`.
+
+    Relative, so it works on whichever host (comar.lab or the tailnet name)
+    the page was served from; the `start` proof is what makes it valid on
+    either, since the session cookie does not travel.
+    """
+    q = urllib.parse.urlencode({
+        "account": account_email,
+        "user": user_name,
+        "start": sign_login_start(account_email, user_name),
+    })
+    return f"/api/auth/google/login?{q}"
 
 
 def create_auth_url(
@@ -127,7 +278,7 @@ def create_auth_url(
         "client_id": settings.google_client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": " ".join(SCOPES),
+        "scope": " ".join(_oauth_scopes()),
         "access_type": "offline",
         "include_granted_scopes": "true",
         "prompt": "consent",
@@ -195,7 +346,10 @@ def exchange_code(
     token.access_token = encrypt_token(token_data["access_token"])
     token.refresh_token = encrypt_token(token_data.get("refresh_token") or "") or token.refresh_token
     token.token_type = token_data.get("token_type", "Bearer")
-    token.scopes = token_data.get("scope", " ".join(SCOPES))
+    # `or`, not `.get(..., default)` — the latter evaluates the default
+    # eagerly (a discover_manifests() walk) even on the common path where
+    # Google's response already includes a `scope` field.
+    token.scopes = token_data.get("scope") or " ".join(_oauth_scopes())
     if "expires_in" in token_data:
         token.expires_at = datetime.now(timezone.utc) + timedelta(seconds=token_data["expires_in"])
     # Successful consent clears any prior revocation flag — the new tokens
@@ -246,7 +400,7 @@ def get_credentials(account_email: str, session: Session, *, user_id: int):
         token_uri=GOOGLE_TOKEN_URI,
         client_id=settings.google_client_id,
         client_secret=settings.google_client_secret,
-        scopes=token.scopes.split() if token.scopes else SCOPES,
+        scopes=token.scopes.split() if token.scopes else _oauth_scopes(),
         expiry=token.expires_at.replace(tzinfo=None) if token.expires_at else None,
     )
 

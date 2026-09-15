@@ -3,14 +3,14 @@
     "Natural"
   ],
   "favourite_roasters": [
-    "Hillside Roasters"
+    "Cloud Picker"
   ],
   "favourites": [
     {
       "id": 2,
       "name": "Yirgacheffe Natural",
       "rating": 9,
-      "roaster": "Hillside Roasters"
+      "roaster": "Cloud Picker"
     }
   ],
   "origins_explored": [
@@ -24,7 +24,7 @@
     }
   ],
   "stale_favourite_roasters": [
-    "Hillside Roasters"
+    "Cloud Picker"
   ],
   "suggestion_prompt": "Look at favourites + favourite_processes + favourite_roasters. Suggest a coffee to try next that overlaps process/roaster but explores an underrepresented origin. Highlight stale_favourite_roasters as worth revisiting."
 }

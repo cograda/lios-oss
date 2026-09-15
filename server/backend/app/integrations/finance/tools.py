@@ -1,4 +1,20 @@
-"""MCP tool definitions and handlers for Finance integration."""
+"""MCP tool definitions and handlers for Finance integration.
+
+Tool dicts are built via the declarative DSL's `CustomTool` wrapper (V4
+chunk 4.2 — same conversion pattern as `google_calendar` in chunk 4.1):
+every handler below is unchanged (none fit `ListTool`/`SearchTool`'s shape —
+period presets, cross-table joins, and bespoke aggregation are all
+bespoke), so `CustomTool` wraps each existing handler without forcing it
+into a shape it doesn't have. Every tool keeps its exact pre-conversion
+`annotations`/`category`/`examples` — `tests/test_tool_snapshots.py` and
+`tests/test_plugin_discovery.py::OLD_TOOL_ANNOTATIONS` both pin this.
+
+Capability label (V4 chunk 2.2 is on hold — no enforcement yet): each tool
+below is read-only (`finance.read`) or a write (`finance.write`) per its
+existing `readOnlyHint`. This is a static label only, carried alongside the
+built tool dict the same way chunk 4.1's google_calendar conversion carried
+capability intent forward without inventing enforcement.
+"""
 
 import json
 import logging
@@ -9,6 +25,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
 
 from app.integrations.finance.models import Category, CategorizationRule, Transaction
+from app.services.text import ILIKE_ESCAPE_CHAR, escape_ilike
 from app.integrations.finance.services import (
     CategoryService,
     compare_periods,
@@ -22,7 +39,14 @@ from app.integrations.finance.services import (
     resolve_period,
 )
 from app.integrations.finance.sync import import_csv
+from app.tools import CustomTool, ToolAnnotations
 from app.tools.helpers import iso_or_none, serialize
+
+# Static capability label per tool (V4 chunk 4.2) — "finance.read" for
+# readOnlyHint=True tools, "finance.write" otherwise. Not enforced (chunk 2.2
+# is deliberately on hold); purely a declared-intent label for now.
+CAPABILITY_READ = "finance.read"
+CAPABILITY_WRITE = "finance.write"
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +86,13 @@ def handle_summary(session: Session, arguments: dict[str, Any]) -> str:
     total_count = total_q.scalar() or 0
     uncat_count = uncat_q.scalar() or 0
     stats["uncategorized_count"] = uncat_count
+    # None on a zero denominator, not 100.0 — a period with zero transactions
+    # is "no data to categorise", not "fully categorised". The old constant
+    # made an empty month indistinguishable from a perfectly tidy one; a
+    # missing import (comar's own coverage, not the merchant's) read as a
+    # clean bill of health. See the "honest numbers" hardening pass.
     stats["categorization_coverage"] = (
-        round((total_count - uncat_count) / total_count * 100, 1) if total_count else 100.0
+        round((total_count - uncat_count) / total_count * 100, 1) if total_count else None
     )
 
     return json.dumps(stats, indent=2)
@@ -92,7 +121,9 @@ def handle_transactions(session: Session, arguments: dict[str, Any]) -> str:
         else:
             query = query.filter(Transaction.category.has(name=category))
     if search:
-        query = query.filter(Transaction.description.ilike(f"%{search}%"))
+        query = query.filter(
+            Transaction.description.ilike(f"%{escape_ilike(search)}%", escape=ILIKE_ESCAPE_CHAR)
+        )
 
     transactions = query.limit(limit).all()
 
@@ -357,389 +388,27 @@ def handle_register_fingerprint(session: Session, arguments: dict[str, Any]) -> 
     return json.dumps(result, indent=2)
 
 
+def _with_capability(tool: dict, capability: str) -> dict:
+    """Attach the static capability label (V4 chunk 4.2; enforcement is
+    chunk 2.2, deliberately on hold) to a built tool dict."""
+    tool["capability"] = capability
+    return tool
+
+
 def get_mcp_tools() -> list[dict]:
-    """Return MCP tool definitions with handler functions."""
+    """Return MCP tool definitions with handler functions, built via the
+    declarative DSL's `CustomTool` wrapper (see module docstring)."""
     return [
-        {
-            "name": "finance_summary",
-            "description": (
-                "Financial dashboard: total income, expenses, net savings, and savings rate "
-                "for a period, with comparison to the previous equivalent period. "
-                "Also shows categorisation coverage. "
-                "Periods: this_month, last_month, last_3_months, last_6_months, ytd, last_12_months, all."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "period": {
-                        "type": "string",
-                        "description": "Time period preset.",
-                        "default": "this_month",
-                        "enum": ["this_month", "last_month", "last_3_months", "last_6_months", "ytd", "last_12_months", "all"],
-                    },
-                    "account_id": {
-                        "type": "integer",
-                        "description": "Filter to a specific account ID (optional).",
-                    },
-                },
-            },
-            "handler": handle_summary,
-            "category": "money",
-            "examples": [
-                "How much did I spend this month?",
-                "What's my savings rate?",
-                "Financial summary for last quarter",
-            ],
-        },
-        {
-            "name": "finance_transactions",
-            "description": (
-                "Search and list financial transactions. Filter by date range, category, "
-                "or text search. Returns amount, description, category, and account for each."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "start_date": {
-                        "type": "string",
-                        "description": "Start date (YYYY-MM-DD).",
-                    },
-                    "end_date": {
-                        "type": "string",
-                        "description": "End date (YYYY-MM-DD).",
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Category name to filter by, or 'uncategorized'.",
-                    },
-                    "search": {
-                        "type": "string",
-                        "description": "Text search in transaction descriptions.",
-                    },
-                    "account_id": {
-                        "type": "integer",
-                        "description": "Filter to a specific account ID.",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max results (default 50, max 200).",
-                        "default": 50,
-                    },
-                },
-            },
-            "handler": handle_transactions,
-            "category": "money",
-            "examples": [
-                "Show me recent transactions",
-                "What did I spend at Dunnes?",
-                "Uncategorized transactions this month",
-            ],
-        },
-        {
-            "name": "finance_categories",
-            "description": (
-                "Spending breakdown by category for a period — shows where money is going. "
-                "Returns each category with total spend and transaction count."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "period": {
-                        "type": "string",
-                        "description": "Time period preset.",
-                        "default": "this_month",
-                        "enum": ["this_month", "last_month", "last_3_months", "last_6_months", "ytd", "last_12_months", "all"],
-                    },
-                    "account_id": {
-                        "type": "integer",
-                        "description": "Filter to a specific account ID (optional).",
-                    },
-                },
-            },
-            "handler": handle_categories,
-            "category": "money",
-            "examples": [
-                "Where am I spending the most?",
-                "Category breakdown for last month",
-            ],
-        },
-        {
-            "name": "finance_trends",
-            "description": (
-                "Monthly income vs expense trend over time. Shows each month's income, "
-                "expenses, and net for the last N months. Good for spotting spending trends."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "months": {
-                        "type": "integer",
-                        "description": "Number of months to include (default 12).",
-                        "default": 12,
-                    },
-                },
-            },
-            "handler": handle_trends,
-            "category": "money",
-            "examples": [
-                "How has spending changed over time?",
-                "Show income vs expenses by month",
-            ],
-        },
-        {
-            "name": "finance_subscriptions",
-            "description": (
-                "Detect recurring charges (subscriptions, regular payments) by analysing "
-                "transaction patterns. Returns each subscription with frequency, average "
-                "amount, and when it was last charged."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "period": {
-                        "type": "string",
-                        "description": "Time range to analyse.",
-                        "default": "last_12_months",
-                    },
-                },
-            },
-            "handler": handle_subscriptions,
-            "category": "money",
-            "examples": [
-                "What subscriptions am I paying for?",
-                "Show recurring charges",
-            ],
-        },
-        {
-            "name": "finance_top_merchants",
-            "description": (
-                "Top merchants/payees ranked by total spend. Shows where money actually goes "
-                "at the individual merchant level (more granular than category breakdown). "
-                "Optionally filter by category to drill into a specific spending area."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "period": {
-                        "type": "string",
-                        "description": "Time period preset.",
-                        "default": "this_month",
-                        "enum": ["this_month", "last_month", "last_3_months", "last_6_months", "ytd", "last_12_months", "all"],
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Filter to a specific category (e.g. 'Groceries').",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max results (default 20, max 50).",
-                        "default": 20,
-                    },
-                    "account_id": {
-                        "type": "integer",
-                        "description": "Filter to a specific account ID.",
-                    },
-                },
-            },
-            "handler": handle_top_merchants,
-            "category": "money",
-            "examples": [
-                "Where am I spending the most?",
-                "Top merchants for Groceries",
-                "Biggest payees this year",
-            ],
-        },
-        {
-            "name": "finance_compare",
-            "description": (
-                "Compare spending by category between two time periods. Shows each category's "
-                "total in both periods plus the change amount and percentage. "
-                "Great for month-over-month or year-over-year comparisons."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "period_a": {
-                        "type": "string",
-                        "description": "First period (preset like 'this_month' or 'YYYY-MM' for a specific month).",
-                        "default": "this_month",
-                    },
-                    "period_b": {
-                        "type": "string",
-                        "description": "Second period to compare against.",
-                        "default": "last_month",
-                    },
-                    "account_id": {
-                        "type": "integer",
-                        "description": "Filter to a specific account ID.",
-                    },
-                },
-            },
-            "handler": handle_compare,
-            "category": "money",
-            "examples": [
-                "How has spending changed this month vs last?",
-                "Compare Q1 to Q4 spending",
-            ],
-        },
-        {
-            "name": "finance_accounts",
-            "description": (
-                "List all bank accounts with income, expense, net, and transaction count. "
-                "Useful for seeing which accounts are most active and for getting account IDs "
-                "to filter other finance tools."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "period": {
-                        "type": "string",
-                        "description": "Time period preset.",
-                        "default": "all",
-                        "enum": ["this_month", "last_month", "last_3_months", "last_6_months", "ytd", "last_12_months", "all"],
-                    },
-                },
-            },
-            "handler": handle_accounts,
-            "category": "money",
-            "examples": [
-                "Show my accounts",
-                "Which account has the most spending?",
-            ],
-        },
-        {
-            "name": "finance_import_csv",
-            "description": (
-                "Import transactions from CSV content. Auto-detects format (AIB, Revolut, Generic) "
-                "and account (via registered fingerprints). If account is not registered, returns "
-                "status 'unknown_account' with fingerprint details — use finance_register_fingerprint "
-                "to map it, then re-import. You can also provide account_name/account_type explicitly."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "content": {
-                        "type": "string",
-                        "description": "Raw CSV file content.",
-                    },
-                    "filename": {
-                        "type": "string",
-                        "description": "Original filename (important for Revolut account detection).",
-                    },
-                    "account_name": {
-                        "type": "string",
-                        "description": "Account name (e.g. 'AIB Current', 'Revolut Alex'). Optional if fingerprint is registered.",
-                    },
-                    "account_type": {
-                        "type": "string",
-                        "description": "Account type (e.g. 'AIB', 'Revolut'). Optional if fingerprint is registered.",
-                    },
-                },
-                "required": ["content"],
-            },
-            "handler": handle_import,
-            "category": "money",
-        },
-        {
-            "name": "finance_register_fingerprint",
-            "description": (
-                "Register a CSV fingerprint → account mapping for auto-detection. "
-                "Called after finance_import_csv returns 'unknown_account'. "
-                "Once registered, future imports of CSVs with the same fingerprint "
-                "will auto-detect the account."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "account_name": {
-                        "type": "string",
-                        "description": "Account name (e.g. 'AIB Current', 'Revolut Alex').",
-                    },
-                    "account_type": {
-                        "type": "string",
-                        "description": "Account type: 'AIB' or 'Revolut'.",
-                    },
-                    "fingerprint_type": {
-                        "type": "string",
-                        "description": "Type from the unknown_account response (e.g. 'aib_account_number', 'revolut_hash').",
-                    },
-                    "fingerprint_value": {
-                        "type": "string",
-                        "description": "Value from the unknown_account response (e.g. '930156 - 25232034', 'de3b34').",
-                    },
-                },
-                "required": ["account_name", "account_type", "fingerprint_type", "fingerprint_value"],
-            },
-            "handler": handle_register_fingerprint,
-            "category": "money",
-        },
-        {
-            "name": "finance_uncategorized",
-            "description": (
-                "Show uncategorised transactions grouped by description pattern. "
-                "Useful for identifying which merchants need categorisation rules. "
-                "Groups are sorted by frequency (most common first)."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max groups to return (default 20, max 100).",
-                        "default": 20,
-                    },
-                },
-            },
-            "handler": handle_uncategorized,
-            "category": "money",
-            "examples": [
-                "What transactions need categorising?",
-                "Show uncategorised spending",
-            ],
-        },
-        {
-            "name": "finance_add_rule",
-            "description": (
-                "Create categorisation rule(s) and immediately apply to all uncategorised transactions. "
-                "Supports single rule (pattern + category) or batch mode (rules array). "
-                "Pattern is a case-insensitive substring match against transaction descriptions."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Substring to match (case-insensitive). For single rule mode.",
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Category name to assign. Created if it doesn't exist. For single rule mode.",
-                    },
-                    "priority": {
-                        "type": "integer",
-                        "description": "Rule priority (higher = checked first, default 0).",
-                        "default": 0,
-                    },
-                    "rules": {
-                        "type": "array",
-                        "description": "Batch mode: array of rules to create at once.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "pattern": {"type": "string"},
-                                "category": {"type": "string"},
-                                "priority": {"type": "integer", "default": 0},
-                            },
-                            "required": ["pattern", "category"],
-                        },
-                    },
-                },
-            },
-            "handler": handle_add_rule,
-            "category": "money",
-            "examples": [
-                "Categorise DUNNES as Groceries",
-                "Add rules for SPOTIFY→Entertainment, DUNNES→Groceries, TESCO→Groceries",
-            ],
-        },
+        _with_capability(CustomTool(name='finance_summary', description='Financial dashboard: total income, expenses, net savings, and savings rate for a period, with comparison to the previous equivalent period. Also shows categorisation coverage (categorization_coverage is null, not 100, when the period has zero transactions). Periods: this_month, last_month, last_3_months, last_6_months, ytd, last_12_months, all.', input_schema={'type': 'object', 'properties': {'period': {'type': 'string', 'description': 'Time period preset.', 'default': 'this_month', 'enum': ['this_month', 'last_month', 'last_3_months', 'last_6_months', 'ytd', 'last_12_months', 'all']}, 'account_id': {'type': 'integer', 'description': 'Filter to a specific account ID (optional).'}}}, handler=handle_summary, annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True), category='money', examples=['How much did I spend this month?', "What's my savings rate?", 'Financial summary for last quarter']).build(), CAPABILITY_READ),
+        _with_capability(CustomTool(name='finance_transactions', description='Search and list financial transactions. Filter by date range, category, or text search. Returns amount, description, category, and account for each.', input_schema={'type': 'object', 'properties': {'start_date': {'type': 'string', 'description': 'Start date (YYYY-MM-DD).'}, 'end_date': {'type': 'string', 'description': 'End date (YYYY-MM-DD).'}, 'category': {'type': 'string', 'description': "Category name to filter by, or 'uncategorized'."}, 'search': {'type': 'string', 'description': 'Text search in transaction descriptions.'}, 'account_id': {'type': 'integer', 'description': 'Filter to a specific account ID.'}, 'limit': {'type': 'integer', 'description': 'Max results (default 50, max 200).', 'default': 50}}}, handler=handle_transactions, annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True), category='money', examples=['Show me recent transactions', 'What did I spend at Dunnes?', 'Uncategorized transactions this month']).build(), CAPABILITY_READ),
+        _with_capability(CustomTool(name='finance_categories', description='Spending breakdown by category for a period — shows where money is going. Returns each category with total spend and transaction count.', input_schema={'type': 'object', 'properties': {'period': {'type': 'string', 'description': 'Time period preset.', 'default': 'this_month', 'enum': ['this_month', 'last_month', 'last_3_months', 'last_6_months', 'ytd', 'last_12_months', 'all']}, 'account_id': {'type': 'integer', 'description': 'Filter to a specific account ID (optional).'}}}, handler=handle_categories, annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True), category='money', examples=['Where am I spending the most?', 'Category breakdown for last month']).build(), CAPABILITY_READ),
+        _with_capability(CustomTool(name='finance_trends', description="Monthly income vs expense trend over time. Shows each month's income, expenses, and net for the last N months. Good for spotting spending trends.", input_schema={'type': 'object', 'properties': {'months': {'type': 'integer', 'description': 'Number of months to include (default 12).', 'default': 12}}}, handler=handle_trends, annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True), category='money', examples=['How has spending changed over time?', 'Show income vs expenses by month']).build(), CAPABILITY_READ),
+        _with_capability(CustomTool(name='finance_subscriptions', description='Detect recurring charges (subscriptions, regular payments) by analysing transaction patterns. Returns each subscription with frequency, average amount, and when it was last charged.', input_schema={'type': 'object', 'properties': {'period': {'type': 'string', 'description': 'Time range to analyse.', 'default': 'last_12_months'}}}, handler=handle_subscriptions, annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True), category='money', examples=['What subscriptions am I paying for?', 'Show recurring charges']).build(), CAPABILITY_READ),
+        _with_capability(CustomTool(name='finance_top_merchants', description='Top merchants/payees ranked by total spend. Shows where money actually goes at the individual merchant level (more granular than category breakdown). Optionally filter by category to drill into a specific spending area.', input_schema={'type': 'object', 'properties': {'period': {'type': 'string', 'description': 'Time period preset.', 'default': 'this_month', 'enum': ['this_month', 'last_month', 'last_3_months', 'last_6_months', 'ytd', 'last_12_months', 'all']}, 'category': {'type': 'string', 'description': "Filter to a specific category (e.g. 'Groceries')."}, 'limit': {'type': 'integer', 'description': 'Max results (default 20, max 50).', 'default': 20}, 'account_id': {'type': 'integer', 'description': 'Filter to a specific account ID.'}}}, handler=handle_top_merchants, annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True), category='money', examples=['Where am I spending the most?', 'Top merchants for Groceries', 'Biggest payees this year']).build(), CAPABILITY_READ),
+        _with_capability(CustomTool(name='finance_compare', description="Compare spending by category between two time periods. Shows each category's total in both periods plus the change amount and percentage. Great for month-over-month or year-over-year comparisons.", input_schema={'type': 'object', 'properties': {'period_a': {'type': 'string', 'description': "First period (preset like 'this_month' or 'YYYY-MM' for a specific month).", 'default': 'this_month'}, 'period_b': {'type': 'string', 'description': 'Second period to compare against.', 'default': 'last_month'}, 'account_id': {'type': 'integer', 'description': 'Filter to a specific account ID.'}}}, handler=handle_compare, annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True), category='money', examples=['How has spending changed this month vs last?', 'Compare Q1 to Q4 spending']).build(), CAPABILITY_READ),
+        _with_capability(CustomTool(name='finance_accounts', description='List all bank accounts with income, expense, net, and transaction count. Useful for seeing which accounts are most active and for getting account IDs to filter other finance tools.', input_schema={'type': 'object', 'properties': {'period': {'type': 'string', 'description': 'Time period preset.', 'default': 'all', 'enum': ['this_month', 'last_month', 'last_3_months', 'last_6_months', 'ytd', 'last_12_months', 'all']}}}, handler=handle_accounts, annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True), category='money', examples=['Show my accounts', 'Which account has the most spending?']).build(), CAPABILITY_READ),
+        _with_capability(CustomTool(name='finance_import_csv', description="Import transactions from CSV content. Auto-detects format (AIB, Revolut, Generic) and account (via registered fingerprints). If account is not registered, returns status 'unknown_account' with fingerprint details — use finance_register_fingerprint to map it, then re-import. You can also provide account_name/account_type explicitly.", input_schema={'type': 'object', 'properties': {'content': {'type': 'string', 'description': 'Raw CSV file content.'}, 'filename': {'type': 'string', 'description': 'Original filename (important for Revolut account detection).'}, 'account_name': {'type': 'string', 'description': "Account name (e.g. 'AIB Current', 'Revolut Alex'). Optional if fingerprint is registered."}, 'account_type': {'type': 'string', 'description': "Account type (e.g. 'AIB', 'Revolut'). Optional if fingerprint is registered."}}, 'required': ['content']}, handler=handle_import, annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=False), category='money').build(), CAPABILITY_WRITE),
+        _with_capability(CustomTool(name='finance_register_fingerprint', description="Register a CSV fingerprint → account mapping for auto-detection. Called after finance_import_csv returns 'unknown_account'. Once registered, future imports of CSVs with the same fingerprint will auto-detect the account.", input_schema={'type': 'object', 'properties': {'account_name': {'type': 'string', 'description': "Account name (e.g. 'AIB Current', 'Revolut Alex')."}, 'account_type': {'type': 'string', 'description': "Account type: 'AIB' or 'Revolut'."}, 'fingerprint_type': {'type': 'string', 'description': "Type from the unknown_account response (e.g. 'aib_account_number', 'revolut_hash')."}, 'fingerprint_value': {'type': 'string', 'description': "Value from the unknown_account response (e.g. '930156 - 25232034', 'de3b34')."}}, 'required': ['account_name', 'account_type', 'fingerprint_type', 'fingerprint_value']}, handler=handle_register_fingerprint, annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=False), category='money').build(), CAPABILITY_WRITE),
+        _with_capability(CustomTool(name='finance_uncategorized', description='Show uncategorised transactions grouped by description pattern. Useful for identifying which merchants need categorisation rules. Groups are sorted by frequency (most common first).', input_schema={'type': 'object', 'properties': {'limit': {'type': 'integer', 'description': 'Max groups to return (default 20, max 100).', 'default': 20}}}, handler=handle_uncategorized, annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True), category='money', examples=['What transactions need categorising?', 'Show uncategorised spending']).build(), CAPABILITY_READ),
+        _with_capability(CustomTool(name='finance_add_rule', description='Create categorisation rule(s) and immediately apply to all uncategorised transactions. Supports single rule (pattern + category) or batch mode (rules array). Pattern is a case-insensitive substring match against transaction descriptions.', input_schema={'type': 'object', 'properties': {'pattern': {'type': 'string', 'description': 'Substring to match (case-insensitive). For single rule mode.'}, 'category': {'type': 'string', 'description': "Category name to assign. Created if it doesn't exist. For single rule mode."}, 'priority': {'type': 'integer', 'description': 'Rule priority (higher = checked first, default 0).', 'default': 0}, 'rules': {'type': 'array', 'description': 'Batch mode: array of rules to create at once.', 'items': {'type': 'object', 'properties': {'pattern': {'type': 'string'}, 'category': {'type': 'string'}, 'priority': {'type': 'integer', 'default': 0}}, 'required': ['pattern', 'category']}}}}, handler=handle_add_rule, annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=False), category='money', examples=['Categorise DUNNES as Groceries', 'Add rules for SPOTIFY→Entertainment, DUNNES→Groceries, TESCO→Groceries']).build(), CAPABILITY_WRITE),
     ]

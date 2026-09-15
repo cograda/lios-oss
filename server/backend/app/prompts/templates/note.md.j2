@@ -1,0 +1,27 @@
+Create a new note with proper frontmatter. The user's prompt describes the note content.
+
+Arguments: $ARGUMENTS
+
+1. Parse the note topic from the arguments. If no arguments, ask what the note is about.
+
+2. Determine the note type and location:
+   - How-to or guide → `type: reference`, `vault/Reference/Guides/`
+   - Research or comparison → `type: reference`, `vault/Reference/Research/`
+   - About Finn or Isla → `type: note`, `vault/Household/Kids/Finn/` or `vault/Household/Kids/Isla/`
+   - About the house, car, renovation → `type: note`, appropriate `vault/Household/` subfolder
+   - A person (tradesperson, friend, professional) → `type: note`, `vault/People/`
+   - A project or initiative → `type: note`, `vault/Projects/`
+   - Personal thought or reflection ({{display_name}}) → `type: note`, `vault/Notes/`
+   - Genuinely unsure → `type: note`, `vault/Household/` with best-guess subfolder
+
+3. Create the note with appropriate frontmatter, tags, and links to hub notes.
+
+4. If the user included content in their prompt, write it as the note body. Otherwise, create the skeleton and let them know where it is.
+
+5. Filename should be a readable title: spaces allowed, no special chars that break filesystems.
+
+Examples:
+- `/note How to reset the Hive heating schedule` → `vault/Reference/Guides/How to reset the Hive heating.md`
+- `/note Finn's Senior Infants report` → `vault/Household/Kids/Finn/Senior Infants Report.md`, links: [[Finn]]
+- `/note John Builder` → `People/John Builder.md`, tags: [person, renovation]
+- `/note Comparing solar panel installers` → `vault/Reference/Research/Solar Panel Installers.md`

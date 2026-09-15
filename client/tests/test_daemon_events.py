@@ -7,34 +7,17 @@ points run via asyncio.run() so no pytest async plugin is needed.
 
 import asyncio
 
-from comar.daemon import (
+from lios_sync.daemon import (
     _handle_eventkit_command,
     _handle_server_event,
     _next_event,
 )
 
 
-class StubPromptStore:
-    def __init__(self, local_hash="aaa"):
-        self.local_hash = local_hash
-        self.synced_with = None
-
-    def prompt_set_hash(self):
-        return self.local_hash
-
-    def sync_from_server(self, prompts):
-        self.synced_with = prompts
-        return len(prompts)
-
-
 class StubServerClient:
-    def __init__(self, prompts=None, ack_raises=False):
-        self.prompts = prompts or []
+    def __init__(self, ack_raises=False):
         self.acks = []
         self.ack_raises = ack_raises
-
-    def list_prompts(self):
-        return self.prompts
 
     def ack_reminder_command(self, command_id, result=None, error=None):
         if self.ack_raises:
@@ -59,10 +42,9 @@ class StubReminderStore:
         return self.complete_ok
 
 
-def _run(event, prompt_store=None, server_client=None, reminder_store=None):
+def _run(event, server_client=None, reminder_store=None):
     asyncio.run(_handle_server_event(
         event,
-        prompt_store or StubPromptStore(),
         server_client or StubServerClient(),
         reminder_store,
     ))
@@ -83,39 +65,20 @@ def test_next_event_pulls_in_order():
 
 
 # ---------------------------------------------------------------------------
-# prompt_update / hello / unknown
+# hello / unknown
 # ---------------------------------------------------------------------------
 
-def test_prompt_update_with_new_hash_syncs():
-    store = StubPromptStore(local_hash="old")
-    client = StubServerClient(prompts=[{"name": "p1"}])
-
-    _run({"type": "prompt_update", "prompt_set_hash": "new"}, store, client)
-
-    assert store.synced_with == [{"name": "p1"}]
-
-
-def test_prompt_update_with_same_hash_is_noop():
-    store = StubPromptStore(local_hash="same")
-    _run({"type": "prompt_update", "prompt_set_hash": "same"}, store)
-    assert store.synced_with is None
-
-
-def test_prompt_sync_failure_does_not_propagate():
-    store = StubPromptStore(local_hash="old")
-
-    class ExplodingClient(StubServerClient):
-        def list_prompts(self):
-            raise ConnectionError("down")
-
-    _run({"type": "prompt_update", "prompt_set_hash": "new"}, store, ExplodingClient())
-    assert store.synced_with is None  # failed quietly, loop survives
-
-
 def test_hello_and_unknown_events_are_noops():
-    _run({"type": "hello"})
-    _run({"type": "mystery_event"})
-    _run({})  # no type at all
+    """Unknown event types are logged and ignored, never acked. This covers
+    the gRPC-era `prompt_update` too: the server stopped emitting it and the
+    daemon's dedicated no-op branch was removed with list_prompts()."""
+    client = StubServerClient()
+    _run({"type": "hello"}, client)
+    _run({"type": "keepalive"}, client)  # server ping surfaced by open_event_stream
+    _run({"type": "mystery_event"}, client)
+    _run({"type": "prompt_update", "prompt_set_hash": "new"}, client)
+    _run({}, client)  # no type at all
+    assert client.acks == []
 
 
 # ---------------------------------------------------------------------------

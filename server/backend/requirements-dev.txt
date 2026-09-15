@@ -2,4 +2,10 @@
 # The `db` test tier spins up a disposable Postgres via testcontainers
 # (or honours COMAR_TEST_DATABASE_URL in CI).
 pytest>=8.0
+pytest-xdist>=3.5
 testcontainers[postgres]>=4.0
+
+# Wave 5.10 (2026-09-05) CI hygiene: dead-code check in server-unit. Pinned
+# major only — see `.github/workflows/core-tests.yml`'s "Dead code (vulture)"
+# step and `app/vulture_whitelist.py` for the min-confidence and whitelist.
+vulture>=2,<3

@@ -4,18 +4,27 @@ The Node.js bridge (whatsapp-bridge container) maintains the WhatsApp
 connection and writes messages to Postgres. This integration reads
 those messages and exposes them via MCP tools.
 
-No sync schedule — the bridge handles real-time message capture.
-Embedding is triggered manually or could be scheduled.
+`PushSourceIntegration` conversion (V4 chunk 4.3, batch B). The bridge is the
+"push" here — it writes rows directly, out of band — so the base's own
+`sync()` (raises `NotImplementedError`) doesn't fit: the manifest still
+declares a `*/30 * * * *` schedule (unchanged from before this chunk) that
+drives periodic embedding of newly-arrived messages, not a pull from an
+external system, so `sync()` is overridden to keep that exact behaviour
+(`tests/test_scheduler_jobs.py` pins `sync_whatsapp` staying in the job set).
+`probe()` is new — it's the bridge health heartbeat
+(`app.integrations.whatsapp.heartbeat`, scheduled via the manifest's
+`background_tasks` as before) formalized onto the base class interface.
 """
 
 from typing import Any
 
 from app.db import get_db
-from app.integrations.base import BaseIntegration
+from app.integrations.whatsapp import heartbeat as _heartbeat
 from app.integrations.whatsapp.tools import get_mcp_tools
+from app.plugin.bases import PushSourceIntegration
 
 
-class WhatsAppIntegration(BaseIntegration):
+class WhatsAppIntegration(PushSourceIntegration):
 
     @property
     def name(self) -> str:
@@ -26,15 +35,23 @@ class WhatsAppIntegration(BaseIntegration):
         return "WhatsApp"
 
     def sync(self) -> None:
-        """No-op — the bridge writes messages directly to the DB.
-
-        This could optionally trigger embedding of new messages.
-        """
+        """No-op for new messages (the bridge writes them directly to the
+        DB) — this is the periodic embedding pass for messages that have
+        arrived since the last run."""
         from app.integrations.whatsapp.sync import embed_messages
 
         db = get_db()
         with db.session() as session:
+            # Deliberately unscoped: the scheduled sync runs with no bound
+            # user and attributes each chunk to its owner via user_id.
             embed_messages(session, batch_size=200)
+
+    async def probe(self) -> bool:
+        """Liveness check for the Baileys bridge sidecar — same HTTP health
+        check the `whatsapp_bridge_heartbeat` background task runs."""
+        import asyncio
+
+        return await asyncio.to_thread(_heartbeat._check_bridge_blocking)
 
     def mcp_tools(self) -> list[dict[str, Any]]:
         return get_mcp_tools()
@@ -55,13 +72,6 @@ class WhatsAppIntegration(BaseIntegration):
             "latest_message": latest.isoformat() if latest else None,
         }
 
-    def sync_schedule(self) -> str | None:
-        """Run embedding every 30 minutes to chunk new messages."""
-        return "*/30 * * * *"
-
-    def is_configured(self) -> bool:
-        """Always configured — the bridge is a separate container.
-
-        If the bridge isn't running, the tables will just be empty.
-        """
-        return True
+    # is_configured(): default (empty config_schema -> vacuously True — the
+    # bridge is a separate container; if it isn't running, tables are just
+    # empty rather than this integration reporting "not configured").

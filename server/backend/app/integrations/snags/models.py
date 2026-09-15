@@ -14,8 +14,11 @@ from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstr
 from sqlalchemy.orm import Mapped, mapped_column
 
 from coglib import Base
+from app.mixins import UserOwnedMixin
 
-TRADES = ("windowco", "painter", "ken-fergal", "plumber", "electrician", "other", "unknown")
+# Trades are deployment-specific (contractor names) and live in config —
+# see `app.integrations.snags.vocab.trades()`. Statuses and severities are
+# platform behaviour and stay here.
 SEVERITIES = ("critical", "major", "minor", "cosmetic")
 STATUSES = (
     "open", "reported", "accepted", "disputed",
@@ -84,15 +87,29 @@ class SnagMedia(Base):
     vault_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
 
 
-class SnagSourceMessage(Base):
+class SnagSourceMessage(UserOwnedMixin, Base):
     """Which raw messages have already been captured into snags — makes
     snag_capture idempotent across repeated runs (text-only messages have no
-    media_items row, so snag_media alone can't dedupe them)."""
+    media_items row, so snag_media alone can't dedupe them).
+
+    `message_ref` is per-user (F5, 2026-08-08): each household member's
+    WhatsApp bridge session ingests the same group-chat message under its
+    own row, so a globally-unique `message_ref` meant the second bridge's
+    `snag_capture` silently no-op'd against the first bridge's already-seen
+    ref, even though the two users' captures are logically independent runs.
+    The snag itself stays household-shared (no UserOwnedMixin on `Snag`) —
+    only the idempotency bookkeeping is per-user."""
 
     __tablename__ = "snag_source_messages"
+    __table_args__ = (
+        UniqueConstraint("user_id", "message_ref", name="uq_snag_source_messages_user_ref"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    message_ref: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    message_ref: Mapped[str] = mapped_column(String(200), index=True)
     snag_id: Mapped[int] = mapped_column(
         ForeignKey("snags.id", ondelete="CASCADE"), index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
     )

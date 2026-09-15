@@ -34,6 +34,7 @@ class ListTool(ToolBuilder):
         date_params: tuple[str, str] = ("after", "before"),
         extra_filters: list[ExtraFilter] | None = None,
         post_process: Callable[[list[dict]], list[dict]] | None = None,
+        scope_filter: Callable[[Session, Any], Any] | None = None,
         category: str = "",
         examples: list[str] | None = None,
         annotations: ToolAnnotations | None = None,
@@ -47,6 +48,13 @@ class ListTool(ToolBuilder):
         self.date_params = date_params
         self.extra_filters = extra_filters or []
         self.post_process = post_process
+        # `(session, query) -> query`, applied unconditionally right after the
+        # per-user scoping — unlike an ExtraFilter, which is skipped when its
+        # argument is absent. Exists for restrictions that must hold whether
+        # or not the caller asked for a filter: obsidian's folder-scoped grant
+        # uses it so `vault_recent` with no `folder` argument still cannot
+        # list paths outside the grant.
+        self.scope_filter = scope_filter
 
     def _build_schema(self) -> dict[str, Any]:
         properties: dict[str, Any] = {}
@@ -95,6 +103,7 @@ class ListTool(ToolBuilder):
         after_name, before_name = self.date_params
         extra_filters = self.extra_filters
         post_process = self.post_process
+        scope_filter = self.scope_filter
 
         def handler(session: Session, arguments: dict[str, Any]) -> str:
             limit = min(int(arguments.get("limit", default_limit)), max_limit)
@@ -104,6 +113,8 @@ class ListTool(ToolBuilder):
             # Auto-scope per-user models: any model carrying UserOwnedMixin
             # (i.e. has a user_id column) is filtered to the bearer's user_id.
             query = scoped_query(session, model)
+            if scope_filter is not None:
+                query = scope_filter(session, query)
 
             # Date range
             ts_col = getattr(model, timestamp_col)

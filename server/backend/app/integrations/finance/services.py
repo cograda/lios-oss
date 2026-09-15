@@ -10,27 +10,27 @@ import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
-from app.config import settings
-
-# Employer expense reimbursements: 16+ hex chars followed by AIB ref separator.
-_EXPENSE_REIMBURSEMENT_PATTERN = re.compile(r"^[0-9A-Fa-f]{16,}\s*\|")
+# Tines expense reimbursements: 16+ hex chars followed by AIB ref separator.
+_TINES_EXPENSE_PATTERN = re.compile(r"^[0-9A-Fa-f]{16,}\s*\|")
 
 # Family member names that appear in Revolut family transfer descriptions.
 # A "Transfer to/from <NAME>" between two known Revolut accounts is internal.
-# Set HOME_TRANSFER_MATCH_NAMES (comma-separated) to the account-holder names
-# exactly as they appear on bank statements.
-_FAMILY_NAMES = tuple(
-    name.strip().upper()
-    for name in settings.transfer_match_names.split(",")
-    if name.strip()
+_FAMILY_NAMES = (
+    "ALEX CATHAL O RIVERS",
+    "SAM VIRGINIA RIVERS",
+    "ALEX CATHAL O RIVERS & SAM VIRGINIA RIVERS",
 )
 
 # AIB MOBI internal transfer prefixes (between own AIB accounts, not payments).
-# Extend with your own savings-pot labels as they appear on AIB statements.
 _AIB_MOBI_INTERNAL_PREFIXES = (
     "*MOBI JOINT SAVING",
+    "*MOBI JOINT-034",
+    "*MOBI SAVING CLUB",
     "*MOBI CURRENT",
-    "*MOBI SAVINGS",
+    "*MOBI BUILD",
+    "*MOBI BUILDING",
+    "*MOBI BOBBLES",
+    "*MOBI BATHROOM",
 )
 
 
@@ -72,6 +72,7 @@ from app.integrations.finance.models import (
     MonthlySummary,
     Transaction,
 )
+from app.services.text import ILIKE_ESCAPE_CHAR, escape_ilike
 
 # ─── Transfer filter (shared across analytics queries) ───
 
@@ -429,7 +430,7 @@ class CategoryService:
 
         When multiple rules match, the longest pattern takes priority —
         prevents broad keywords like "COFFEE" shadowing specific ones
-        like "HILLSIDE ROASTERS COFFEE".
+        like "CLOUD PICKER COFFEE".
         """
         if not description:
             return None
@@ -444,7 +445,7 @@ class CategoryService:
                 best_len = len(pattern)
         return best_id
 
-    def _expense_reimbursement_category_id(self) -> int | None:
+    def _tines_reimbursement_category_id(self) -> int | None:
         cat = (
             self.session.query(Category)
             .filter(Category.name == "Income - Expense Reimbursement")
@@ -455,9 +456,9 @@ class CategoryService:
     def apply_rules_to_transaction(self, transaction: Transaction) -> bool:
         if transaction.is_manual_category:
             return True
-        # Pattern-based: employer expense reimbursements (hex ref + AIB ref).
-        if transaction.description and _EXPENSE_REIMBURSEMENT_PATTERN.match(transaction.description):
-            cat_id = self._expense_reimbursement_category_id()
+        # Pattern-based: Tines expense reimbursements (hex ref + AIB ref).
+        if transaction.description and _TINES_EXPENSE_PATTERN.match(transaction.description):
+            cat_id = self._tines_reimbursement_category_id()
             if cat_id:
                 transaction.category_id = cat_id
                 return True
@@ -653,7 +654,12 @@ def get_top_merchants(
     if end:
         query = query.filter(Transaction.date <= end)
     if category:
-        query = query.filter(Category.name.ilike(category))
+        # No `%` wildcards here — this wants an exact (case-insensitive) name
+        # match, so a category name that itself contains a literal `%`/`_`
+        # must not be treated as a wildcard.
+        query = query.filter(
+            Category.name.ilike(escape_ilike(category), escape=ILIKE_ESCAPE_CHAR)
+        )
     if account_id:
         query = query.filter(Transaction.account_id == account_id)
 

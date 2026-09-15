@@ -1,11 +1,11 @@
-"""Tests for the remote log handler — buffer management, flush, degradation."""
+"""Tests for the remote log handler — buffer management, flush, deriverstion."""
 
 import logging
 import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-from comar.remote_logging import RemoteLogHandler, MAX_BUFFER_SIZE, _scrub_message
+from lios_sync.remote_logging import RemoteLogHandler, MAX_BUFFER_SIZE, _scrub_message
 
 
 def _make_handler(connected=True):

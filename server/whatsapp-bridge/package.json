@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "test": "node --test src/*.test.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.16",

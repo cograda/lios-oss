@@ -1,25 +1,46 @@
-"""Google Calendar integration — 4 accounts (Alex, Sam, Finn, Isla)."""
+"""Google Calendar integration — multi-account sync (read) + event creation
+(write). Canonical `BidirectionalIntegration` conversion — V4 chunk 4.1.
 
-import logging
-from datetime import datetime, timedelta, timezone
+This is the file future integrations should copy the shape of:
+
+  - `sync()` is entirely inherited from `BidirectionalIntegration` (=
+    `SourceIntegration` + outbound-action interface) — this class supplies
+    only `accounts()`, `pull()`, `store()`, tool wiring, and dashboard data.
+    No hand-rolled fan-out loop, no `sync_schedule()` override (the
+    manifest's `schedule` field is the single source of truth the kernel
+    scheduler reads directly — see `app/scheduler.py`, V4 chunk 3.1).
+  - `client.py` keeps the Google API wrapper and delegates HTTP-error
+    classification to `app.plugin.sync_runtime.classify_exc` — no local
+    copy of a status->error-type mapping.
+  - `tools.py` returns DSL-built tool dicts (`CustomTool`), not raw dicts —
+    every tool still carries its own inline MCP `annotations` (unchanged
+    from before this conversion; see `tests/test_plugin_discovery.py`'s
+    frozen `OLD_TOOL_ANNOTATIONS` for the exact values this must keep
+    matching).
+"""
+
 from typing import Any
 
+from sqlalchemy.orm import Session
+
 from app.config import settings
-from app.db import get_db
-from app.errors import NeedsReauthError, PermanentError, TransientError
-from app.integrations.base import BaseIntegration
-from app.integrations.google_calendar.models import CalendarEvent
-from app.integrations.google_calendar.sync import sync_calendar
+from app.integrations.google_calendar.sync import pull_calendar_events, store_calendar_events
 from app.integrations.google_calendar.tools import get_mcp_tools, query_events
 from app.models.tokens import OAuthToken
-
-logger = logging.getLogger(__name__)
-
-# Accounts to sync — add all family accounts here
-CALENDAR_ACCOUNTS: list[str] = []  # Populated from DB (any google token with calendar scopes)
+from app.plugin.bases import BidirectionalIntegration, PullResult
 
 
-class GoogleCalendarIntegration(BaseIntegration):
+class GoogleCalendarIntegration(BidirectionalIntegration):
+    """Multi-account Google Calendar sync (read) plus event creation (write).
+
+    `accounts()` resolves every stored Google OAuth token (one per family
+    member's connected account) — `SourceIntegration.sync()` fans out over
+    these, calling `pull()`/`store()` once per account and aggregating
+    success/failure exactly as the old hand-rolled `sync()` did (see
+    `app.plugin.sync_runtime.fan_out`'s docstring for the precise
+    all-succeed/all-fail/mixed semantics this preserves).
+    """
+
     @property
     def name(self) -> str:
         return "google_calendar"
@@ -28,64 +49,28 @@ class GoogleCalendarIntegration(BaseIntegration):
     def display_name(self) -> str:
         return "Google Calendar"
 
-    def sync(self) -> None:
-        """Sync all configured Google Calendar accounts."""
-        db = get_db()
-        with db.session() as session:
-            # Find all Google accounts with stored tokens
-            tokens = (
-                session.query(OAuthToken)
-                .filter_by(provider="google")
-                .all()
-            )
+    def accounts(self, session: Session) -> list[OAuthToken]:
+        return session.query(OAuthToken).filter_by(provider="google").all()
 
-            if not tokens:
-                logger.info("No Google accounts configured — skipping calendar sync")
-                return
+    def account_user_id(self, account: OAuthToken) -> int | None:
+        return account.user_id
 
-            total = 0
-            successes = 0
-            failures: list[str] = []
-            failure_excs: list[Exception] = []
-            for token in tokens:
-                try:
-                    count = sync_calendar(
-                        token.account_email, session, user_id=token.user_id,
-                    )
-                    total += count
-                    successes += 1
-                except Exception as e:
-                    logger.exception(f"Failed to sync calendar for {token.account_email}")
-                    failures.append(f"{token.account_email}: {type(e).__name__}: {e}")
-                    failure_excs.append(e)
+    def account_label(self, account: OAuthToken) -> str:
+        return account.account_email
 
-            logger.info(
-                f"Calendar sync complete: {total} events, "
-                f"{successes}/{len(tokens)} accounts ok"
-            )
+    def pull(self, account: OAuthToken, session: Session, cursor: str | None) -> PullResult:
+        return pull_calendar_events(account.account_email, session, user_id=account.user_id)
 
-            # If every account failed, surface that to the scheduler so SyncState
-            # records "error" rather than silent "ok with zero events". Raise
-            # PermanentError only if every account failed for a permanent reason
-            # (dead token, disabled API, ...) — a mix, or any transient failure,
-            # means a retry is still worth trying.
-            if successes == 0 and tokens:
-                message = f"All {len(tokens)} calendar accounts failed: " + " | ".join(failures)
-                last_exc = failure_excs[-1]
-                # A single dead-token account is the common case — preserve
-                # the specific NeedsReauthError so the scheduler's "needs
-                # re-auth" messaging still applies rather than a generic one.
-                if len(failure_excs) == 1 and isinstance(last_exc, NeedsReauthError):
-                    raise last_exc
-                if all(isinstance(e, PermanentError) for e in failure_excs):
-                    raise PermanentError(message) from last_exc
-                raise TransientError(message) from last_exc
+    def store(self, session: Session, records: list[dict]) -> int:
+        return store_calendar_events(session, records)
 
     def mcp_tools(self) -> list[dict[str, Any]]:
         return get_mcp_tools()
 
     async def dashboard_data(self) -> dict[str, Any]:
         """Return this week's calendar summary for the dashboard."""
+        from app.db import get_db
+
         db = get_db()
         with db.session() as session:
             events = query_events(session, days=7)
@@ -103,15 +88,38 @@ class GoogleCalendarIntegration(BaseIntegration):
                 .count()
             )
 
+            # V4 chunk 5.1 — generic dashboard envelope, additive alongside
+            # the legacy keys above (frontend is migrating to `panels`; no
+            # other consumer reads the legacy shape for this integration).
+            from app.services.dashboard_panels import stat_panel, table_panel
+
+            rows = [
+                [
+                    day,
+                    e["start"],
+                    e.get("summary") or "Busy",
+                    e.get("calendar"),
+                    e.get("location") or "",
+                ]
+                for day, evs in sorted(by_day.items())
+                for e in evs
+            ]
+
             return {
                 "connected_accounts": account_count,
                 "events_this_week": len(events),
                 "by_day": by_day,
                 "next_event": events[0] if events else None,
+                "panels": [
+                    stat_panel("Connected accounts", account_count),
+                    stat_panel("Events this week", len(events)),
+                    table_panel(
+                        "This week",
+                        ["Day", "Start", "Event", "Calendar", "Location"],
+                        rows,
+                    ),
+                ],
             }
-
-    def sync_schedule(self) -> str | None:
-        return "*/15 * * * *"  # Every 15 minutes
 
     def is_configured(self) -> bool:
         return bool(settings.google_client_id and settings.google_client_secret)

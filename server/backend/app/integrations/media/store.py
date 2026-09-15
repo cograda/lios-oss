@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.integrations.media.models import MediaItem
 
-BRIDGE_URL = os.environ.get("WA_BRIDGE_URL", "http://comar-whatsapp:3100")
+BRIDGE_URL = os.environ.get("WA_BRIDGE_URL", "http://lios-whatsapp:3100")
 
 # Auto-download window for the scheduled sync. Anything older is 'expired' at
 # scan time anyway (see scan.py); this is a second guard so a stalled scheduler
@@ -87,13 +87,9 @@ def download_item(session: Session, item: MediaItem) -> bool:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / storage_filename(item)
 
-    headers = {}
-    if settings.wa_bridge_shared_secret:
-        headers["X-Bridge-Secret"] = settings.wa_bridge_shared_secret
-
     try:
         with httpx.stream(
-            "GET", f"{BRIDGE_URL}/download/{item.message_ref}", timeout=120.0, headers=headers,
+            "GET", f"{BRIDGE_URL}/download/{item.message_ref}", timeout=120.0
         ) as r:
             r.raise_for_status()
             sha = hashlib.sha256()
@@ -123,17 +119,25 @@ def download_item(session: Session, item: MediaItem) -> bool:
     return True
 
 
-def download_pending(session: Session, limit: int = AUTO_DOWNLOAD_BATCH) -> dict:
+def download_pending(
+    session: Session, limit: int = AUTO_DOWNLOAD_BATCH, *, user_id: int | None = None,
+) -> dict:
     """Auto-download recent 'indexed' items (scheduled-sync path). Commits per
-    item so a crash mid-batch keeps what it got."""
+    item so a crash mid-batch keeps what it got.
+
+    `user_id` restricts the batch to one user's items (the `media_sync` tool
+    passes the caller's — 2026-09-06 scoping audit). `None` is the unbound
+    scheduled sync, which downloads every user's recent window.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=AUTO_DOWNLOAD_WINDOW_DAYS)
+    q = session.query(MediaItem).filter(
+        MediaItem.status == "indexed",
+        MediaItem.message_ts >= cutoff,
+    )
+    if user_id is not None:
+        q = q.filter(MediaItem.user_id == user_id)
     items = (
-        session.query(MediaItem)
-        .filter(
-            MediaItem.status == "indexed",
-            MediaItem.message_ts >= cutoff,
-        )
-        .order_by(MediaItem.message_ts.desc())
+        q.order_by(MediaItem.message_ts.desc())
         .limit(limit)
         .all()
     )

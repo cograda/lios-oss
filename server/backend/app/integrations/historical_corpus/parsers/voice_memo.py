@@ -91,7 +91,7 @@ def _title(header: str, fm: dict, path: Path) -> str:
     m = re.search(r"^#\s+(.+)$", header, re.MULTILINE)
     if m:
         t = m.group(1).strip()
-        # "VM104 · Renovation Requests for Barry" → keep the descriptive part.
+        # "VM104 · Riverside Requests for Cameron" → keep the descriptive part.
         return t.split("·", 1)[1].strip() if "·" in t else t
     return fm.get("id") or path.stem
 

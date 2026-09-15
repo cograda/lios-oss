@@ -1,0 +1,44 @@
+<!-- GENERATED from server/backend/app/prompts/templates/add-task.md.j2 via app.prompts.commands — do not hand-edit. Edit the template and run scripts/render_commands.py (or refetch GET /api/v1/commands). -->
+
+Add a task to the household backlog.
+
+Arguments: $ARGUMENTS
+
+> **The backlog is a ledger, not a file.** `Task Backlog.md` is a rendered view of the task
+> ledger. Never read it for state and never edit it — a hand edit locks every task write until
+> someone forces a render. Read with `tasks_query` (open tasks by default; `include_done`,
+> `status=`, `queue=`, `energy=`, `text=`, `project=`), write with `tasks_add`, `tasks_update`,
+> `tasks_complete`, `tasks_bulk_update`, `tasks_note_add`. Every write re-renders the file itself.
+> `Someday` is `status="someday"`; something owed to us by someone else is `status="waiting"`
+> with who in the description. (`Someday.md` and `Delegated Tasks.md` are folded into the
+> ledger — their contents were a one-time import and nothing writes to those files any more.)
+
+1. Parse the task from the arguments. If no arguments, ask what the task is.
+
+2. Determine priority from context:
+   - `highest` — needs doing today/tomorrow
+   - `high` — this week
+   - `medium` — planned (default)
+   - `low` — nice to have
+
+3. Determine the project. `tasks_structure()` lists programs → projects with their open counts; pick the best match by title. A task with no project is fine until it has company — do not invent a project for one task. If the user names a domain (home / kids / money / tech / …), pass it as `domains=[...]`; it must already exist in the list `tasks_structure` returns.
+
+4. Parse due date if mentioned. Convert relative dates to absolute ISO (`due_at`). If the task is not actionable until a date, that is `defer_until`, not `due_at`.
+
+5. Decide the kind:
+   - a real next action → `status="next"` (default)
+   - an idea / nice-to-have → `status="someday"`
+   - something owed to us by someone else → `status="waiting"`, with who and what in `description`
+   - a 10-minute job → `energy="quick"`; a sit-down job → `energy="deep"`; an errand → `context="errand"`
+
+6. Before adding, check it is not already there: `tasks_query(text="<distinctive word>")`. If it is, say so and offer `tasks_update` instead.
+
+7. `tasks_add(title=..., priority=..., project=..., due_at=..., status=..., energy=..., context=..., domains=..., description=..., source="manual")`. Keep `[[wiki links]]` for people and entities in the title — the renderer preserves them.
+
+8. Show the uid and where it landed (program · project), in one line.
+
+Examples:
+- `/add-task book Finn's swimming for summer` → `tasks_add(title="Book [[Finn]] swimming lessons for summer term", project="Kids Activities", priority="medium")`
+- `/add-task NCT by end of April` → `tasks_add(title="[[Polestar 2]] NCT", due_at="2026-04-30", priority="medium")`
+- `/add-task urgently call the plumber about the leak` → `tasks_add(title="Call plumber about the leak", priority="highest", energy="quick")`
+- `/add-task waiting on Phil for the tile quote` → `tasks_add(title="Tile quote from Phil", status="waiting", description="Waiting on Phil — asked 3 Sep")`

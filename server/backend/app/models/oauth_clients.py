@@ -11,10 +11,9 @@ Four tables:
   mcp_access_tokens          — issued access + refresh tokens (the bearer the MCP
                                layer validates)
 
-Access/refresh tokens are high-entropy random secrets stored in plaintext — the
-same posture as `client_tokens`: equality-lookup by value requires it, and the
-Tailscale-only exposure + short TTLs bound the risk. Encryption-at-rest is a
-later hardening (Plans/mcp-oauth.md, Phase 2).
+Access/refresh tokens are hashed at rest (sha256, V4 chunk 2.3) — same
+posture as `client_tokens`. Lookup is hash-then-index-equality; see
+`app/auth/hashing.py`.
 """
 
 import secrets
@@ -24,6 +23,7 @@ from sqlalchemy import Boolean, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from coglib import Base
+from app.auth.hashing import hash_token, token_last4
 from app.mixins import UserOwnedMixin
 
 
@@ -102,21 +102,23 @@ class OAuthAuthorizationCode(UserOwnedMixin, Base):
 class McpAccessToken(UserOwnedMixin, Base):
     """An issued access token (+ refresh token) for an MCP connector.
 
-    `access_token` is the bearer the MCP layer validates — see
+    The bearer the MCP layer validates — see
     `app/mcp/server.py::_authenticate_request` →
-    `app.auth.oauth_provider.resolve_oauth_token_to_user`.
+    `app.auth.oauth_provider.resolve_oauth_token_to_user`. Both secrets are
+    stored hashed (V4 chunk 2.3); `*_last4` are display/log-only.
     """
 
     __tablename__ = "mcp_access_tokens"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    access_token: Mapped[str] = mapped_column(
-        String(128), nullable=False, unique=True, index=True,
-        default=lambda: secrets.token_urlsafe(32),
+    access_token_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True,
     )
-    refresh_token: Mapped[str | None] = mapped_column(
-        String(128), nullable=True, unique=True, index=True,
+    access_token_last4: Mapped[str] = mapped_column(String(4), nullable=False)
+    refresh_token_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, unique=True, index=True,
     )
+    refresh_token_last4: Mapped[str | None] = mapped_column(String(4), nullable=True)
     client_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     scopes: Mapped[str] = mapped_column(Text, nullable=False, default="[]")  # JSON list
     resource: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -128,3 +130,33 @@ class McpAccessToken(UserOwnedMixin, Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow,
     )
+
+    @classmethod
+    def for_tokens(
+        cls, *, access_token: str, refresh_token: str | None = None, **kwargs,
+    ) -> "McpAccessToken":
+        """Build a row from known plaintext access/refresh tokens (hashes them).
+
+        Used by the mint path (below) and directly by tests that need a
+        stable bearer string to authenticate with later.
+        """
+        return cls(
+            access_token_hash=hash_token(access_token),
+            access_token_last4=token_last4(access_token),
+            refresh_token_hash=hash_token(refresh_token) if refresh_token else None,
+            refresh_token_last4=token_last4(refresh_token) if refresh_token else None,
+            **kwargs,
+        )
+
+    @classmethod
+    def mint(cls, **kwargs) -> tuple["McpAccessToken", str, str]:
+        """Generate fresh access + refresh tokens, return (row, access, refresh).
+
+        Neither plaintext is stored — the caller must hand them to the
+        client now (the OAuth token response); they cannot be recovered
+        later.
+        """
+        access = secrets.token_urlsafe(32)
+        refresh = secrets.token_urlsafe(32)
+        row = cls.for_tokens(access_token=access, refresh_token=refresh, **kwargs)
+        return row, access, refresh

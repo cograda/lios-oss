@@ -1,0 +1,318 @@
+Morning kickoff for {{ display_name }}: create today's daily note and get the day moving.
+
+Arguments: $ARGUMENTS
+
+**This is not a note-generation command — the note is one output of it, not the point of it.** The point is: get today's read-only data on screen fast, ask the three things only a human can answer, and pick up any genuinely new tasks from overnight — without paying a single expensive model call for things that are pure formatting. Renamed from `/daily-note` 2026-09-07 (see the vault plan `Projects/lios/Plans/Daily Kickoff — Rebuilding Daily Note as a Morning Ritual.md` for the full audit and decisions behind this shape).
+
+## Claims carry their source
+
+Almost everything in this note is pasted verbatim from `system_daily_brief(render=true)` — server-rendered markdown fragments, each sourced at generation time. **That rule now holds by construction for those fragments: don't add, strip, or recompute anything inside them.** The only things you compute yourself are Track B's answers (coffee, commute, the catch-all) and Track C's confirmed tasks — write those plainly, no marker needed, since you're the source.
+
+**Track C2's fragments (Morning read, the Pulse asides) are commentary, not facts — and that distinction is the whole point of splitting it out.** They're pasted the same way (verbatim, own subagent, own instructions below), but they exist to add judgement the rendered fragments deliberately don't carry, never to restate a number a rendered fragment already gives. If a Pulse aside ever disagrees with its matching fact block on a figure, the fact block is right and the aside is a bug in the subagent's instructions. **The Email/WhatsApp digests Track C2 used to produce are retired as of 2026-09-10 (lios#192, #193)** — `## Conversations` (Phase 2) is built from Track C's TriageList List 2 instead, which reads whole conversations rather than scoring messages in isolation.
+
+**Prior daily notes are not a data source for anything in this note.** Read them only if you need continuity for the catch-all conversation — never to fill in a number or status today's brief doesn't hand you directly.
+
+## 0. Check whether today's note already exists
+
+`vault/{{ daily_notes_dir }}YYYY-MM-DD.md`. **If it exists, stop and say so** — point at `/checkin` instead ("Today's note is already up — run `/checkin` to update it, or `/checkin <section>` for just one part"). `/kickoff` is a create-once ritual; re-entry during the day is `/checkin`'s job. If it doesn't exist, continue.
+
+## Phase 0 — fan out
+
+Fire Track A, Track B and Track C together. None of them wait on each other. **Track C2 is the exception** — it needs Track B's answers, so it's spawned once those land rather than at the top of the phase (see Track C2, below); intake (Track C) itself still starts immediately, in parallel with Track A and B.
+
+### Track A — background, no model
+
+1. **Vault guard.** `python3 .tools/vault_guard.py` (Bash, from the vault root, no arguments — canonical copy also at `core/scripts/vault_guard.py` in the dev repo). Local, instant, no server round-trip.
+   - Exit 0 → nothing to add.
+   - Exit 1 → capture stdout verbatim. It names every `.sync-conflict-*` file (with a verdict on which side is truncated) and every 0-byte `.md` note. This becomes a `## Vault guard` heading in the note — never silently swallow a finding.
+2. **One `system_daily_brief` call, and only one.** `{"render": true, "since": "<mtime of the last daily note, ISO>", "sections": [...]}`. Omit `since` if there's no previous note (server defaults the window). Build `sections` from `_meta.preferences["daily_note.sections"]` (see the table below) — always include `alerts`; include `freshness` only if `daily_note.show_freshness` is set; include `listening` only if `daily_note.show_listening` is set.
+   - **Two vocabularies, one call.** The preference lists sections by their note names (`today`, `house`, `pulse`, …); the `rendered` object is keyed by fragment names (`calendar`, `consumables`, `pulse`, …). The server accepts either in `sections` (`calendar`→`today`, `consumables`→`house`, `listening`→`pulse`), so pass whichever you have. **After the call, check `_meta`: `sections_unknown` must be `[]` and `sections_enabled` must be non-empty.** An empty `sections_enabled` means nothing was fetched, and every fragment will come back `_Not measured today._` — that's a bad request, not a data gap (it produced a `## Today` reading "not measured" on a day with seven meetings, 2026-09-08). Fix the names and call again rather than pasting the empty result.
+   - The response's `rendered` object carries one markdown fragment per requested section — `alerts`, `pulse`, `coffee`, `transport`, `consumables`, `snags`, `calendar`, `listening`, `freshness`. **Every requested key is present in `rendered`; its *value* is what tells you whether to render anything.** A non-empty value already carries its own `##` heading (see `app/integrations/system/brief_render.py`'s module docstring for the exact heading text per section — e.g. `alerts` renders under `## System Alerts`, `consumables` under `## House`, `calendar` under `## Today`) — paste it verbatim, don't rename, rewrap, or add a heading of your own around it. **An empty string (`""`) means omit that section's heading from the note entirely** — this covers both "not configured for this user" and "ran clean, genuinely nothing to report" (a real zero, e.g. no snags captured, no coffee bag on the go, no departures on a weekend); the two look identical on purpose and neither is worth a heading.
+{% if section:snags %}
+   - **`rendered.snags` is always `""` through this call, permanently.** `system_daily_brief` is read-only by design and never invokes `snag_capture` (which writes), so its renderer never has anything to render. The `## Snags` section instead comes from calling `snag_capture` directly — see Track A step 3, below.
+{% endif %}
+   - A fragment that says `_Not measured today._` under its heading (Pulse's Sleep/Vitals/Workout lines, Alerts, Today, Data freshness can all do this) is a **third state, not an error and not a zero** — it means the source genuinely wasn't available to render *today*. Paste it as-is; never reinterpret it as "no data ever" or strip it as noise, and never let it read as a system fault (that's what `⚠️ ... unavailable` is for, on a real error).
+   - `system_daily_brief` also still returns `_meta` (`preferences`, `lookback_start`, `is_weekend`, `sections_enabled`, `sources_skipped_no_data`) exactly as before — read personalisation from it, never from memory of a previous run.
+   - The unfiltered/hourly-prewarmed brief can still be large; if it's spooled to a file rather than returned inline, that's expected — pull `rendered` and `_meta` with `jq`, don't read the file linearly.
+{% if section:snags %}
+3. **`snag_capture`** (writes) — call directly, in parallel with the brief call, when `daily_note.sections` includes `snags`. No arguments needed (idempotent against its own prior captures, default `since_days: 7`). Its result (`snags_created`, `snags: [{uid, room, description, trade}]`, `sheet_url`) is what builds `## Snags` in Phase 2 — never `rendered.snags` (see above). If `snags_created` is 0, there's nothing to render and the whole heading is omitted.
+{% endif %}
+4. **`inbox_pending`** — call it here, in the same parallel batch, no arguments. This is the capture queue: voice memos (with their transcript in `note`), photos (with a vision description in `note`, or `vision_error` when that failed), Strong workout exports, anything a Shortcut or the WhatsApp self-chat dropped in. Hold the result for Track C — this is the TriageList's **List 1** raw material (explicit inbox items, §4(b) of the phase contract) — these are the things the human deliberately sent in, so they outrank everything Track C builds from conversations.
+5. **`conversations_since(since=<the same `since` passed to `system_daily_brief`, ISO>)`** — call it here too, same parallel batch. Deterministic grouping only (chat/thread identity + a time-gap burst window) — no embedding call, no LLM call; see `app/integrations/system/conversations.py`. Returns `{since, until, sources, burst_gap_minutes, counts, groups: [{source, key, title, participants, span, message_count, from_me_count, first_message, last_message, has_question, mentions_me, messages}]}`, one group per Gmail thread or per WhatsApp chat-burst, newest-first. **Hold the result for Track C — this is the TriageList's List 2 raw material.** Never present a `conversations_since` group's individual `messages` one at a time in the terminal readout; the group is the unit (this is the fix for lios#192 — the AGM question already answered in-thread, the belly-pain remark read out of context).
+
+#### Personalisation — from `_meta.preferences`, read fresh every time
+
+| Preference | Effect |
+|---|---|
+| `daily_note.sections` | Which `rendered` sections to request and render, in order |
+| `daily_note.focus_count` | Passed through to `/tunetasks`' lock-in step — not used here, this note no longer sets Focus |
+| `house.appliance_entities` | Read server-side by the `consumables` fragment — nothing for this template to do with it directly |
+| `rail.direction` | Already applied server-side to `transport` |
+
+If a preference is absent, use its default — never fall back to what a previous note showed.
+
+### Track B — foreground, interactive
+
+Ask all three together, in one message, right after firing Track A and Track C (don't wait for their results first). **Ask as plain text in your reply — never through the structured question widget (`AskUserQuestion`).** Questions 1 and 3 are free-text and the widget requires a fixed option list, so it fails with "Invalid tool parameters" and the user ends up answering one question at a time (2026-09-08). One plain message, three lines, one reply:
+
+> "Morning. Three quick ones:
+> 1. What are you drinking / brewing today? (or 'nothing yet')
+> 2. Commuting in today? (yes/no — if yes I'll pull trains)
+> 3. Anything else on your mind for today?"
+
+Hold the answers. They land in Phase 2: the coffee answer folds into the `coffee` block (a plain note if it adds context the render doesn't have — the render already covers the mechanical bag/brew-history side), the commute answer decides whether `transport` renders at all, and the catch-all answer is the seed of `## Notes`.
+
+If the user included content in `$ARGUMENTS` already answering one of these (e.g. `/kickoff feeling rough today, tax return is on my mind`), treat that as the answer to Q3 and only ask the other two.
+
+### Track C — background subagent, triage (the TriageList)
+
+**Replaces the old message-by-message intake table (lios#192, folds in #193).** Alex's own framing (2026-09-10 voice memo): "looking at individual messages... not useful. So what is useful to look at is stuff that's been explicitly sent to the inbox, and then we should look at conversations in context... here's a bunch of just FYI stuff, and then here are things where maybe we need to make a decision about whether we ingest it or not." Track C now builds that two-list **TriageList** — it does not score or present individual messages at all.
+
+Spawn one subagent (Haiku is fine — this is matching and light judgement, not synthesis) and give it, verbatim: Track A's `inbox_pending` result and Track A's `conversations_since` result. Instructions:
+
+> You're given two payloads: `inbox_pending` (the capture queue) and `conversations_since` (grouped WhatsApp/Gmail conversations since this morning's window). Build a single numbered **TriageList**, two lists, continuous numbering across both (List 1 first, then List 2 continuing the count — never restart at 1).
+>
+> **List 1 — explicit inbox items.** One row per item in `inbox_pending.items` (or whatever key holds the pending list) — number, age, kind, original filename, one-line preview/detail (same shape as the inbox table the caller already knows: the transcript for audio, the vision description for an image, `preview` for text/documents). These already carry their own routing decision (vault/corpus/archive/dismiss/issue) — you are not judging them, just listing them in order, oldest first.
+>
+> **List 2 — conversations in context.** One row per group in `conversations_since.groups`. First call `tasks_intake_candidates()` with defaults (no arguments) and use its `candidates[].matches` only to tag a conversation as already-in-the-ledger — **never present `tasks_intake_candidates`' individual candidates as their own list; it is a matching aid for this step, not a third list.** For each conversation group, decide **FYI** or **DECIDE**:
+>
+> - **DECIDE** — there is a decision to make or a thing to take on: a question addressed to Alex still open at the end of the group (`has_question` is a hint, not a verdict — read `last_message` and, if you need more, the group's own `messages`), a request, a date/commitment, a candidate task. Read the group as a conversation, not as isolated lines — the AGM question that was already answered later in the same thread is FYI, not DECIDE, precisely because reading the whole burst shows the resolution.
+> - **FYI** — everything else, including: a group that already matches an open task per `tasks_intake_candidates` (say so — "already in the ledger, TASK-0404"), an ordinary exchange with nothing pending, a passing remark (e.g. an evening update at the tail of an otherwise low-key thread — don't elevate it just because it's the last line).
+>
+> Each List 2 row: number, source, title/chat name, participants, span (first→last), a one-line reason for the verdict. **One row per conversation group — never a merged row, never a range.**
+>
+> **Cap List 2 at `conversations_since`'s own `counts.total`** (it's already capped server-side at `limit`, default 30) — if `counts.total_before_limit` is larger, say so in one line ("N older conversations not shown"). Don't re-cap further yourself.
+>
+> Return `{list1: [...], list2: [...], until: <verbatim from tasks_intake_candidates, for the caller to advance the marker later>}`. Do not call `tasks_add`, `tasks_intake_mark`, or any inbox-routing tool yourself — you're producing the TriageList for the human to answer by number, not applying anything.
+
+Hold the result for Phase 1.
+
+### Track C2 — background subagent, morning read
+
+**Spawned once Track B's three answers have landed** — not at the top of Phase 0 like the others — because the Morning read is meant to be able to say something like "commuting in, so leave by 8" and can't until the commute answer exists. It still runs in the background alongside Track A finishing up and Track C's intake pass; nothing in Phase 1 blocks on it arriving a beat later than the rest.
+
+This is the fix for a real complaint: the pure-formatting redesign cut every judgement-tier line from the note, including the italic Pulse asides and any morning assessment — leaving 2.7 KB of facts with no commentary at all. This subagent brings that back, deliberately kept off the ~150k-char full brief that caused the original one-Haiku-call latency problem: it reads a restricted ~75 KB slice instead.
+
+**The Email/WhatsApp digest fragments (`email`, `whatsapp`) are retired as of 2026-09-10 (lios#192).** They scored/tiered individual messages in isolation — the exact failure the TriageList's List 2 (Track C, above) replaces with thread-grouped, context-aware FYI/DECIDE triage. Nothing here re-reads mail/WhatsApp; `## Conversations` in Phase 2 is built entirely from Track C's List 2.
+
+Spawn one Sonnet subagent (this needs real judgement — weighing what matters, not matching) with these instructions:
+
+> Read the brief file from Track A's `system_daily_brief` call, but pull **only** these top-level keys with `jq` — do not read anything else in the file, it can run past 150k characters and everything outside this list is either already rendered elsewhere or irrelevant here: `health_summary`, `health_sleep`, `health_trends`, `lastfm_recent`, `lastfm_stats`, `calendar`, `reminders`, `attachments`, `alerts.issues`. Also call **`health_exercise_status`** yourself (it isn't in the brief file) — its `target.strength_sessions` is the current weekly floor and `on_track` already accounts for remaining days in the week, so use those fields rather than reasoning about raw workouts.
+>
+> You're also given Track B's three answers verbatim (coffee, commute yes/no, and the catch-all) — you can reference them in the Morning read (e.g. "commuting in, so leave time for the 8:04") but never invent a plan they didn't state.
+>
+> Produce a JSON object with two fields — `morning_read`, `pulse_asides` — each a markdown string (or `""` if there's genuinely nothing to say for that one):
+>
+> - **`morning_read`** — 3–6 lines of prose, no heading of your own (the caller adds "## Morning read"): the shape of the day, what's waiting on {{ display_name }}, one real observation. Voice: warm, direct, a little dry — like the italic Pulse asides used to read, not like a status report.
+> - **`pulse_asides`** — a JSON object keyed by `recovery` (from `health_sleep`), `movement` (from `health_trends`), `exercise` (from your own `health_exercise_status` call — compare `actual.strength_sessions` against `target.strength_sessions` and note `on_track`, never a hard-coded weekly number), `listening` (from `lastfm_recent`/`lastfm_stats`) — one italic-ready line of commentary each, no leading `*` (the caller wraps it). **Every line must be trend-relative, not a single-point restatement** (lios#193 — "8,642 steps, almost exactly on the average" is what to avoid; "recovery's been climbing three days running" is the shape to hit) — compare today's reading against the recent run in `health_trends`/`lastfm_stats`, don't just restate today's number in words. **Only include a key when its source data is present and not an error** — omit the key entirely for missing/errored data rather than writing a line about it; the caller pastes each present key next to its matching Pulse fact line and simply skips the ones you didn't include. `listening` stays its own line here for its own top-level `## Listening` section in Phase 2 (not nested under Pulse — that placement was checked and kept as-is on 2026-09-10, not reopened).
+>
+> Rules, and they're not optional: **never restate a number a rendered fact fragment already carries** — you're adding judgement on top of facts already on screen, not repeating them. Every number you *do* write must come from the payload above or your own `health_exercise_status` call. Prior daily notes are never a source, even for continuity. If one of the keys you were told to read is missing from the payload, or holds `{"error": ...}`, don't invent content — omit that key from `pulse_asides` rather than guessing; the same applies if `health_exercise_status` itself errors.
+
+Hold the result for Phase 2 — it isn't part of the terminal readout in Phase 1 (Track B's answers are already on screen from asking them, and the point of the readout is to move fast; the Morning read lands with the rest of the written note).
+
+## Phase 1 — terminal readout
+
+Once Track A and Track B have both landed, show the day in this order — this *is* the note's order for the fact sections, so you're reading straight through most of what you're about to write, not composing a separate summary. **Track C2's fragments (Morning read, the Pulse asides) are not part of this readout** — they land a beat later than the rest and go straight into the note in Phase 2; showing Track B's answers here (from asking them) plus the facts below is enough to keep the terminal fast.
+
+- `rendered.alerts` — always requested, always rendered (either the status line, or `_Not measured today._` if the alerts source itself is unavailable — never omitted)
+{% if section:pulse %}
+- `rendered.pulse`
+{% endif %}
+{% if section:coffee %}
+- `rendered.coffee` — fold in Track B's coffee answer if it adds anything the render didn't already say
+{% endif %}
+{% if section:transport %}
+- `rendered.transport` — **only if Track B's commute answer was yes.** If no, don't show it and don't put it in the note either, even if the brief returned it (transport is fetched regardless of the answer per the brief's own logic; rendering is conditional on the answer, not on the fetch).
+{% endif %}
+{% if section:consumables %}
+- `rendered.consumables`
+{% endif %}
+{% if section:snags %}
+- **Snags** — from step Track A.3's `snag_capture` result, not `rendered.snags` (always empty — see above). FYI only, no analysis. Omit if `snags_created` is 0.
+{% endif %}
+- `rendered.calendar`
+{% if pref:daily_note.show_freshness %}
+- `rendered.freshness` — name only the sources whose row is ⚠️ in the terminal readout; the full table goes in the note regardless
+{% endif %}
+- **The TriageList from Track C** — one table, two lists, continuous numbering. **Mandatory whenever List 1 is non-empty** (Track A's `inbox_pending` returned `count > 0`) — never defer it, not "these can wait for `/checkin`". Optional to show at all only when both lists are empty (say so in one line and skip straight to Phase 2).
+
+   ```
+   ## Triage (N inbox, M to decide, K FYI)
+
+   ### Inbox
+   #  | Age  | Kind  | Original filename       | Preview / detail
+   1  | 36h  | image | 4E5C4694-…              | (vision failed — no description) 1152×2048
+   2  | 2h   | text  | Morning Workout         | "Bench Press (Barbell) Set 1: 20 kg × 10 …" (16 lines)
+   3  | 1h   | audio | AUDIO-2026-09-08-09-40  | 1m 48s — "…do we want to aim for October 8th as our first draw date…"
+
+   ### Decide
+   #  | Source    | Who                | Span              | Why
+   4  | whatsapp  | PTA group          | 07:40–08:12        | AGM date still unconfirmed — Stef said "will confirm asap", nothing since
+   5  | email     | Crannarc           | yesterday 17:40    | Confirm tile colour before Friday — no reply sent yet
+
+   ### FYI
+   #  | Source    | Who                | Span              | Why
+   6  | whatsapp  | Sam              | 20:10–21:02        | Evening logistics, dishwasher — nothing pending
+   7  | email     | SSE Airtricity     | 06 Sep 09:14       | Meter reading reminder, already in the ledger (TASK-0404)
+   ```
+
+   Rows 1–3 are Track C's List 1 (`inbox_pending`, unchanged shape from before), oldest-first. Rows 4 onward are Track C's List 2 (`conversations_since`, via Track C's FYI/DECIDE labelling) — Decide rows first, then FYI, but **the numbering is one continuous sequence across all three groups, set by Track C, never renumbered here.** FYI rows are shown for reading only — they're never part of the reply, and List 2's own cap note (if any conversations were cut by `conversations_since`'s `limit`) goes under the table as one line.
+
+   **Table rules, learned the hard way (2026-09-08):** the table goes **inline in your reply as plain markdown** — never an artifact, never a file, never the question widget (both failed with "Invalid tool parameters" and cost a round-trip each). **One row per item, one integer per row.** No ranges, no comma lists, no merged rows — the human replies by number.
+
+   Then ask, in one message:
+
+   > "Triage: inbox items 1–3 — route each (e.g. `1 corpus renovation`, `2 vault Inbox/`, `3 archive`, or `dismiss`/`issue bug`/`preview`). Decide items 4–5 — reply `<n> task`, `<n> note`, `<n> ignore`, or `<n> skip` for each (e.g. `4 task`, `5 skip`). One line per number, or `all archive`/`all skip` for a whole group, or 'none' to leave everything as-is."
+
+   Decode each numbered reply by which list the number belongs to (Track C's own numbering tells you):
+
+   **Inbox rows** (List 1) — one tool call per item, run in parallel:
+   - `corpus [tags…]` → `inbox_to_corpus` (`project_tags=[…]`, default `["tines"]`)
+   - `vault <target-path>` → `inbox_to_vault` (`target=<path>`; bare `vault` defaults to `Inbox/<YYYY-MM-DD>-<original-filename-or-slug>.<ext>`)
+   - `archive` → `inbox_archive`
+   - `dismiss` → `inbox_dismiss`
+   - `preview` → `inbox_preview` first, show full text, re-ask
+   - `issue [bug|feature|other] [title…]` → this item is about lios itself (a bug or improvement in the platform, not a household matter). Run, from the shell: `gh issue create -R cograda/lios --title "<title>" --label <label> --body "<the captured note text, plus 'Captured via inbox <date>'>"`. Default `<label>` to `other` when none given. Default `<title>` to the note's first line with any leading `loops feedback -`/`lios:`/`bug:` prefix stripped, when no title is given in the reply. Then `inbox_archive` the item — it does not go to corpus or vault.
+
+   **Decide rows** (List 2) — the verdict, applied against that conversation group:
+   - `task`/`todo` → first check whether it's clearly about lios itself (a bug or improvement in Loops, the daily note, a sync daemon, an MCP tool) rather than household work — if so, file a GitHub issue the same way as an inbox `issue` (above) instead of `tasks_add`, and say so in the confirmation line. Otherwise `tasks_add(title=..., project=..., source="kickoff")`, pulling the actual detail from the conversation group (its `messages`, or `whatsapp_thread`/`gmail_thread` for more than the capped 20) into the task description — find the project via `tasks_structure()` if one fits, otherwise leave it loose.
+   - `note` → no task; record the decision as a one-line entry under `## Conversations` in Phase 2 (e.g. "acknowledged, no action needed") without creating a ledger row — for a DECIDE row that turned out to need only a reply or an FYI-level note, not a task.
+   - `ignore`/`dismiss` → decline; nothing written, the row is not carried forward.
+   - `skip` → **not a decision** — see "Skipped rows" below. Record it as skipped, don't apply anything.
+
+   **A number with no reply at all is also a skip** — same handling as an explicit `skip`.
+
+   After all replies land (or if the user said "none"), call `tasks_intake_mark(until=<the until Track C returned>)` to advance the marker, regardless of how many were added — a marker that only advances on an add re-surfaces declined items every day.
+
+   Confirm in one line: `"Triage: 2 to corpus (renovation), 1 archived, 1 task added (TASK-0409), 1 noted, 1 skipped (re-asking tomorrow)."`
+
+### Skipped Decide rows
+
+Per the phase contract §7/§10.3: a Decide row skipped (no reply, or explicit `skip`) is not silently dropped, and it's not re-litigated today either. **This step implements the presentation and records the choice in the note's Notes section only — persisting per-row skip state server-side (so a row skipped twice actually drops, per the design's default) is step 3 of the build order, not built yet.** For now: note in `## Notes` which rows were skipped today, and say in the confirmation line that they'll be offered again tomorrow (the re-ask-once-then-drop default from the design isn't enforced automatically yet — there's no stored `first_skipped_on` — so today's skip is always presented as "will re-ask," not "will drop," until that piece lands).
+
+## Phase 2 — write the note
+
+**Phase 2 starts after Phase 1's replies land** — the whole TriageList reply, inbox rows and Decide rows together — so the note is written once, with everything in it. Don't write it early and patch a paragraph in afterwards (2026-09-08's note gained a "Note: five tasks landed…" bullet under Focus that listed four; that shape exists nowhere below). If the human has clearly moved on without replying, say so in one line and write the note with both lists recorded under `## Conversations`/`## Notes` as still open — but that's the fallback, not the flow.
+
+```markdown
+---
+date: YYYY-MM-DD
+type: daily
+---
+
+# DayName, D Month YYYY
+
+<< [[YYYY-MM-DD]] | [[YYYY-MM-DD]] >>
+
+## Morning read
+
+[Track C2's `morning_read` — verbatim, 3-6 lines of prose, no heading of its own beyond the one shown here. Omit the whole heading if C2 hasn't landed yet by the time you're writing (rare — it starts as soon as Track B answers land, well before this point) or returned "" for it (say so happened only if it errored — a genuine "" here means the subagent found nothing worth saying, which should be uncommon enough to be worth a glance, not a silent omission).]
+
+[rendered.alerts — verbatim, own "## System Alerts" heading built in; always present, even when it's just "_Not measured today._"]
+
+<!-- From step Track A.1: only if vault_guard.py exited 1. Omit the whole heading — not an empty one — when it exited 0. -->
+## Vault guard
+
+⚠️ vault_guard.py findings, named verbatim (conflict files + verdicts, 0-byte notes).
+
+{% if section:pulse %}
+[rendered.pulse — verbatim, own "## Pulse" heading built in; omit if ""]
+
+[Track C2's `pulse_asides.recovery`, `.movement`, `.exercise` — one italic line each, directly under the fact block they comment on (recovery under Sleep, movement under Vitals/Movement, exercise under Workouts), wrapped in `*…*` by you (C2 returns the text without the asterisks). Skip any key C2 didn't include — that means it had no data to comment on, not that it forgot.]
+
+{% endif %}
+{% if section:coffee %}
+[rendered.coffee, folded with Track B's answer — own "## Coffee" heading built in; omit if ""]
+
+{% endif %}
+{% if section:transport %}
+[rendered.transport — own "## Transport" heading built in; only if Track B said commuting today AND the fragment is non-empty; omit the whole heading otherwise]
+
+{% endif %}
+{% if section:consumables %}
+[rendered.consumables — NOTE: this fragment's own heading is "## House", not "## Consumables"; omit if ""]
+
+{% endif %}
+{% if section:snags %}
+[## Snags, built from step Track A.3's `snag_capture` result — NOT `rendered.snags` (always ""). Omit the whole heading if `snags_created` is 0.]
+
+{% endif %}
+[rendered.calendar — this fragment carries the "## Today" heading; omit if "" (it renders "_Nothing on the calendar today._" rather than "" when the calendar is genuinely empty, so this case is rare)]
+
+## Tasks
+
+### Focus
+
+_No Focus items set yet today. Run `/tunetasks` for candidates from the ledger, or say "lock in <items>" now._
+
+### Added this morning
+
+[One line per thing Phase 1 created, or omit the whole subheading if nothing was. Tasks from an inbox item (List 1) as `- **TASK-0407** Return the delivery box, order 635867 — from triage (An Post)`; tasks from a Decide row (List 2) as `- **TASK-0409** Confirm tile colour with Crannarc — from triage (email thread)`; tasks from Track B's catch-all as `— from this morning's notes`; calendar events as `- 📅 Meitheal Night, Mon 14 Sept 19:30–20:30 — from triage (Comhaltas Howth)`; GitHub issues as `- 🐙 cograda/lios#158 …`; inbox routings as `- 📥 voice memo 1m48s → archived (PTA draw date, already handled)`. Decide-row verdicts that were `note`/`ignore`/`skip` (no task/issue created) do NOT get a line here — they're recorded under `## Conversations` instead, where the conversation itself lives. You are the source for these, so no marker — but nothing else about tasks goes anywhere else in the note; this is the one place.]
+
+### From the backlog
+
+> Live view of [[Task Backlog]] — these are not copies. Tick an item here and the Tasks plugin marks it done in the backlog itself.
+
+**🔺 Urgent / overdue**
+```tasks
+not done
+path includes Task Backlog.md
+(priority is highest) OR (due before tomorrow)
+sort by priority
+sort by due
+```
+
+**⏫ This week**
+```tasks
+not done
+path includes Task Backlog.md
+priority is high
+sort by priority
+```
+
+## Conversations
+
+[Built from Track C's TriageList **List 2** (`conversations_since`, replaces the retired Email/WhatsApp digests — lios#192, #193). Omit the whole heading only if List 2 was genuinely empty (no conversations in the window at all) — not merely "all FYI". Render:
+
+- **FYI rows, collapsed to one line each:** `- <source icon> <title/chat> (<participants>) — <the one-line reason Track C gave>.` No further detail — these were read and found to need nothing.
+- **Decide rows, with their verdict from Phase 1's reply:** `- <source icon> <title/chat> (<participants>) — <reason> → **<verdict>**` (e.g. "→ **task added (TASK-0409)**", "→ **noted**", "→ **ignored**", "→ **skipped, re-asking tomorrow**").
+
+Two icons only: 📧 for `mail`, 💬 for `whatsapp` (matching each group's `source`).]
+
+## Notes
+
+- [Track B's catch-all answer]
+{% if pref:daily_note.show_listening %}
+
+[rendered.listening — its own "## Listening" heading, a separate top-level section, not nested inside Pulse; omit if ""]
+
+[Track C2's `pulse_asides.listening`, if present — one italic line directly under the Listening fragment, same wrapping rule as the Pulse asides above. Omit if C2 didn't include the key.]
+{% endif %}
+{% if pref:daily_note.show_freshness %}
+
+[rendered.freshness — own "## Data freshness" heading; omit if ""]
+{% endif %}
+```
+
+A `rendered.<key>` value of `""` means omit that section's heading entirely from the note — never render a present-and-empty heading, whether the emptiness is "not configured for this user" or a genuine zero (no snags, no coffee, no departures). `_Not measured today._` under a heading is different again — that heading stays, because the fragment *is* rendered, just with nothing to report. The same rule applies to Track C2's two remaining fragments and to `## Conversations`: a genuine "nothing to show" omits the heading, a one-line "not available today" notice keeps it. Honour the order in `_meta.sections_enabled` if it differs from the skeleton above; the skeleton is the default order, not an override.
+
+## Phase 3 — done
+
+Keep it brief — they want to start working, not read a summary of what you just showed them.
+
+One line, no more, at the end: **"Note's up. Run `/tunetasks` when you're ready to lock in Focus."** Do not run `/tunetasks` yourself — it hands off to `/youdoit`, which can run long, and chaining all three synchronously is exactly the slow-session problem this redesign exists to fix.
+
+## What moved out of here
+
+- **Task triage, Focus lock-in, ledger cleanup** → `/tunetasks` (its final step now does lock-in — see its own file).
+- **House entity/offline counts, appliance and anomaly lines** → cut/parked, see the plan doc's audit. `consumables` (the one genuinely-mechanical piece of the old House section) is the only survivor, and it's now its own rendered fragment.
+- **Food, Meetings** → cut; Food was never populated, meeting notes belong in `/meeting`.
+- **Reminder reconciliation** → nothing to do; `apple_reminders` keeps Reminders and the ledger in sync on its own tick.
+
+## Corrected 2026-09-07 evening — commentary came back
+
+The first cut of this redesign also removed the Email/WhatsApp digests and any morning assessment, folding "new task identification" into Track C's intake pass and calling that sufficient. It wasn't — Alex's words, on the first real run: **"the daily note has lost some of its charm — it needs more detail and at least *some* commentary."** Facts-only was 2.7 KB; the old note with asides and digests was 4.7 KB, and the gap was exactly the judgement the audit had cut. Track C2 (above) is the fix: a second, separate background subagent scoped to a restricted slice of the brief (~75 KB, not the full ~150 KB) so the original one-Haiku-call latency problem doesn't come back — commentary is now clearly commentary (its own subagent, its own instructions, never allowed to restate a number the facts already give), and the facts stay exactly as pasteable as they were.
+
+## Revised 2026-09-10 — Email/WhatsApp digests retired, the TriageList replaces message-by-message intake
+
+lios#192: reading messages one at a time (Track C2's tiered Email/WhatsApp digests, and the old intake table's per-message rows) misread urgency twice in one session — a WhatsApp group question already answered later in the same thread surfaced as ~10 false "new" candidates, and a passing evening remark at the tail of an ordinary thread was elevated to "worth a check-in before bed." lios#193 folded in: the fix for both was the same shape Alex asked for directly — "what is useful to look at is stuff that's been explicitly sent to the inbox, and then we should look at conversations in context... here's a bunch of just FYI stuff, and then here are things where maybe we need to make a decision." Track C now builds that two-list **TriageList** from `inbox_pending` (List 1) and the new deterministic `conversations_since` (List 2, chat/thread grouping + a time-gap burst, no embedding call, no LLM call — see `app/integrations/system/conversations.py`), with only the FYI-vs-DECIDE label needing a (cheap, Haiku) judgement call. Track C2's `email`/`whatsapp` fragments are deleted; `## Conversations` in the note is built entirely from List 2. Persisting per-row skip state (the design's re-ask-once-then-drop default) is deferred to the next build step.

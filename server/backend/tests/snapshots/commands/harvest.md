@@ -1,0 +1,114 @@
+<!-- GENERATED from server/backend/app/prompts/templates/harvest.md.j2 via app.prompts.commands — do not hand-edit. Edit the template and run scripts/render_commands.py (or refetch GET /api/v1/commands). -->
+
+Harvest missed actions from email and WhatsApp into the task ledger.
+
+(Was `/seed-backlog` until 2026-09-03 — misnamed: it is not a one-time seed, it is a periodic sweep of the two comms channels the ledger cannot see on its own.)
+
+Arguments: $ARGUMENTS
+
+Default lookback: 6 weeks. Can override with arguments like "3 months" or "2 weeks".
+
+## Steps
+
+### 1. Parse lookback window
+
+Default 6 weeks. If arguments specify a different window, use that.
+
+### 2. Read the ledger
+
+> **The backlog is a ledger, not a file.** Never read `Task Backlog.md` for state and never edit it — it is a rendered view and a hand edit locks every task write. Read with `tasks_query`, write with `tasks_add` / `tasks_update` / `tasks_complete` / `tasks_bulk_update`; every write re-renders the file.
+
+`tasks_query(limit=500)` for what is open, and `tasks_query(include_done=true, status="done", limit=500)` so completed items are not re-suggested. Keep both lists in context for step 5.
+
+### 3. Fetch data in batches
+
+Use MCP tools to pull data. Process in manageable chunks:
+
+**Email**: Use `gmail_recent` with `{"limit": 50}` repeatedly, or `gmail_search` with date-bounded queries. Focus on:
+- Personal email — the primary source of household actions
+- Skip newsletters, marketing, automated notifications
+
+**WhatsApp**: Use `whatsapp_contacts` to identify key contacts/groups, then `whatsapp_thread` for the most active threads. Focus on:
+- Family group chats
+- Conversations with tradespeople, school, medical
+- 1:1 with Sam (shared household planning)
+- Skip large noisy group chats with no actionable content
+
+### 4. Extract candidates (Haiku subagents)
+
+Process in batches of ~50 messages per Haiku call. Run multiple subagents in parallel where possible.
+
+Each Haiku subagent gets these instructions:
+
+> You are scanning messages for actionable items that should be on a family task backlog. Extract ONLY items that represent a concrete action someone needs to take — not information, not conversation, not things already done.
+>
+> For each candidate, return:
+> - **action**: what needs to be done (imperative, concise)
+> - **source**: email subject/sender or WhatsApp contact/group
+> - **who**: alex, sam, shared, or unclear
+> - **urgency**: urgent (overdue/time-sensitive), high (this month), medium (no rush but real), low (nice to have)
+> - **category**: household, kids, renovation, vehicle, finance, medical, school, social, or other
+> - **context**: one line of supporting context (date mentioned, person involved, etc.)
+>
+> SKIP:
+> - Things that are clearly already done (past tense, "done", "sorted", "booked")
+> - Pure information sharing (no action needed)
+> - Casual conversation, jokes, memes
+> - Newsletter content, marketing
+> - Things that are someone else's responsibility (not Alex or Sam)
+> - Automated notifications (bank alerts, delivery confirmations for completed deliveries)
+>
+> Return a JSON array of candidates, or an empty array if nothing actionable found.
+>
+> ---
+> **MESSAGES:**
+> [batch of messages]
+
+### 5. Deduplicate and merge
+
+Combine all candidates from all batches. Then:
+- Remove duplicates (same action from different messages)
+- Remove items already in the ledger, open or done (compare against step 2; for a borderline pair, `tasks_query(text=<distinctive token>)`)
+- Group by category
+- Sort by urgency within each group
+
+### 6. Present for review
+
+Show the candidates grouped by category in a clear table format:
+
+```
+## Candidates from Email (X items)
+
+### Household
+| # | Action | Source | Who | Urgency | Context |
+|---|--------|--------|-----|---------|---------|
+| 1 | Call electrician about garden lights | Email from Crannarc, 15 Mar | Shared | High | Mentioned in renovation update |
+
+### Kids
+...
+
+## Candidates from WhatsApp (X items)
+...
+```
+
+Ask the user to:
+- **Accept** items (by number) to add to the backlog
+- **Reject** items that aren't needed
+- **Edit** items before adding (change priority, wording, etc.)
+- **Accept all** in a category
+
+### 7. Add accepted items
+
+For each accepted item, `tasks_add(...)` with the same judgement as `/add-task`: title (keep `[[wiki links]]` for people and entities), `priority` from the urgency column, `project` from `tasks_structure()` where one fits, `due_at` if a date was mentioned, `description` = the one-line context plus the source (sender / group, date), `source="seed"` (or `"seed-whatsapp"`), and `confirmed=false` — this is an extraction pass, so the task lands out of every active view until a person runs `tasks_confirm` on it, even though someone already picked it off the harvest list here. One `tasks_bulk_update` is not the right tool here — these are creations, so it is one `tasks_add` per accepted item.
+
+### 8. Summary
+
+Show what was added: the uids, grouped by project, and the rejected count.
+
+Suggest running `/kickoff` (or `/checkin` if today's note already exists) after to pick up any new urgent items.
+
+## Notes
+
+- Run it when the backlog feels behind the conversations — after a busy fortnight, or before a weekly review. The daily note's 72h lookback catches most things day-to-day; this is the wider net.
+- For ongoing capture, the daily note's 72h lookback handles new actionable items day-to-day.
+- The user can also run this conversationally: "scan my recent emails for things I need to do" triggers the same logic without the slash command.

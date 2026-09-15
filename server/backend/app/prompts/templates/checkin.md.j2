@@ -1,0 +1,134 @@
+Re-fetch live data and update today's daily note in place. Use this any time the note is stale — mid-morning after meetings, after lunch, before the commute, or when you said something to Claude that referenced data that turns out to be old.
+
+Arguments: $ARGUMENTS
+
+Argument forms:
+- No args: rerun Track A in full (all rendered sections), Track C (the TriageList — inbox items + conversations, since your last marker), and Track C2 (both remaining commentary fragments — Morning read, Pulse asides). Track B (coffee/commute/catch-all) is **never** rerun by `/checkin` — see below.
+- `email`, `whatsapp`, `conversations`, `calendar`, `transport`, `house`, `health`, `coffee`, `attachments`, `inbox`, `weather`, `listening`, `snags` — refresh only that section's `rendered` fragment. `email`/`whatsapp`/`conversations` all rerun the `## Conversations` section (Track C's List 2 — see below); `health`/`listening` additionally rerun their matching Track C2 fragment — see the table below and "Track C2 rerun" below.
+- `morning` — rerun Track C2's `morning_read` fragment only.
+- `intake`, `conversations` — rerun Track C (the TriageList) only.
+- `--full`: rebuild every `rendered` section from scratch rather than trusting the hourly prewarm cache (`refresh: true` on the brief call). Use when the day's shape has fundamentally changed (a session got cancelled, a major new email landed).
+
+The note is always your own — `vault/{{daily_notes_dir}}<today>.md`. There is no argument for refreshing another person's note; each user runs their own `/checkin`.
+
+If today's note doesn't exist yet, this command bails out with a one-liner: *"No daily note for today. Run `/kickoff` first."* — that's deliberate. `/checkin` is an *update* command; creation goes through `/kickoff`.
+
+## Claims carry their source
+
+Same as `/kickoff`: everything here is pasted from `system_daily_brief(render=true)`'s `rendered` fragments, each already sourced at generation time — nothing to mark up further. **The note being refreshed is not a data source for anything new** — you may compare against what's already in a section to decide whether a rewrite is even needed (step 3), but never pull a figure from the note itself. If a re-fetched section now has no data for something the note currently shows, replace it with "not reported" rather than leaving the old content in place.
+
+Track C2's two remaining fragments (Morning read, Pulse asides) are commentary, sourced the same restricted-payload way `/kickoff`'s Track C2 is (see step 4.5) — same rule: never restate a number a rendered fact fragment already carries, and never source anything from the note being refreshed. **Track C2's Email/WhatsApp digest fragments are retired (2026-09-10, lios#192/#193)** — `## Conversations` is now built from Track C's TriageList List 2 (`conversations_since`), same as `/kickoff`; see step 4 and "Track C rerun", below.
+
+## Why Track B never reruns
+
+Commute and the morning catch-all don't go stale within a day, and a second coffee is a "just tell me" rather than a standing prompt. If the user wants to log a second coffee, or add to the catch-all, take it conversationally and append it directly — don't re-ask the three questions.
+
+## Steps
+
+### 1. Locate the note
+
+`vault/{{daily_notes_dir}}<today>.md`. If absent → bail with the message above.
+
+### 2. Resolve which sections to refresh
+
+**One call does almost all of it**, same shape as `/kickoff`'s Track A:
+
+```
+system_daily_brief {"render": true, "sections": [...], "since": "<previous note mtime ISO>", "refresh": true}
+```
+
+Pass `refresh: true` — a refresh is explicitly asking for current data, so the brief's hourly-prewarm cache should be bypassed for the requested sections (`--full` bypasses it for *every* section; a plain unfiltered refresh still benefits from the cache where an individual source hasn't changed — the server decides that, not this template).
+
+Map the user's filters onto `rendered` keys:
+
+| Filter | `sections` value | Notes |
+|---|---|---|
+| `calendar` | `calendar` | |
+| `weather` | *(none)* | folded into `pulse`/`consumables` context server-side, no separate fragment |
+| `transport` | `transport` | only render it into the note if the note currently shows a Transport heading (i.e. this morning's commute answer was yes) — a refresh doesn't re-ask Track B |
+| `email`, `whatsapp`, `conversations` | *(none — Track C only)* | all three rerun Track C's TriageList List 2 (`conversations_since`) and rebuild `## Conversations` — see step 4. `email`/`whatsapp` are kept as filter names for muscle memory; they no longer map to a separate rendered fragment or a separate Track C2 pass |
+| `health`, `listening` | `pulse`, `listening` | `health` also reruns Track C2's `pulse_asides`; `listening` reruns just the `pulse_asides.listening` key |
+| `morning` | *(none — Track C2 only)* | reruns `morning_read` only, no rendered-fragment refetch |
+| `coffee` | `coffee` | |
+| `house` | `consumables` | the only surviving piece of the old House section |
+| `snags` | `snags` | also triggers the `snag_capture` write below |
+| `inbox` | *(handled outside the brief, see 3.5)* | also rebuilds Track C's List 1 — see step 4 |
+| `intake` | *(handled outside the brief, see 4)* | reruns Track C (both lists) |
+
+No args → request every section the user's `daily_note.sections` preference includes, same as `/kickoff`.
+
+The server accepts both this table's `rendered` names and the preference's own names (`today`, `house`) in `sections`. **Check `_meta.sections_unknown` is `[]` and `_meta.sections_enabled` is non-empty before pasting anything** — an empty `sections_enabled` means nothing was fetched and every fragment will read `_Not measured today._`; that's a bad request, so fix the names and call again.
+
+System alerts (`rendered.alerts`, under its own `## System Alerts` heading) come back on **every** call regardless of filter — if something's degraded you need to know before trusting the rest of the refresh. It's never `""`; if the alerts source itself is unavailable it renders `_Not measured today._` rather than being omitted.
+
+**A `rendered.<key>` value of `""` means the section's heading is dropped from the note on this refresh** — whether that's "not configured" or a genuine zero (no snags, no coffee, nothing nearly empty). `_Not measured today._` is a third state and keeps its heading — the source ran, it just has nothing for today. Never confuse the two, and never carry a heading forward from before this refresh just because the fresh fetch came back empty.
+
+**If the note has a `## Data freshness` heading, rewrite it on every refresh** — whatever the filters, even when nothing else changed. A freshness table stamped 07:40 sitting under a section refreshed at 14:20 is worse than no table. If the note has no such heading, don't add one — the user has it switched off (`daily_note.show_freshness`).
+
+**Also run `python3 .tools/vault_guard.py` on every refresh, regardless of filters** — cheap, local, instant. Exit 0 → nothing to do. Exit 1 → if the note has no `## Vault guard` heading, insert one (right after the top section) naming every finding verbatim; if it already has one, rewrite it with current findings; if a previously-reported finding is now gone, remove the heading entirely.
+
+Three things sit outside the brief and are called alongside it, in the same parallel block, when relevant:
+
+- `inbox_pending` — for the `inbox` filter (and unfiltered runs).
+- `conversations_since(since=<the caller's own intake marker or the previous note mtime, ISO>)` — for `intake`/`email`/`whatsapp`/`conversations` (and unfiltered runs). Same deterministic call as `/kickoff`'s Track A — see step 4.
+- `snag_capture` — for the `snags` filter (and unfiltered runs). It **writes** (idempotent against its own prior captures, default `since_days: 7`), which is why it isn't in the read-only brief. Rebuild `## Snags` from the result (omit the heading if `snags_created` is 0 this run — not cumulative for the day).
+
+### 3. Edit the note in place
+
+For each refreshed section, locate its heading (`## Today`, `## Pulse`, `## House` for `consumables`, `## Listening` — its own top-level heading, not nested inside Pulse — `## Conversations` for Track C's List 2, etc.; whatever heading the `rendered` fragment itself carries) and replace the whole fragment. Mark refreshed sections with a small `*(refreshed HH:MM)*` italic tag next to the heading — replace a previous tag rather than piling them up.
+
+`## Snags`, `## Transport` and `## Vault guard` are conditional headings, present only when there's something to show — insert them fresh if the note predates them, remove them if this refresh finds nothing.
+
+If a section's content hasn't materially changed (same fragment, byte for byte), still update the timestamp tag but don't otherwise touch it.
+
+### 3.5. Inbox triage (conditional)
+
+Only fires if `inbox_pending` returned `count > 0` and the user either passed no filters or passed `inbox` explicitly.
+
+Identical shape to `/kickoff`'s inbox routing: numbered table (age/kind/source/original-filename/preview), one-line-per-item routing reply, then `inbox_to_corpus` / `inbox_to_vault` / `inbox_archive` / `inbox_dismiss` in parallel — including the `issue [bug|feature|other] [title…]` destination (`gh issue create -R cograda/lios`, then `inbox_archive`) for anything that's about lios itself rather than a household matter. `skip` leaves everything pending for next time.
+
+### 4. Triage (Track C rerun)
+
+Runs on a plain `/checkin` and on `/checkin intake`/`/checkin email`/`/checkin whatsapp`/`/checkin conversations`; the `inbox`-only filter reruns just List 1 (below); skipped entirely for any other single-section filter unless explicitly named.
+
+Same TriageList shape as `/kickoff`'s Track C (see that command's file for the full instructions) — one subagent (Haiku), given `inbox_pending` and `conversations_since(since=<the caller's own intake marker>)` verbatim, which after `/kickoff` this morning means "since then," not "since yesterday." It builds **List 1** (inbox items, only if the `inbox` filter or an unfiltered run) and **List 2** (conversation groups labelled FYI/DECIDE, using `tasks_intake_candidates()` only to tag already-ledgered groups — never presented as its own list), continuous numbering across both, exactly as `/kickoff`'s Track C does. Present the same combined table and ask the same combined question (inbox verbs for List 1, `task`/`note`/`ignore`/`skip` for List 2's Decide rows).
+
+For each confirmed task (from either list), check first whether it's clearly about lios itself (a bug or improvement in Loops, the daily note, a sync daemon, an MCP tool) — if so, file it as a GitHub issue (`gh issue create -R cograda/lios --title "<title>" --label <bug|feature|other> --body "<candidate text>, plus 'Captured via inbox intake <date>'"`) instead of `tasks_add`; the ledger is for household work only. Then `tasks_intake_mark(until=<the until Track C returned>)` regardless of how many were added.
+
+Rebuild `## Conversations` from List 2's result exactly as `/kickoff` does (FYI rows collapsed to one line, Decide rows with their verdict) — mark the heading `*(refreshed HH:MM)*` per step 3's rule. Skipped-row persistence is the same deferred piece noted in `/kickoff` — not built yet.
+
+If there's nothing new in either list, say so in one line and don't render a table.
+
+### 4.5. Track C2 rerun (Morning read / Pulse asides)
+
+Fires on a plain `/checkin`, `--full`, or any of `morning`, `pulse`, `health`, `listening`; skipped for every other single-section filter (`calendar`, `transport`, `coffee`, `house`, `snags`, `inbox`, `intake`, `email`, `whatsapp`, `conversations`) unless one of the trigger filters is also named. **`email`/`whatsapp`/`conversations` no longer trigger Track C2** — they trigger Track C (step 4) instead, since 2026-09-10.
+
+Same subagent shape as `/kickoff`'s Track C2 (see that command's file for the full instructions) — a Sonnet subagent reading the same restricted ~75 KB slice of the just-refetched brief (`health_summary`, `health_sleep`, `health_trends`, `health_workouts`, `lastfm_recent`, `lastfm_stats`, `calendar`, `reminders`, `attachments`, `alerts.issues`), producing whichever of `morning_read` / `pulse_asides` this refresh actually needs (both on an unfiltered run or `--full`; otherwise only the fragment the trigger filter maps to per the table above). Track B's answers from this morning are still valid (they don't go stale within a day — see "Why Track B never reruns" above) — pass them along if this session still has them; if this is a fresh session with no memory of them, proceed without rather than re-asking, since `/checkin` never re-asks Track B's questions.
+
+Replace the matching fragment(s) in the note in place, same rule as step 3: mark the touched heading(s) with `*(refreshed HH:MM)*`, and never touch a fragment this refresh didn't request. A `""` result omits the heading (or the aside line, for `pulse_asides`) exactly as it would on `/kickoff`; a one-line "not available" notice keeps it.
+
+### 5. Update the Notes section delta
+
+At the bottom of `## Notes`, append a one-paragraph delta of anything genuinely new since the last refresh — new intake items added, a snag captured, a section that changed materially. Skip this if nothing changed; don't pad it.
+
+### 6. Confirm
+
+One line: `"Refreshed: pulse, coffee, consumables, snags (1 captured), morning read, conversations. Triage: 2 added, 1 skipped."` — name only what actually changed.
+
+## Never invokes `/tunetasks`
+
+Confirmed in the plan of record: running the ledger audit on every intraday refresh is wasted churn. `/tunetasks` is a deliberate, once-a-day (or as-needed) act, not something a `/checkin` should trigger as a side effect.
+
+## Why a separate command
+
+`/kickoff` stays creation-shaped: fan out once, ask the human things, write the note from scratch. `/checkin` stays update-shaped: re-fetch, diff, edit sections in place. Filter args (`/checkin transport` before the commute) are fast and intent-clear.
+
+*(This command was called `/refresh` until 2026-09-10, when it was renamed to `/checkin` — no behaviour change, lios#194.)*
+
+## Safety rules
+
+- Never overwrite handwritten user notes inside a section — append rather than replace if unsure.
+- Never touch Focus — that's `/tunetasks`' job now, not a refresh.
+- Never edit sections the user didn't ask for when filters are passed.
+- If a filter is unrecognised, list valid filters and bail.
+- Never source a number, count, or status claim from the note being refreshed — only from the fresh `rendered` fragment (or, for Morning read/Pulse asides, the fresh Track C2 subagent output; or, for Conversations, the fresh Track C TriageList).

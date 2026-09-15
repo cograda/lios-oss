@@ -14,7 +14,8 @@ from sqlalchemy.orm import Session
 
 from app.auth.context import current_user_id
 from app.integrations.google_mail.models import MailMessage
-from app.tools import CustomTool, ExtraFilter, ListTool, SearchTool, SemanticSearchTool, StatsTool
+from app.integrations.google_mail.ooo import detect_ooo
+from app.tools import CustomTool, ExtraFilter, ListTool, SearchTool, SemanticSearchTool, StatsTool, ToolAnnotations
 from app.tools.helpers import iso_or_none, make_enrich, scoped_query, serialize
 
 logger = logging.getLogger(__name__)
@@ -30,8 +31,26 @@ _MSG_RENAMES = {"google_message_id": "id", "account_email": "account", "sender":
 _MSG_TRANSFORMS = {"date": iso_or_none}
 
 
+def _parse_live_date(raw: str | None):
+    """`list_messages`' live-path dicts carry the raw RFC 2822 `Date` header
+    (e.g. "Mon, 15 Sep 2026 09:14:00 +0000"), not the parsed `MailMessage.date`
+    column `_msg_to_dict` gets — `detect_ooo` needs a real datetime either way."""
+    if not raw:
+        return None
+    from email.utils import parsedate_to_datetime
+    try:
+        return parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _msg_to_dict(m: MailMessage) -> dict:
-    return serialize(m, _MSG_FIELDS, renames=_MSG_RENAMES, transforms=_MSG_TRANSFORMS)
+    d = serialize(m, _MSG_FIELDS, renames=_MSG_RENAMES, transforms=_MSG_TRANSFORMS)
+    # `ooo_active` (lios#143): computed on the fly from this row alone, never
+    # persisted — an auto-reply's evidence goes stale, so re-derive it at
+    # read time rather than caching a verdict that would itself go stale.
+    d["ooo_active"] = detect_ooo(m.subject, m.snippet, m.date).active
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +106,12 @@ def handle_unread(session: Session, arguments: dict[str, Any]) -> str:
                 "is_read": m.get("is_read", False),
                 "is_starred": m.get("is_starred", False),
                 "has_attachments": m.get("has_attachments", False),
+                # See `_msg_to_dict` — same on-the-fly OOO check (lios#143).
+                "ooo_active": detect_ooo(
+                    m.get("subject"),
+                    m.get("snippet"),
+                    _parse_live_date(m.get("date")),
+                ).active,
             }
             for m in all_messages
         ]
@@ -190,17 +215,32 @@ def handle_backfill(session: Session, arguments: dict[str, Any]) -> str:
 
 
 def handle_embed(session: Session, arguments: dict[str, Any]) -> str:
-    """Enqueue un-embedded mail messages for semantic search."""
-    from app.integrations.google_mail.sync import embed_messages
+    """Enqueue un-embedded mail messages for semantic search.
+
+    `dry_run` (default False) reports what a real run would enqueue —
+    count and date range, over the same eligibility rule `embed_messages`
+    itself uses — without enqueuing anything. Run this first on a mailbox
+    that hasn't been backfilled before; `embed_messages` refuses outright
+    (rather than truncating) if the real run would exceed its `max_messages`
+    cap, and the error names the actual count.
+    """
+    from app.integrations.google_mail.sync import EmbedBacklogTooLargeError, embed_messages, plan_embed_messages
     from app.services.embedding import Embedding
+
+    dry_run = bool(arguments.get("dry_run", False))
     try:
-        count = embed_messages(session)
+        if dry_run:
+            plan = plan_embed_messages(session, user_id=current_user_id())
+            return json.dumps({"status": "ok", "dry_run": True, **plan})
+        count = embed_messages(session, user_id=current_user_id())
         total = session.query(Embedding).filter_by(source="email").count()
         return json.dumps({
             "status": "ok",
             "new_enqueued": count,
             "total_embedded": total,
         })
+    except EmbedBacklogTooLargeError as e:
+        return json.dumps({"error": str(e)})
     except Exception as e:
         logger.exception("Embedding enqueue failed")
         return json.dumps({"error": str(e)})
@@ -217,6 +257,35 @@ _semantic_enrich = make_enrich(
     renames={"sender": "from"},
     transforms={"date": iso_or_none},
 )
+
+
+def _semantic_date_filter(after_dt: datetime | None, before_dt: datetime | None):
+    """Build an embeddings-table filter clause for gmail_semantic_search's
+    after/before args.
+
+    Filters on `MailMessage.date` — the actual sent date, a proper indexed
+    timestamptz column — rather than `Embedding.created_at` (when the message
+    was *embedded*, which for backfilled history is a bulk-import time with no
+    relation to when the mail was sent — filtering on that would silently fail
+    to fix the "2012 email about this week's washing machine" problem this
+    feature exists for). Applied as an `IN (subquery)` against
+    `Embedding.source_id`, so it becomes part of the same SQL query
+    `EmbeddingService.search()` already runs before its `ORDER BY`/`LIMIT` —
+    the date range narrows *which* rows compete for the top-K, it doesn't trim
+    an already-decided top-K afterwards.
+    """
+    from sqlalchemy import select
+
+    from app.services.embedding import Embedding
+
+    subq = select(MailMessage.google_message_id).where(
+        MailMessage.user_id == current_user_id()
+    )
+    if after_dt is not None:
+        subq = subq.where(MailMessage.date >= after_dt)
+    if before_dt is not None:
+        subq = subq.where(MailMessage.date <= before_dt)
+    return Embedding.source_id.in_(subq)
 
 
 def _gmail_stats_compute(session: Session, _arguments: dict[str, Any]) -> dict:
@@ -260,7 +329,10 @@ def _gmail_stats_compute(session: Session, _arguments: dict[str, Any]) -> dict:
         "total_messages": total_messages,
         "total_embedded": total_embedded,
         "queue_pending": queue_pending,
-        "embedding_coverage": round(total_embedded / total_messages * 100, 1) if total_messages else 0,
+        # None, not 0, when there are no messages at all — "0% embedded"
+        # implies a backlog of un-embedded mail, when the true state is
+        # there's nothing to embed. See the "honest numbers" hardening pass.
+        "embedding_coverage": round(total_embedded / total_messages * 100, 1) if total_messages else None,
         "accounts": accounts,
     }
 
@@ -275,6 +347,7 @@ def get_mcp_tools() -> list[dict]:
         # ---- Hand-written: live Gmail API + admin operations ----
         CustomTool(
             name="gmail_unread",
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=True),
             description=(
                 "List unread Gmail messages across all accounts. Returns subject, sender, "
                 "date, and a snippet preview. Fetches live from the Gmail API for freshness."
@@ -293,6 +366,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="gmail_thread",
+            annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=True),
             description=(
                 "Read all messages in a Gmail thread by thread_id. Includes full bodies "
                 "where available (live API) or cached snippets as a fallback. "
@@ -312,6 +386,7 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="gmail_backfill",
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True, open_world_hint=True),
             description=(
                 "Backfill Gmail history from a given date. Fetches all messages and caches "
                 "metadata. Admin tool — use for initial setup or catching up on history."
@@ -334,11 +409,25 @@ def get_mcp_tools() -> list[dict]:
 
         CustomTool(
             name="gmail_embed",
+            annotations=ToolAnnotations(read_only_hint=False, idempotent_hint=True),
             description=(
                 "Embed un-embedded mail messages for semantic search. Fetches full bodies "
-                "and creates vector embeddings. Admin tool — run after backfill or periodically."
+                "and creates vector embeddings. Admin tool — run after backfill or periodically. "
+                "Only considers mail dated on/after the google_mail.embed_backfill_from config "
+                "floor (default 2026-07-15) — older mail is covered by a historical import, not "
+                "re-embedded here. Refuses (naming the count) rather than truncating if more than "
+                "max_messages (default 5000) would be enqueued. Pass dry_run=true first to see "
+                "the count and date range it would enqueue without enqueuing anything."
             ),
-            input_schema={"type": "object", "properties": {}},
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "dry_run": {
+                        "type": "boolean", "default": False,
+                        "description": "Report count + date range without enqueuing.",
+                    },
+                },
+            },
             handler=handle_embed,
             category="email",
         ).build(),
@@ -388,7 +477,7 @@ def get_mcp_tools() -> list[dict]:
                 ),
             ],
             category="email",
-            examples=["Search emails for 'mortgage'", "Find emails from school about Finn"],
+            examples=["Search emails for 'mortgage'", "Find emails from school about a child"],
         ).build(),
 
         SemanticSearchTool(
@@ -396,12 +485,16 @@ def get_mcp_tools() -> list[dict]:
             description=(
                 "Semantic search across email content using embeddings (meaning-based, not keyword). "
                 "Searches full message bodies. Great for finding emails about a topic even when "
-                "you don't remember the exact words. Requires gmail_embed to have been run first."
+                "you don't remember the exact words. Optional after/before date range narrows to "
+                "emails actually sent in that window — useful when the same topic recurs over "
+                "years and only recent (or a specific period's) results matter. "
+                "Requires gmail_embed to have been run first."
             ),
             model=MailMessage,
             embedding_source="email",
             embed_tool_name="gmail_embed",
             enrich=_semantic_enrich,
+            date_filter=_semantic_date_filter,
             default_limit=10,
             max_limit=50,
             category="search",
@@ -415,7 +508,8 @@ def get_mcp_tools() -> list[dict]:
             name="gmail_stats",
             description=(
                 "Email cache statistics: per-account message counts, date ranges covered, "
-                "and embedding coverage percentage. Use to check how much history is indexed."
+                "and embedding coverage percentage (null, not 0, when there are no messages "
+                "at all). Use to check how much history is indexed."
             ),
             model=MailMessage,
             compute=_gmail_stats_compute,

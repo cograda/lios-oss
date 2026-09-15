@@ -8,8 +8,15 @@ the testcontainers harness in Phase 1.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from app.auth.context import _current_user_id, current_user_id_or_none, use_user
-from app.services.embedding import Embedding, EmbeddingQueue, EmbeddingService
+from app.services.embedding import (
+    Embedding,
+    EmbeddingQueue,
+    EmbeddingService,
+    UnknownEmbeddingSourceError,
+)
 
 
 def test_current_user_id_or_none_unbound_returns_none():
@@ -132,6 +139,42 @@ def test_transient_batch_failure_marks_all_pending_for_retry():
     assert done == 0
     assert all(i.status == "pending" for i in items)
     assert all(i.attempts == 1 for i in items)
+
+
+# ---------------------------------------------------------------------------
+# Source registry (V4 chunk 3.4)
+# ---------------------------------------------------------------------------
+
+def test_enqueue_unknown_source_raises():
+    session = _empty_session()
+    with pytest.raises(UnknownEmbeddingSourceError, match="not-a-real-source"):
+        EmbeddingService.enqueue(session, "not-a-real-source", "id-1", "hello")
+
+
+def test_enqueue_batch_unknown_source_raises():
+    session = _empty_session()
+    with pytest.raises(UnknownEmbeddingSourceError, match="not-a-real-source"):
+        EmbeddingService.enqueue_batch(
+            session, [("not-a-real-source", "id-1", "hello", None)],
+        )
+
+
+def test_search_unknown_source_raises():
+    session = _empty_session()
+    with pytest.raises(UnknownEmbeddingSourceError, match="not-a-real-source"):
+        EmbeddingService.search(session, "query", sources=["not-a-real-source"])
+
+
+def test_delete_source_unknown_source_raises():
+    session = _empty_session()
+    with pytest.raises(UnknownEmbeddingSourceError, match="not-a-real-source"):
+        EmbeddingService.delete_source(session, "not-a-real-source", "id-1")
+
+
+def test_enqueue_known_source_does_not_raise():
+    session = _empty_session()
+    # "vault" is a real, manifest-declared source (obsidian) — must not raise.
+    assert EmbeddingService.enqueue(session, "vault", "Note.md", "hello")
 
 
 def test_process_queue_copies_user_id_to_embedding():

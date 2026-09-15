@@ -1,10 +1,12 @@
 """MCP transport suite (db tier) — real ASGI requests against /mcp.
 
 Drives `mcp_asgi_app` through httpx's ASGITransport: real bearer
-resolution against the test Postgres (client_tokens, mcp_access_tokens,
-legacy HOME_MCP_TOKEN), real Streamable HTTP framing through the MCP SDK,
-real tool dispatch with ContextVar user pinning, the 60s timeout path,
-and the 410 tombstone for the removed SSE transport.
+resolution against the test Postgres (client_tokens, mcp_access_tokens —
+hashed at rest, V4 chunk 2.3; the legacy shared HOME_MCP_TOKEN fallback is
+gone, see `test_home_mcp_token_no_longer_authenticates`), real Streamable
+HTTP framing through the MCP SDK, real tool dispatch with ContextVar user
+pinning, the 60s timeout path, and the 410 tombstone for the removed SSE
+transport.
 """
 
 import json
@@ -51,12 +53,17 @@ def mcp_app(real_db, monkeypatch):
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from mcp.types import Tool
 
+    from app.integrations import register_all
     from app.mcp import server as srv
 
     # Ensure the call_tool/list_tools dispatchers are registered (idempotent:
     # re-decoration replaces the handler; duplicate tool defs are guarded).
+    # V4 chunk 3.4: embedding's tools now come through the normal
+    # per-integration loop (embedding is integration #20), not a standalone
+    # `_register_embedding_tools()`.
     if "search_semantic" not in srv._tool_handlers:
-        srv._register_embedding_tools()
+        register_all()
+        srv.register_mcp_tools()
 
     def probe_handler(session, arguments):
         from app.auth.context import current_user_id
@@ -85,23 +92,35 @@ def mcp_app(real_db, monkeypatch):
 
 @pytest.fixture
 def tokens(db_session):
-    """One client token per user, one OAuth token for sam, one expired."""
+    """One client token per user, one OAuth token for sam, some expired/revoked."""
     from app.models.clients import ClientToken
     from app.models.oauth_clients import McpAccessToken
 
     now = datetime.now(timezone.utc)
+    year = timedelta(days=365)
     db_session.add_all([
-        ClientToken(user_id=1, token="alex-client-token", label="test-alex"),
-        ClientToken(user_id=2, token="sam-client-token", label="test-sam"),
-        ClientToken(
-            user_id=2, token="sam-dead-token", label="revoked", is_active=False,
+        ClientToken.for_token(
+            user_id=1, token="alex-client-token", label="test-alex",
+            expires_at=now + year,
         ),
-        McpAccessToken(
-            user_id=2, access_token="sam-oauth-token", client_id="c1",
+        ClientToken.for_token(
+            user_id=2, token="sam-client-token", label="test-sam",
+            expires_at=now + year,
+        ),
+        ClientToken.for_token(
+            user_id=2, token="sam-dead-token", label="revoked", is_active=False,
+            expires_at=now + year,
+        ),
+        ClientToken.for_token(
+            user_id=2, token="sam-expired-client-token", label="stale",
+            expires_at=now - timedelta(minutes=1),
+        ),
+        McpAccessToken.for_tokens(
+            access_token="sam-oauth-token", user_id=2, client_id="c1",
             expires_at=now + timedelta(hours=1),
         ),
-        McpAccessToken(
-            user_id=2, access_token="sam-expired-oauth", client_id="c1",
+        McpAccessToken.for_tokens(
+            access_token="sam-expired-oauth", user_id=2, client_id="c1",
             expires_at=now - timedelta(minutes=1),
         ),
     ])
@@ -170,21 +189,28 @@ async def test_expired_oauth_token_is_401(mcp_post, tokens):
 
 
 @pytest.mark.anyio
-async def test_legacy_admin_token_pins_alex(mcp_post, tokens, monkeypatch):
-    from app.config import settings
-    monkeypatch.setattr(settings, "mcp_token", "legacy-admin-secret")
-
-    resp = await mcp_post(_call("probe_whoami"), bearer="legacy-admin-secret")
-    assert resp.status_code == 200
-    assert json.loads(_result_text(resp.json())) == {"user_id": 1}
+async def test_expired_client_token_is_401(mcp_post, tokens):
+    resp = await mcp_post(_rpc("tools/list"), bearer="sam-expired-client-token")
+    assert resp.status_code == 401
 
 
 @pytest.mark.anyio
-async def test_legacy_token_disabled_when_unset(mcp_post, tokens, monkeypatch):
+async def test_home_mcp_token_no_longer_authenticates(mcp_post, tokens, monkeypatch):
+    """Regression test (V4 chunk 2.3): the shared HOME_MCP_TOKEN admin
+    fallback in `_authenticate_request` was a standing impersonation path
+    (any bearer matching this one env var minted a User(id=1) session) and
+    has been deleted outright — not just gated. Setting the setting to a
+    known value and presenting it as a bearer must still 401; there is no
+    code path left that reads `settings.mcp_token` at all.
+    """
     from app.config import settings
-    monkeypatch.setattr(settings, "mcp_token", "")
 
-    resp = await mcp_post(_call("probe_whoami"), bearer="")
+    assert not hasattr(settings, "mcp_token"), (
+        "settings.mcp_token still exists — the config field must be fully "
+        "removed, not just unused"
+    )
+
+    resp = await mcp_post(_call("probe_whoami"), bearer="legacy-admin-secret")
     assert resp.status_code == 401
 
 

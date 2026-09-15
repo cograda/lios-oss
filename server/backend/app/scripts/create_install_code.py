@@ -1,7 +1,7 @@
 """Mint a single-use install code for onboarding a new machine.
 
 Usage (inside the container):
-    docker exec -it comar-app python -m app.scripts.create_install_code \
+    docker exec -it lios-core python -m app.scripts.create_install_code \
         --user sam --label sam-macbook
 
 Prints:
@@ -21,12 +21,13 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
+from app.auth.encryption import encrypt_token
 from app.db import get_db
 from app.models.clients import ClientToken, InstallCode
 from app.models.users import User
 
 
-PUBLIC_URL_DEFAULT = "https://your-server.your-tailnet.ts.net"
+PUBLIC_URL_DEFAULT = "https://ubuntudockerbox.tail78010b.ts.net"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,12 +49,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: user '{args.user}' is not active", file=sys.stderr)
             return 2
 
-        # Mint the bearer this install will use.
-        token = ClientToken(
-            user_id=user.id,
-            token=secrets.token_hex(32),
-            label=args.label,
-            is_active=True,
+        # Mint the bearer this install will use. Only the hash lands in
+        # client_tokens; the plaintext rides on the InstallCode row until
+        # redemption (or 24h TTL), same as the code itself — see
+        # InstallCode's docstring for the threat-model reasoning.
+        token, plaintext = ClientToken.mint(
+            user_id=user.id, label=args.label, is_active=True,
         )
         session.add(token)
         session.flush()  # populate token.id without commit
@@ -64,6 +65,10 @@ def main(argv: list[str] | None = None) -> int:
             user_id=user.id,
             label=args.label,
             token_id=token.id,
+            # F4: encrypted at rest (same Fernet machinery as oauth_tokens /
+            # integration_config) — decrypted only in app/routes/install.py
+            # at redemption time.
+            token_plaintext=encrypt_token(plaintext),
             created_at=now,
             expires_at=now + timedelta(hours=args.ttl_hours),
         )
@@ -71,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # Snapshot for printing before commit closes the session.
         code = install.code
-        token_str = token.token
+        token_str = plaintext
         expires = install.expires_at
 
         session.commit()
@@ -84,10 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print("Run on the new machine:")
     print()
-    print(
-        f"  curl -fsSL -X POST -H 'Content-Type: application/json' "
-        f"-d '{{\"code\":\"{code}\"}}' {public}/api/install/redeem | bash"
-    )
+    print(f"  curl -fsSL {public}/api/install/{code} | bash")
     print()
     print("Fallback (if curl can't reach the server before Tailscale is up):")
     print()

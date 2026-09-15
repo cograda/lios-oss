@@ -5,7 +5,7 @@
 #   make deploy-build  Dev rsync deploy: build locally, rsync + build on server
 #   make deploy-fast   Dev rsync deploy (backend only, skip frontend build)
 
-.PHONY: build-client test test-client test-server deploy deploy-build deploy-fast deploy-pull
+.PHONY: build-client test test-client test-server deploy deploy-build deploy-fast deploy-pull state-of-project check-state
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -47,3 +47,20 @@ deploy-build: build-client
 
 deploy-fast:
 	$(MAKE) -C server deploy-fast
+
+# ---------------------------------------------------------------------------
+# Generated state document (S5.2) — see scripts/state_of_project.py
+# ---------------------------------------------------------------------------
+
+# Falls back to PATH python when no local server/backend/.venv exists (CI
+# installs deps straight into the runner's system python — see
+# .github/workflows/core-tests.yml).
+STATE_PYTHON := $(if $(wildcard server/backend/.venv/bin/python),server/backend/.venv/bin/python,python)
+
+# Render STATE.md from live measurements (integration/tool/table/test counts).
+state-of-project:
+	$(STATE_PYTHON) scripts/state_of_project.py
+
+# Fail if the committed STATE.md has drifted from live measurements.
+check-state:
+	$(STATE_PYTHON) scripts/state_of_project.py --check

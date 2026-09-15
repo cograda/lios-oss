@@ -1,10 +1,16 @@
-"""Tests for OAuth token encryption (Fernet)."""
+"""Tests for OAuth token encryption (Fernet) — fail-closed (V4 chunk 3.3)."""
 
 from unittest.mock import patch
 
+import pytest
 from cryptography.fernet import Fernet
 
-from app.auth.encryption import decrypt_token, encrypt_token, is_encrypted
+from app.auth.encryption import (
+    EncryptionKeyMissingError,
+    decrypt_token,
+    encrypt_token,
+    is_encrypted,
+)
 
 
 # Generate a test key (don't use in production)
@@ -48,11 +54,32 @@ class TestEncryptDecryptRoundtrip:
         assert encrypted_once == encrypted_twice
 
     @patch("app.auth.encryption.settings")
-    def test_plaintext_passthrough_no_key(self, mock_settings):
+    def test_encrypt_raises_when_key_unset(self, mock_settings):
+        """Fail-closed (V4 chunk 3.3): no more silent plaintext passthrough."""
         mock_settings.oauth_encryption_key = ""
-        plaintext = "ya29.some-token"
+        with pytest.raises(EncryptionKeyMissingError):
+            encrypt_token("ya29.some-token")
 
-        assert encrypt_token(plaintext) == plaintext
+    @patch("app.auth.encryption.settings")
+    def test_decrypt_raises_when_key_unset_and_value_is_ciphertext(self, mock_settings):
+        mock_settings.oauth_encryption_key = ""
+        ciphertext = "gAAAAAfake-ciphertext-looking-value"
+        with pytest.raises(EncryptionKeyMissingError):
+            decrypt_token(ciphertext)
+
+    @patch("app.auth.encryption.settings")
+    def test_empty_string_no_key_does_not_raise(self, mock_settings):
+        """Empty strings short-circuit before the key is ever consulted."""
+        mock_settings.oauth_encryption_key = ""
+        assert encrypt_token("") == ""
+        assert decrypt_token("") == ""
+
+    @patch("app.auth.encryption.settings")
+    def test_plaintext_decrypt_no_key_does_not_raise(self, mock_settings):
+        """Decrypting a value that isn't Fernet ciphertext never needs the
+        key, regardless of whether one is configured."""
+        mock_settings.oauth_encryption_key = ""
+        plaintext = "ya29.not-encrypted"
         assert decrypt_token(plaintext) == plaintext
 
     @patch("app.auth.encryption.settings")

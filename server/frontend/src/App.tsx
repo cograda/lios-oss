@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 import { Routes, Route, useLocation, Link } from 'react-router'
-import { Home, Settings, RefreshCw, ScrollText } from 'lucide-react'
+import { Home, Settings, RefreshCw, ScrollText, LogOut } from 'lucide-react'
 import { SidebarNav } from '@/components/layout/sidebar-nav'
 import { ErrorBoundary } from '@/components/error-boundary'
-import { api } from '@/lib/api'
+import { api, type AuthUser } from '@/lib/api'
+import { AuthProvider } from '@/lib/auth'
 import Login from '@/pages/Login'
 import Dashboard from '@/pages/Dashboard'
 import Integrations from '@/pages/Integrations'
@@ -23,42 +24,71 @@ const navItems = [
   { href: '/settings', icon: Settings, label: 'Settings' },
 ]
 
+type AuthState = { kind: 'loading' } | { kind: 'login' } | { kind: 'ok'; user: AuthUser }
+
 export default function App() {
   const { pathname } = useLocation()
-  const [authState, setAuthState] = useState<'loading' | 'login' | 'ok'>('loading')
+  const [auth, setAuth] = useState<AuthState>({ kind: 'loading' })
 
   useEffect(() => {
     api.checkAuth()
-      .then((r) => setAuthState(r.authenticated ? 'ok' : r.auth_required ? 'login' : 'ok'))
-      .catch(() => setAuthState('login'))
+      .then((r) => setAuth(r.authenticated && r.user ? { kind: 'ok', user: r.user } : { kind: 'login' }))
+      .catch(() => setAuth({ kind: 'login' }))
 
-    function handleLogout() { setAuthState('login') }
+    function handleLogout() { setAuth({ kind: 'login' }) }
     window.addEventListener('auth:logout', handleLogout)
     return () => window.removeEventListener('auth:logout', handleLogout)
   }, [])
 
-  if (authState === 'loading') return null
-  if (authState === 'login') return <Login onLogin={() => setAuthState('ok')} />
+  if (auth.kind === 'loading') return null
+  if (auth.kind === 'login') return <Login onLogin={(user) => setAuth({ kind: 'ok', user })} />
+
+  const user = auth.user
+
+  async function signOut() {
+    try { await api.logout() } finally { setAuth({ kind: 'login' }) }
+  }
 
   return (
-    <div className="flex min-h-screen">
-      <SidebarNav
-        items={navItems}
-        activePath={pathname}
-        LinkComponent={RouterLink}
-        header={<span className="text-xs font-bold uppercase tracking-widest text-muted-foreground">Home Services</span>}
-      />
-      <main className="flex-1 p-6 overflow-auto">
-        <ErrorBoundary>
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/integrations" element={<Integrations />} />
-            <Route path="/integrations/:name" element={<IntegrationDetail />} />
-            <Route path="/logs" element={<Logs />} />
-            <Route path="/settings" element={<SettingsPage />} />
-          </Routes>
-        </ErrorBoundary>
-      </main>
-    </div>
+    <AuthProvider value={{ user, isAdmin: user.is_admin, signOut }}>
+      <div className="flex min-h-screen">
+        <SidebarNav
+          items={navItems}
+          activePath={pathname}
+          LinkComponent={RouterLink}
+          header={
+            <div className="space-y-2">
+              <span className="text-xs font-bold uppercase tracking-widest text-muted-foreground">lios</span>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-sm font-medium truncate" title={user.name}>
+                  {user.display_name}
+                  {user.is_admin && <span className="ml-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">admin</span>}
+                </span>
+                <button
+                  type="button"
+                  onClick={signOut}
+                  className="text-muted-foreground hover:text-foreground"
+                  title="Sign out"
+                  aria-label="Sign out"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          }
+        />
+        <main className="flex-1 p-6 overflow-auto">
+          <ErrorBoundary>
+            <Routes>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/integrations" element={<Integrations />} />
+              <Route path="/integrations/:name" element={<IntegrationDetail />} />
+              <Route path="/logs" element={<Logs />} />
+              <Route path="/settings" element={<SettingsPage />} />
+            </Routes>
+          </ErrorBoundary>
+        </main>
+      </div>
+    </AuthProvider>
   )
 }

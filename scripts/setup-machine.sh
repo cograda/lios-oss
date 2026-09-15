@@ -9,10 +9,10 @@
 #
 # What it does:
 #   1. Checks for pipx (installs via brew if missing).
-#   2. Installs / upgrades the comar daemon from ./client.
-#   3. Runs `comar setup --noninteractive` if ~/.config/comar/config.toml
+#   2. Installs / upgrades the lios-sync daemon from ./client.
+#   3. Runs `lios-sync setup --noninteractive` if ~/.config/lios/config.toml
 #      doesn't exist (prompting for the per-user bearer token).
-#   4. Writes ~/.config/comar/env.sh — exports COMAR_TOKEN from config.toml.
+#   4. Writes ~/.config/lios/env.sh — exports COMAR_TOKEN from config.toml.
 #   5. Patches ~/.zshenv to source env.sh on every zsh invocation (so
 #      GUI-launched apps like Claude Code see the token, not just terminals).
 #   6. Verifies with a heartbeat to the server.
@@ -34,7 +34,7 @@ die()  { printf "\033[1;31m✗\033[0m %s\n" "$*" >&2; exit 1; }
 # config.toml values are extracted with python3's stdlib tomllib (3.11+),
 # which handles real TOML instead of brittle awk field-splitting.
 command -v python3 >/dev/null 2>&1 \
-  || die "python3 not found — install it (e.g. 'brew install python3'); needed to parse ~/.config/comar/config.toml"
+  || die "python3 not found — install it (e.g. 'brew install python3'); needed to parse ~/.config/lios/config.toml"
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' \
   || die "python3 is older than 3.11 (no tomllib) — upgrade it (e.g. 'brew install python3')"
 ok "python3 with tomllib available"
@@ -48,8 +48,8 @@ if ! command -v pipx >/dev/null 2>&1; then
 fi
 ok "pipx available"
 
-# 2. comar daemon --------------------------------------------------------------
-say "Installing comar daemon from ${repo_root}/client"
+# 2. lios-sync daemon --------------------------------------------------------------
+say "Installing lios-sync daemon from ${repo_root}/client"
 pipx install --force "${repo_root}/client" >/dev/null
 ok "daemon installed at $(command -v comar)"
 
@@ -60,17 +60,22 @@ if [ -f "${config_file}" ]; then
 else
   say "No config found — running interactive setup"
   printf "  User (alex/sam): "; read -r user
-  printf "  Server URL [http://192.168.1.50:8400]: "; read -r server
+  printf "  Server URL on home network [http://192.168.1.50:8400]: "; read -r server
   server="${server:-http://192.168.1.50:8400}"
+  # Off-network fallback. The client probes URLs in order and uses the first
+  # that answers, so listing the tailnet address here is what lets a laptop
+  # keep working from anywhere without being reconfigured.
+  printf "  Fallback URL when away (Tailscale, blank for none): "; read -r fallback
+  [ -n "${fallback}" ] && server="${server},${fallback}"
   printf "  Bearer token (from server's client_tokens table): "; read -rs token; echo
   [ -n "${token}" ] || die "token cannot be empty"
-  comar setup --noninteractive --user "${user}" --token "${token}" --server "${server}"
+  lios-sync setup --noninteractive --user "${user}" --token "${token}" --server "${server}"
 fi
 
 # 4. env shim ------------------------------------------------------------------
 say "Writing env shim to ${env_shim}"
 cat > "${env_shim}" <<'SHIM'
-# comar — exports environment variables from ~/.config/comar/config.toml.
+# comar — exports environment variables from ~/.config/lios/config.toml.
 # Sourced by ~/.zshenv so GUI-launched apps (Claude Code via Spotlight/Dock)
 # see COMAR_TOKEN, not only interactive terminals.
 _comar_config="${HOME}/.config/comar/config.toml"
@@ -78,7 +83,11 @@ if [ -r "${_comar_config}" ] && command -v python3 >/dev/null 2>&1; then
   COMAR_TOKEN=$(python3 -c 'import tomllib,sys; d=tomllib.load(open(sys.argv[1],"rb")); print(d.get("server",{}).get("token",""))' "${_comar_config}" 2>/dev/null)
   if [ -n "${COMAR_TOKEN}" ]; then
     export COMAR_TOKEN
+  else
+    echo "comar: token empty in ~/.config/lios/config.toml — COMAR_TOKEN not set" >&2
   fi
+else
+  echo "comar: ~/.config/lios/config.toml unreadable — COMAR_TOKEN not set" >&2
 fi
 unset _comar_config
 SHIM
@@ -102,15 +111,32 @@ fi
 say "Verifying with server heartbeat"
 . "${env_shim}"
 [ -n "${COMAR_TOKEN:-}" ] || die "COMAR_TOKEN still empty after sourcing env shim"
-server_url=$(python3 -c 'import tomllib,sys; d=tomllib.load(open(sys.argv[1],"rb")); print(d.get("server",{}).get("url",""))' "${config_file}" 2>/dev/null)
-[ -n "${server_url}" ] || server_url="http://192.168.1.50:8400"
-status=$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${COMAR_TOKEN}" "${server_url%/}/api/v1/heartbeat" --max-time 5 || echo "000")
-case "${status}" in
-  200) ok "heartbeat 200 from ${server_url}" ;;
-  401) die "heartbeat 401 — token rejected. Check the value in ${config_file}." ;;
-  000) warn "could not reach ${server_url} — check Wi-Fi / Tailscale, then re-run" ;;
-  *)   warn "heartbeat returned HTTP ${status} from ${server_url}" ;;
-esac
+# Read the whole preference list. `lios-sync setup` writes `urls = [...]`; the
+# `url = "..."` single-key form is the legacy shape, still honoured by the
+# client's config loader and so still read here. (This used to read only `url`
+# and therefore always fell through to the hardcoded default.)
+server_urls=$(python3 -c '
+import tomllib, sys
+s = tomllib.load(open(sys.argv[1], "rb")).get("server", {})
+urls = s.get("urls") or ([s["url"]] if s.get("url") else [])
+print("\n".join(urls))
+' "${config_file}" 2>/dev/null)
+[ -n "${server_urls}" ] || server_urls="http://192.168.1.50:8400"
+
+reachable=""
+while IFS= read -r server_url; do
+  [ -n "${server_url}" ] || continue
+  status=$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${COMAR_TOKEN}" "${server_url%/}/api/v1/heartbeat" --max-time 5 || echo "000")
+  case "${status}" in
+    200) ok "heartbeat 200 from ${server_url}"; reachable="yes" ;;
+    401) die "heartbeat 401 from ${server_url} — token rejected. Check the value in ${config_file}." ;;
+    000) warn "could not reach ${server_url}" ;;
+    *)   warn "heartbeat returned HTTP ${status} from ${server_url}" ;;
+  esac
+done <<EOF
+${server_urls}
+EOF
+[ -n "${reachable}" ] || warn "no configured endpoint answered — check Wi-Fi / Tailscale, then re-run"
 
 echo
 ok "Setup complete. Quit and relaunch Claude Code so it picks up COMAR_TOKEN."
