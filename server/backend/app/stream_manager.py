@@ -30,6 +30,19 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+# The dashboard (session-cookie auth, `/api/system/events`) subscribes as
+# this pseudo-user rather than as itself, because the dashboard's daemon/
+# sync-state view is household-wide (any signed-in user sees every
+# member's daemons — same admin-household exception `system_alerts` already
+# uses), not scoped to whoever has the browser tab open. Publishers name
+# this constant as `target_user` when an event is meant for the dashboard
+# rather than for a specific person's bearer-authenticated SSE stream
+# (channel="sse", keyed by the real username) — see api/v1.py's
+# `events_stream`/`heartbeat` for the publishers and routes/system.py's
+# `system_events` for the one subscriber.
+DASHBOARD_CHANNEL_USER = "__dashboard__"
+DASHBOARD_CHANNEL = "dashboard"
+
 
 @dataclass
 class Subscriber:
@@ -78,24 +91,16 @@ class StreamManager:
         self,
         user: str,
         channel: str,
-        queue: asyncio.Queue | None = None,
+        queue: asyncio.Queue,
     ) -> None:
         """Remove a subscriber.
 
         `queue` identifies which subscriber to remove (multiple may exist
-        for the same key). If omitted, all subscribers for the key are
-        removed — kept for backwards compatibility, but new callers should
-        always pass the queue returned by subscribe().
+        for the same key) — always the queue returned by subscribe().
         """
         key = self._key(user, channel)
         async with self._lock:
             subs = self._subscribers.get(key, [])
-            if queue is None:
-                # Legacy path — remove everyone for the key.
-                if subs:
-                    del self._subscribers[key]
-                    logger.info("Subscriber disconnected: %s (all %d)", key, len(subs))
-                return
             before = len(subs)
             subs[:] = [s for s in subs if s.queue is not queue]
             removed = before - len(subs)

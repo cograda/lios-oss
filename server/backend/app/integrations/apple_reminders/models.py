@@ -39,6 +39,18 @@ class Reminder(UserOwnedMixin, SourcedRecordMixin, Base):
     vault_task_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     sync_direction: Mapped[str | None] = mapped_column(String(20), nullable=True)  # 'from_apple', 'from_server'
 
+    # The ledger inlet (E chunk 6b, 2026-09-04): the `tasks.uid` this reminder
+    # was captured into, or that it is now tracking. Set once, on capture
+    # (`app.integrations.tasks.reminders_inlet::_capture_new`, via this
+    # package's own facade), and never cleared — a reminder deleted on
+    # the device does NOT drop the linked task (see the integration README's
+    # deletion rule), so there is no event that should ever null this out.
+    # A plain string column, not a foreign key: apple_reminders may not
+    # import `tasks.models` (capability boundary), and `tasks.uid` — not a
+    # numeric id — is this codebase's convention for a cross-package
+    # reference (see `TaskLink.target_ref`).
+    linked_task_uid: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+
     # Timestamps
     # synced_at inherited from SourcedRecordMixin
     created_at: Mapped[datetime] = mapped_column(
@@ -54,8 +66,25 @@ class ReminderCommand(UserOwnedMixin, Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     action: Mapped[str] = mapped_column(String(50))  # 'add', 'complete'
     payload: Mapped[str] = mapped_column(Text)  # JSON
-    status: Mapped[str] = mapped_column(String(20), default="pending")  # 'pending', 'done', 'failed'
+    # 'pending' — waiting to be dispatched (or re-dispatched).
+    # 'draining' — claimed by a `drain_pending` call that hasn't finished
+    #   dispatching it yet (`commands.py::_claim`). Transient: it either
+    #   becomes 'superseded' (dispatch landed) or is released back to
+    #   'pending' (dispatch failed, or the payload was unreadable). If the
+    #   process dies mid-claim, `drain_pending` resets anything left in
+    #   'draining' past `DRAINING_CLAIM_TIMEOUT` back to 'pending' before
+    #   selecting candidates — see `claimed_at` below.
+    # 'superseded' — replaced by a fresh row `dispatch_command` created
+    #   while replaying this one; this row is done, the new one is live.
+    # 'expired' — too old to replay (`MAX_REPLAY_AGE`); the write was lost.
+    # 'done' / 'failed' — the device acked, one way or the other.
+    status: Mapped[str] = mapped_column(String(20), default="pending")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # When `_claim` last moved this row into 'draining'. NULL otherwise
+    # (including once it leaves 'draining' either way) — only meaningful
+    # while status == 'draining', for recovering a claim orphaned by a
+    # process death between claim and dispatch.
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

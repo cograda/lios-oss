@@ -1,0 +1,16 @@
+{
+  "event_count": 1,
+  "events": [
+    {
+      "changed_at": "2026-01-15T09:50:00+00:00",
+      "entity_id": "sensor.dishwasher_operation_state",
+      "event": "dishwasher_finished",
+      "label": "Dishwasher finished",
+      "new_state": "finished",
+      "old_state": "run"
+    }
+  ],
+  "hours": 24,
+  "stale": false,
+  "synced_at": "2026-01-15T09:58:00+00:00"
+}

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
-from app.tools.base import ToolAnnotations, ToolBuilder
+from app.tools.base import ToolAnnotations, ToolBuilder, parse_iso_date
 
 
 class SemanticSearchTool(ToolBuilder):
@@ -33,6 +34,9 @@ class SemanticSearchTool(ToolBuilder):
         category: str = "",
         examples: list[str] | None = None,
         annotations: ToolAnnotations | None = None,
+        date_filter: Callable[[datetime | None, datetime | None], Any | None] | None = None,
+        date_params: tuple[str, str] = ("after", "before"),
+        apply_recency_decay: bool = True,
     ):
         super().__init__(name, description, model, category=category, examples=examples, annotations=annotations)
         self.embedding_source = embedding_source
@@ -40,21 +44,53 @@ class SemanticSearchTool(ToolBuilder):
         self.enrich = enrich
         self.default_limit = default_limit
         self.max_limit = max_limit
+        # R4 (2026-09-04): on by default — every current user of this builder
+        # (gmail_semantic_search, whatsapp_semantic_search) is exactly the
+        # "what's true/relevant now" case the brief names explicitly: a fresh
+        # message beating an old one with a marginally better cosine score is
+        # the wanted behavior, not a bug. A future source built on this DSL
+        # where recency is the wrong signal (an archive, a similarity-only
+        # lookup) can pass False here, same as the hand-written handlers in
+        # historical_corpus/coffee do directly against EmbeddingService.search.
+        self.apply_recency_decay = apply_recency_decay
+        # `date_filter`, when supplied, turns parsed after/before datetimes into
+        # a SQLAlchemy filter clause against `Embedding` — the shape of "date"
+        # differs per source (mail has a sent date, whatsapp a message
+        # timestamp), so this class stays agnostic of that and just plumbs the
+        # parsed bounds to whichever integration configured it. `None` means
+        # this tool doesn't support date filtering at all (schema omits the
+        # params), matching every existing SemanticSearchTool call site
+        # unchanged.
+        self.date_filter = date_filter
+        self.date_params = date_params
 
     def _build_schema(self) -> dict[str, Any]:
+        properties: dict[str, Any] = {
+            "query": {
+                "type": "string",
+                "description": "Natural language search query.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": f"Max results (default {self.default_limit}, max {self.max_limit}).",
+                "default": self.default_limit,
+            },
+        }
+
+        if self.date_filter is not None:
+            after_name, before_name = self.date_params
+            properties[after_name] = {
+                "type": "string",
+                "description": "Only include results dated on or after this date (ISO format, e.g. 2026-03-01). Optional.",
+            }
+            properties[before_name] = {
+                "type": "string",
+                "description": "Only include results dated on or before this date (ISO format, e.g. 2026-03-26). Optional.",
+            }
+
         return {
             "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Natural language search query.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": f"Max results (default {self.default_limit}, max {self.max_limit}).",
-                    "default": self.default_limit,
-                },
-            },
+            "properties": properties,
             "required": ["query"],
         }
 
@@ -64,6 +100,9 @@ class SemanticSearchTool(ToolBuilder):
         enrich = self.enrich
         default_limit = self.default_limit
         max_limit = self.max_limit
+        date_filter = self.date_filter
+        after_name, before_name = self.date_params
+        apply_recency_decay = self.apply_recency_decay
 
         def handler(session: Session, arguments: dict[str, Any]) -> str:
             query = arguments.get("query", "").strip()
@@ -80,9 +119,36 @@ class SemanticSearchTool(ToolBuilder):
                     "error": f"No {embedding_source} embeddings found. Run {embed_tool_name} first."
                 })
 
+            extra_filter = None
+            date_range_requested = False
+            if date_filter is not None:
+                after_val = parse_iso_date(arguments.get(after_name))
+                before_val = parse_iso_date(arguments.get(before_name))
+                date_range_requested = after_val is not None or before_val is not None
+                if date_range_requested:
+                    extra_filter = date_filter(after_val, before_val)
+
             raw_results = EmbeddingService.search(
-                session, query=query, sources=[embedding_source], limit=top_k
+                session, query=query, sources=[embedding_source], limit=top_k,
+                extra_filter=extra_filter, apply_recency_decay=apply_recency_decay,
             )
+
+            if not raw_results and date_range_requested:
+                # Deliberately `note`, not `error`. Filtering to nothing is a
+                # legitimate outcome, and the success path returns a bare list —
+                # a caller branching on "error" in the payload would read this
+                # as a failure. The note exists so the caller can say *why* it
+                # found nothing instead of guessing whether the filter or the
+                # query was responsible.
+                return json.dumps({
+                    "results": [],
+                    "note": (
+                        f"No {embedding_source} results in that date range "
+                        f"({after_name}={arguments.get(after_name)!r}, "
+                        f"{before_name}={arguments.get(before_name)!r}). "
+                        "Try widening or omitting the date range."
+                    ),
+                })
 
             if enrich:
                 results = enrich(session, raw_results)

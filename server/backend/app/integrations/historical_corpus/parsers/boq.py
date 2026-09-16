@@ -1,4 +1,4 @@
-"""Parse the renovation Bill of Quantities xlsx into structured chunks.
+"""Parse Riverside Bill of Quantities xlsx into structured chunks.
 
 BoQ rows classify into six kinds via Bill Ref + Description + Unit:
   TRADE_HEADER | SUBSECTION_HEADER | GROUP_HEADER |

@@ -1,19 +1,39 @@
+# The compose PROJECT name is pinned. Compose derives it from the directory
+# name, and this stack lived in ~/comar-server until 2026-09-02 — so its four
+# named volumes are `comar-server_*` on disk. Renaming the directory to
+# ~/lios-core without this would make compose create four EMPTY volumes and
+# start the WhatsApp bridge un-paired. The project is `lios-core`; each volume
+# below carries an explicit `name:` so the existing data is adopted, not
+# abandoned. Do not "tidy" those names — they are the data.
+name: lios-core
+
 services:
   # Postgres is now owned by the infra project (~/infra/).
-  # comar-app connects to home-services-db via the homelab_default network.
+  # lios-core connects to home-services-db via the homelab_default network.
 
   app:
-    image: ghcr.io/cograda/comar-oss-app:latest
+    image: ghcr.io/cograda/lios-core:latest
     build: .
-    container_name: comar-app
+    container_name: lios-core
     env_file: .env
     environment:
       # Connect to Postgres via homelab_default network (container name unchanged).
       HOME_DATABASE__URL: postgresql://${HOME_DB_USER:-homeservices}:${HOME_DB_PASSWORD:?Set HOME_DB_PASSWORD in .env}@home-services-db:5432/home_services
+      # The alerts inlet's shared secret (lios#230, POST /api/v1/alerts/events)
+      # — `app/integrations/alerts/manifest.py`'s `alerts_inlet_key` config
+      # field falls back to `HOME_ALERTS_INLET_KEY` (plugin_config()'s env
+      # fallback is always `HOME_{key.upper()}`), but the deploy side names
+      # the secret `LIOS_ALERTS_INLET_KEY` (Alertmanager's own
+      # `deploy/monitoring/` config references it under that name, matching
+      # the `LIOS_`-prefixed convention its other secrets use) — this maps
+      # the externally-named env var onto the internal one the app reads.
+      # Empty when unset, same as every other optional secret here; an
+      # unset key means the inlet 503s rather than accepting everything.
+      HOME_ALERTS_INLET_KEY: ${LIOS_ALERTS_INLET_KEY:-}
     networks:
       - homelab
     ports:
-      - "${HOME_PORT:-8400}:8000"         # HTTP API — direct (LAN, comar-client, Health Auto Export iOS)
+      - "${HOME_PORT:-8400}:8000"         # HTTP API — direct (LAN, lios-sync, Health Auto Export iOS)
     labels:
       caddy: comar.lab
       caddy.reverse_proxy: "{{upstreams 8000}}"
@@ -27,23 +47,78 @@ services:
       - ${HOME_VAULTS_HOST_PATH:-/dev/null}/alex:/obsidian:rw
       - ${HOME_DOC_CORPUS_HOST_PATH:-/dev/null}:/doc_corpus:ro   # historical renovation archive (one-shot ingest)
       - fastembed_cache:/app/.cache/fastembed
-      - inbox_data:/inbox                  # automation webhook ingestion pipeline
+      - inbox_data:/inbox                  # Tines webhook ingestion pipeline
       - ${HOME_MEDIA_HOST_PATH:-/dev/null}:/data/media:rw   # WhatsApp media store (images/videos/audio)
+      # `lios-db-backup.sh`'s STAGE dir (default /home/alex/comar-backups on
+      # the host), read-only — the restore drill (R2, 2026-09-05) scans it
+      # for the latest comar-db-*.dump. See
+      # app/integrations/system/manifest.py::restore_drill_stage_dir, whose
+      # default (/data/backups) matches the mount point here.
+      - ${HOME_BACKUPS_HOST_PATH:-/dev/null}:/data/backups:ro
+      # Strand A (dead-board alerting) reads `contracts/fleet.md` — the
+      # canonical board registry — read-only from the repo root. Set
+      # HOME_CONTRACTS_HOST_PATH to the repo's `contracts/` directory (e.g.
+      # /home/alex/lios-core-repo/contracts, a separate checkout, since the
+      # deploy tree itself is just the built image). Unset mounts /dev/null,
+      # so the path doesn't exist and the axis hard-refuses loudly rather
+      # than reporting a clean fleet — see
+      # app/integrations/system/device_fleet.py.
+      #
+      # That host directory is a plain copy, not a git checkout, and nothing
+      # refreshes it automatically — `make -C core/server sync-contracts`
+      # (now run on every `deploy-pull`/`deploy-fast`) rsyncs the repo's
+      # contracts/ there so a merged fleet change doesn't sit stale.
+      - ${HOME_CONTRACTS_HOST_PATH:-/dev/null}:/contracts:ro
     restart: unless-stopped
 
+  # One bridge per person. A Baileys session is bound to a single phone
+  # number, so multi-user WhatsApp is another container, not another config
+  # key. Each needs its OWN auth_state volume — sharing one would have the two
+  # sessions overwrite each other's credentials and log both phones out.
+  #
+  # USER_ID is what keeps the data apart: the bridge writes it explicitly
+  # rather than relying on the DEFAULT 1 on whatsapp_messages/whatsapp_contacts.
   whatsapp-bridge:
-    image: ghcr.io/cograda/comar-oss-whatsapp:latest
+    image: ghcr.io/cograda/lios-whatsapp:latest
     build: ./whatsapp-bridge
-    container_name: comar-whatsapp
+    container_name: lios-whatsapp
     environment:
       DATABASE_URL: postgresql://${HOME_DB_USER:-homeservices}:${HOME_DB_PASSWORD:?Set HOME_DB_PASSWORD in .env}@home-services-db:5432/home_services
       LOG_LEVEL: info
       SYNC_FULL_HISTORY: ${HOME_WA_SYNC_HISTORY:-false}
-      BRIDGE_SHARED_SECRET: ${HOME_WA_BRIDGE_SHARED_SECRET:-}
+      USER_ID: ${HOME_WA_USER_ID:-1}
     networks:
       - homelab
     volumes:
       - wa_auth_state:/app/auth_state
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3100/health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # Second person's bridge. Gated behind the `wa2` profile so `docker compose
+  # up` on a single-user deployment doesn't start a container that would sit
+  # forever printing a QR code nobody scans.
+  #   Pair it with:  docker compose --profile wa2 up -d whatsapp-bridge-2
+  #   Then read the QR from:  docker logs -f lios-whatsapp-2
+  whatsapp-bridge-2:
+    image: ghcr.io/cograda/lios-whatsapp:latest
+    build: ./whatsapp-bridge
+    container_name: lios-whatsapp-2
+    profiles: ["wa2"]
+    environment:
+      DATABASE_URL: postgresql://${HOME_DB_USER:-homeservices}:${HOME_DB_PASSWORD:?Set HOME_DB_PASSWORD in .env}@home-services-db:5432/home_services
+      LOG_LEVEL: info
+      # History backfill is opt-in per bridge: the second phone's full history
+      # is a large one-time import and shouldn't ride on the first one's flag.
+      SYNC_FULL_HISTORY: ${HOME_WA2_SYNC_HISTORY:-false}
+      USER_ID: ${HOME_WA2_USER_ID:?Set HOME_WA2_USER_ID in .env (the users.id this bridge belongs to)}
+    networks:
+      - homelab
+    volumes:
+      - wa2_auth_state:/app/auth_state
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3100/health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"]
       interval: 30s
@@ -60,6 +135,15 @@ networks:
     name: homelab_default
 
 volumes:
+  # Existing volumes from the ~/comar-server era, adopted by name (see header).
   fastembed_cache:
+    name: comar-server_fastembed_cache
   wa_auth_state:
+    name: comar-server_wa_auth_state
+  # Second bridge's Baileys credentials. Separate from wa_auth_state on
+  # purpose: two sessions sharing one auth directory overwrite each other's
+  # creds and log both phones out.
+  wa2_auth_state:
+    name: comar-server_wa2_auth_state
   inbox_data:
+    name: comar-server_inbox_data

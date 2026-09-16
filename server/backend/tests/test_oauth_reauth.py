@@ -148,11 +148,10 @@ def test_already_flagged_token_short_circuits():
 def test_successful_exchange_clears_reauth_flag():
     """exchange_code must wipe needs_reauth_at + reason on a fresh consent."""
     from app.auth.oauth import _sign_state, exchange_code
-    from app.config import settings
 
-    # State signing needs a non-empty ui_token. Tests run without env vars set,
-    # so pin a deterministic value for the signing key.
-    settings.ui_token = "test-ui-token"
+    # State signing derives its key from `settings.oauth_encryption_key`
+    # (2026-09-06; was the UI token) — conftest's autouse
+    # `_default_encryption_key` already pins one for every test.
 
     token = _make_token(needs_reauth=True)
     session = _make_session(token)

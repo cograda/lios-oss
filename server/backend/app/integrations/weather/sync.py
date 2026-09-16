@@ -1,4 +1,11 @@
-"""Sync logic: fetch Open-Meteo data → upsert into Postgres."""
+"""Pull/store split for weather — V4 chunk 4.3 batch A.
+
+Splits the old `sync_weather()` (fetch -> upsert, all in one) into the two
+pieces `app.plugin.bases.SourceIntegration.sync()` calls separately:
+`pull_weather` (fetch only, no DB writes) and `store_weather` (persist
+only, no outbound I/O). `WeatherIntegration.pull`/`.store` in `__init__.py`
+are thin one-line adapters onto these.
+"""
 
 import logging
 from datetime import date, datetime, timezone
@@ -7,17 +14,29 @@ from sqlalchemy.orm import Session
 
 from app.integrations.weather.client import fetch_weather
 from app.integrations.weather.models import WeatherCurrent, WeatherForecast
+from app.plugin.bases import PullResult
 
 logger = logging.getLogger(__name__)
 
 
-def sync_weather(session: Session) -> None:
-    """Fetch weather from Open-Meteo and upsert into DB.
+def pull_weather(session: Session, cursor: str | None) -> PullResult:
+    """Fetch current conditions + 7-day forecast from Open-Meteo. No DB
+    writes — see `store_weather`. `cursor` is unused (Open-Meteo has no
+    resumable window — every sync re-fetches the full current+7-day payload)."""
+    data = fetch_weather()
+    return PullResult(records=[data])
+
+
+def store_weather(session: Session, records: list[dict]) -> int:
+    """Upsert `records[0]` (the single Open-Meteo response payload).
 
     - Current conditions: delete old row, insert new.
     - Daily forecast: upsert by date.
     """
-    data = fetch_weather()
+    if not records:
+        return 0
+
+    data = records[0]
 
     # --- Current conditions (single row, replace) ---
     current = data["current"]
@@ -77,3 +96,4 @@ def sync_weather(session: Session) -> None:
 
     session.commit()
     logger.info("Weather sync complete: current + %d forecast days", len(daily["time"]))
+    return 1 + len(daily["time"])

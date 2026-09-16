@@ -54,10 +54,17 @@ def _extract_media_meta(raw: dict) -> dict | None:
     return None
 
 
-def scan_whatsapp_media(session: Session) -> dict:
+def scan_whatsapp_media(session: Session, user_id: int | None = None) -> dict:
     """Insert MediaItem rows for every WhatsApp image/video/audio message we
-    don't already track. Returns counts so callers can surface progress."""
-    sql = sa_text("""
+    don't already track. Returns counts so callers can surface progress.
+
+    `user_id` scopes the scan to one user's `whatsapp_messages` (the MCP tool
+    passes the caller's — 2026-09-06 scoping audit); `None` is the scheduled
+    sync, unbound and household-wide, attributing rows via `w.user_id`.
+    """
+    uid_clause = "AND w.user_id = :uid" if user_id is not None else ""
+    params = {"uid": user_id} if user_id is not None else {}
+    sql = sa_text(f"""
         SELECT w.message_id, w.chat_name, w.chat_id, w.sender_name, w.timestamp,
                w.media_caption, w.raw_json, w.is_from_me, w.user_id
           FROM whatsapp_messages w
@@ -67,8 +74,9 @@ def scan_whatsapp_media(session: Session) -> dict:
            AND m.user_id = w.user_id
          WHERE w.message_type IN ('image', 'video', 'audio')
            AND m.id IS NULL
+           {uid_clause}
     """)
-    rows = session.execute(sql).all()
+    rows = session.execute(sql, params).all()
 
     now = datetime.now(timezone.utc)
     outbound_cutoff = now - timedelta(days=OUTBOUND_EXPIRY_DAYS)

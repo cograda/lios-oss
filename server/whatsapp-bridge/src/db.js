@@ -2,9 +2,13 @@
  * Postgres connection and message/contact upsert logic.
  *
  * Schema is owned by the Python server (SQLAlchemy + Alembic).
- * `whatsapp_messages.user_id` has DEFAULT 1, so the bridge omits it and lets
- * the DB fill it in. Composite unique key is (user_id, message_id) — the
- * ON CONFLICT target must match.
+ *
+ * `user_id` is written EXPLICITLY (from the USER_ID env var), not left to the
+ * column default. One Baileys session is one phone number is one user, so a
+ * second bridge container must not inherit the DEFAULT 1 and silently file
+ * its messages under the first user. Both `whatsapp_messages` and
+ * `whatsapp_contacts` are keyed (user_id, ...) — the ON CONFLICT targets
+ * must match those composite constraints.
  */
 
 import pg from "pg";
@@ -12,6 +16,22 @@ import pg from "pg";
 const { Pool } = pg;
 
 let pool;
+
+/**
+ * Which comar user this bridge belongs to. Defaults to 1 so an existing
+ * single-bridge deployment keeps working unchanged, but a bad value is fatal
+ * rather than silently coerced: filing one person's messages under another is
+ * not something to discover later from the data.
+ */
+export const USER_ID = (() => {
+  const raw = process.env.USER_ID;
+  if (raw === undefined || raw === "") return 1;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`USER_ID must be a positive integer, got ${JSON.stringify(raw)}`);
+  }
+  return parsed;
+})();
 
 export function initDb() {
   const connectionString = process.env.DATABASE_URL;
@@ -38,19 +58,23 @@ export async function ensureTables() {
   // loudly at startup instead of silently dropping every insert.
   const client = await pool.connect();
   try {
-    const { rows } = await client.query(`
-      SELECT conname FROM pg_constraint
-      WHERE conrelid = 'whatsapp_messages'::regclass
-        AND contype = 'u'
-        AND conname = 'uq_wa_user_msg'
-    `);
-    if (rows.length === 0) {
-      throw new Error(
-        "whatsapp_messages is missing the uq_wa_user_msg unique constraint. " +
-        "Run Alembic migrations on the Python server before starting the bridge.",
+    for (const [table, constraint] of [
+      ["whatsapp_messages", "uq_wa_user_msg"],
+      ["whatsapp_contacts", "uq_wa_user_contact"],
+    ]) {
+      const { rows } = await client.query(
+        `SELECT conname FROM pg_constraint
+          WHERE conrelid = $1::regclass AND contype = 'u' AND conname = $2`,
+        [table, constraint],
       );
+      if (rows.length === 0) {
+        throw new Error(
+          `${table} is missing the ${constraint} unique constraint. ` +
+          "Run Alembic migrations on the Python server before starting the bridge.",
+        );
+      }
     }
-    console.log("Schema check passed: uq_wa_user_msg present");
+    console.log(`Schema check passed (user_id=${USER_ID})`);
   } finally {
     client.release();
   }
@@ -61,12 +85,13 @@ export async function upsertMessage(msg) {
   try {
     await client.query(
       `INSERT INTO whatsapp_messages
-        (message_id, chat_id, chat_name, sender_id, sender_name,
+        (user_id, message_id, chat_id, chat_name, sender_id, sender_name,
          is_group, timestamp, message_type, body, media_caption,
          is_from_me, reply_to_id, raw_json)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        ON CONFLICT (user_id, message_id) DO NOTHING`,
       [
+        USER_ID,
         msg.messageId,
         msg.chatId,
         msg.chatName,
@@ -91,14 +116,15 @@ export async function upsertContact(contact) {
   const client = await pool.connect();
   try {
     await client.query(
-      `INSERT INTO whatsapp_contacts (jid, name, notify_name, is_group, last_message_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
-       ON CONFLICT (jid) DO UPDATE SET
+      `INSERT INTO whatsapp_contacts (user_id, jid, name, notify_name, is_group, last_message_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       ON CONFLICT (user_id, jid) DO UPDATE SET
          name = COALESCE(EXCLUDED.name, whatsapp_contacts.name),
          notify_name = COALESCE(EXCLUDED.notify_name, whatsapp_contacts.notify_name),
          last_message_at = GREATEST(EXCLUDED.last_message_at, whatsapp_contacts.last_message_at),
          updated_at = NOW()`,
       [
+        USER_ID,
         contact.jid,
         contact.name,
         contact.notifyName,
@@ -125,9 +151,10 @@ export async function upsertMessageBatch(messages) {
 
       for (const msg of batch) {
         values.push(
-          `($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++})`
+          `($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++})`
         );
         params.push(
+          USER_ID,
           msg.messageId, msg.chatId, msg.chatName, msg.senderId,
           msg.senderName, msg.isGroup, msg.timestamp, msg.messageType,
           msg.body, msg.mediaCaption, msg.isFromMe, msg.replyToId,
@@ -137,7 +164,7 @@ export async function upsertMessageBatch(messages) {
 
       const result = await client.query(
         `INSERT INTO whatsapp_messages
-          (message_id, chat_id, chat_name, sender_id, sender_name,
+          (user_id, message_id, chat_id, chat_name, sender_id, sender_name,
            is_group, timestamp, message_type, body, media_caption,
            is_from_me, reply_to_id, raw_json)
          VALUES ${values.join(", ")}
@@ -158,14 +185,14 @@ export async function upsertContactBatch(contacts) {
   try {
     for (const contact of contacts) {
       await client.query(
-        `INSERT INTO whatsapp_contacts (jid, name, notify_name, is_group, last_message_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, NOW())
-         ON CONFLICT (jid) DO UPDATE SET
+        `INSERT INTO whatsapp_contacts (user_id, jid, name, notify_name, is_group, last_message_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())
+         ON CONFLICT (user_id, jid) DO UPDATE SET
            name = COALESCE(EXCLUDED.name, whatsapp_contacts.name),
            notify_name = COALESCE(EXCLUDED.notify_name, whatsapp_contacts.notify_name),
            last_message_at = GREATEST(EXCLUDED.last_message_at, whatsapp_contacts.last_message_at),
            updated_at = NOW()`,
-        [contact.jid, contact.name, contact.notifyName, contact.isGroup, contact.lastMessageAt]
+        [USER_ID, contact.jid, contact.name, contact.notifyName, contact.isGroup, contact.lastMessageAt]
       );
     }
   } finally {

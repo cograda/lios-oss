@@ -2,7 +2,7 @@
 
 Seeded with two rows by the multi-user migration:
     (1, 'alex',  'Alex')
-    (2, 'sam',  'Sam')
+    (2, 'sam', 'Sam')
 
 `name` is the canonical short identifier (lowercase, used in code paths
 like `Daily Notes/Alex/`). `display_name` is for UI rendering.
@@ -27,6 +27,12 @@ class User(Base):
     name: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     display_name: Mapped[str] = mapped_column(String(100))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    # The only role concept (2026-09-06, "one credential"): an admin may mint
+    # and revoke bearers, purge data, change integration config, and read
+    # other people's logs and preferences on the dashboard. Everyone else is
+    # a signed-in household member. Gated by `app/auth/ui_session.py::
+    # require_admin`, which also carries the route-by-route classification.
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -38,6 +44,15 @@ class User(Base):
     # from "daemon dead".
     reminders_verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # Tone for server-rendered prose (MCP instructions, morning briefing
+    # framing where such text exists): "direct" (default, Alex — concise,
+    # direct, current behavior) or "curious" (Sam — warm/curious, patterns
+    # surfaced as questions, no guilt-inducing framing around missed
+    # tasks/streaks). See sam-rollout Plan D2.
+    voice_profile: Mapped[str] = mapped_column(
+        String(20), default="direct", server_default="direct"
     )
 
     def __repr__(self) -> str:

@@ -4,37 +4,26 @@ import base64
 import logging
 
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from sqlalchemy.orm import Session
 
 from app.auth.oauth import get_credentials
-from app.errors import PermanentError, TransientError
+from app.errors import PermanentError
+from app.plugin.sync_runtime import classify_exc
 
 logger = logging.getLogger(__name__)
 
 # Gmail API batch limit
 BATCH_SIZE = 50
 
+# See google_calendar/client.py::_classify — same rationale: get_credentials
+# already raises NeedsReauthError before any HTTP call for a dead refresh
+# token, so a 401/403 reaching classify_exc means something else (disabled
+# API, insufficient scope) and should stay a plain PermanentError.
+_OVERRIDES = {401: PermanentError, 403: PermanentError}
 
-def _classify_http_error(exc: Exception, context: str) -> Exception:
-    """Map a googleapiclient/network failure to TransientError or PermanentError.
 
-    Returns the exception to raise (chained `from exc` by the caller). Auth
-    failures that mean "needs re-auth" are already handled upstream by
-    `get_credentials` (raises `NeedsReauthError` before the API call is ever
-    made) — a 401/403 reaching this point means something else is wrong
-    (API disabled, insufficient scope, etc.), still permanent but distinct.
-    """
-    if isinstance(exc, HttpError):
-        status = getattr(exc.resp, "status", None)
-        if status in (401, 403):
-            return PermanentError(f"{context}: HTTP {status} ({exc.reason})")
-        if status == 429 or (status is not None and status >= 500):
-            return TransientError(f"{context}: HTTP {status} ({exc.reason})")
-        return exc
-    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
-        return TransientError(f"{context}: {exc}")
-    return exc
+def _classify(exc: Exception, context: str) -> Exception:
+    return classify_exc(exc, context, provider="google", overrides=_OVERRIDES)
 
 
 def get_gmail_service(account_email: str, session: Session, *, user_id: int):
@@ -107,7 +96,202 @@ def list_message_ids(
         # would report 0 synced as a *success*. Raise (typed + chained) so
         # the scheduler can tell a real failure from an empty inbox.
         logger.exception(f"Failed to list messages for {account_email}")
-        raise _classify_http_error(exc, f"list_message_ids for {account_email}") from exc
+        raise _classify(exc, f"list_message_ids for {account_email}") from exc
+
+
+def list_attachment_candidates_page(
+    account_email: str,
+    session: Session,
+    *,
+    user_id: int,
+    page_token: str | None = None,
+    max_results: int = 100,
+) -> tuple[list[str], str | None]:
+    """One page of `has:attachment` message ids (id-only, no payload fetched).
+
+    Unlike `list_message_ids`, this does NOT loop through every page — it
+    returns exactly one page plus Gmail's `nextPageToken` so callers can
+    persist the token as a resumable cursor (see
+    `attachments/scan.py::scan_gmail`). Cheap: this is the same
+    `messages.list` call `list_message_ids` makes, just not looped.
+    """
+    service = get_gmail_service(account_email, session, user_id=user_id)
+    if service is None:
+        return [], None
+
+    try:
+        kwargs: dict = {"userId": "me", "maxResults": max_results, "q": "has:attachment"}
+        if page_token:
+            kwargs["pageToken"] = page_token
+        response = service.users().messages().list(**kwargs).execute()
+    except Exception as exc:
+        logger.exception(f"Failed to list attachment candidates for {account_email}")
+        raise _classify(
+            exc, f"list_attachment_candidates_page for {account_email}"
+        ) from exc
+
+    ids = [m["id"] for m in response.get("messages", [])]
+    return ids, response.get("nextPageToken")
+
+
+def fetch_messages_full(
+    account_email: str,
+    session: Session,
+    message_ids: list[str],
+    *,
+    user_id: int,
+) -> list[dict]:
+    """Batch-fetch full messages (format='full') and extract attachment parts.
+
+    Unlike `fetch_messages_metadata` (format='metadata', headers only —
+    `payload.parts` is stripped by the API at that format), this pulls the
+    complete MIME structure so attachment filename/mimetype/size/attachmentId
+    can be recovered. Costs ~10x metadata format in API quota — callers
+    should only pass ids that genuinely need it (see scan.py's bounded
+    candidate selection).
+
+    Returns list of dicts: {google_message_id, thread_id, subject, sender,
+    date (header string), internal_date (epoch ms int or None), attachments
+    (list of {filename, mime_type, size_bytes, attachment_id})}.
+    """
+    service = get_gmail_service(account_email, session, user_id=user_id)
+    if service is None:
+        return []
+
+    results = []
+
+    for i in range(0, len(message_ids), BATCH_SIZE):
+        chunk = message_ids[i : i + BATCH_SIZE]
+        batch_results = {}
+
+        def _callback(request_id, response, exception):
+            if exception:
+                logger.warning(f"Batch full-fetch failed for {request_id}: {exception}")
+            else:
+                batch_results[request_id] = response
+
+        batch = service.new_batch_http_request(callback=_callback)
+        for msg_id in chunk:
+            batch.add(
+                service.users().messages().get(userId="me", id=msg_id, format="full"),
+                request_id=msg_id,
+            )
+
+        try:
+            batch.execute()
+        except Exception:
+            logger.exception(f"Batch full-fetch execute failed for chunk starting at {i}")
+            continue
+
+        for msg_id in chunk:
+            if msg_id not in batch_results:
+                continue
+            msg = batch_results[msg_id]
+            payload = msg.get("payload", {})
+            headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+            internal_date = msg.get("internalDate")
+            results.append({
+                "google_message_id": msg["id"],
+                "thread_id": msg.get("threadId", ""),
+                "subject": headers.get("subject"),
+                "sender": headers.get("from"),
+                "date": headers.get("date"),
+                "internal_date": int(internal_date) if internal_date else None,
+                "attachments": _walk_attachment_parts(payload),
+            })
+
+    return results
+
+
+class GmailAttachmentGone(PermanentError):
+    """`users.messages.attachments.get` returned 404 for this (message, attachment).
+
+    Gmail `attachmentId`s are not stable forever — the API documents them as
+    opaque and they are observed to change (a fresh `format='full'` fetch of
+    the same message returns a different id). A 404 therefore usually means
+    "the id we recorded at scan time has rotated", not "the message is gone",
+    which is why this is its own type: `attachments/ingest.py` needs to
+    distinguish it from every other permanent failure to (a) try the user's
+    other accounts when the row does not record which mailbox it came from
+    and (b) write a skip_reason that says what actually happened.
+    """
+
+
+def fetch_attachment(
+    account_email: str,
+    session: Session,
+    message_id: str,
+    attachment_id: str,
+    *,
+    user_id: int,
+) -> bytes | None:
+    """Download one attachment's bytes via `users.messages.attachments.get`.
+
+    The only Gmail call that returns attachment *content*; everything else
+    in this module returns structure. Gmail hands the body back as
+    base64url (`-`/`_` alphabet, padding optional), so it is decoded here —
+    callers get raw file bytes.
+
+    Uses the same `get_gmail_service` / `get_credentials` path as every
+    other call here, scoped to `user_id` — the token used is always the
+    mailbox owner's. Returns None when no credentials are stored for
+    `(user_id, account_email)`; raises `GmailAttachmentGone` on 404 and the
+    usual classified error otherwise.
+    """
+    service = get_gmail_service(account_email, session, user_id=user_id)
+    if service is None:
+        return None
+
+    try:
+        response = (
+            service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=message_id, id=attachment_id)
+            .execute()
+        )
+    except Exception as exc:
+        if getattr(getattr(exc, "resp", None), "status", None) == 404:
+            raise GmailAttachmentGone(
+                f"Gmail attachment {attachment_id[:12]}… on message {message_id} "
+                f"not found in {account_email} (404)"
+            ) from exc
+        logger.exception(f"Failed to fetch attachment on {message_id} for {account_email}")
+        raise _classify(exc, f"fetch_attachment for {account_email}") from exc
+
+    data = response.get("data") or ""
+    # base64url with optional padding: urlsafe_b64decode requires the
+    # padding Gmail omits, so restore it before decoding.
+    data += "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data)
+
+
+def _walk_attachment_parts(payload: dict) -> list[dict]:
+    """Recursively walk a message payload's MIME tree, collecting attachments.
+
+    A part counts as an attachment when it carries both a filename AND a
+    `body.attachmentId` — inline content referenced by `Content-ID` (e.g.
+    embedded logos) has a filename-less body with inline data instead and is
+    skipped, since there's nothing to fetch bytes for later via
+    `users.messages.attachments.get`. Handles arbitrary multipart nesting
+    (e.g. multipart/mixed containing multipart/alternative containing the
+    actual text parts, with the attachment as a mixed-level sibling part).
+    """
+    found = []
+    filename = payload.get("filename")
+    body = payload.get("body") or {}
+    attachment_id = body.get("attachmentId")
+    if filename and attachment_id:
+        size = body.get("size")
+        found.append({
+            "filename": filename,
+            "mime_type": payload.get("mimeType"),
+            "size_bytes": int(size) if isinstance(size, (int, str)) and str(size).isdigit() else None,
+            "attachment_id": attachment_id,
+        })
+    for part in payload.get("parts") or []:
+        found.extend(_walk_attachment_parts(part))
+    return found
 
 
 def fetch_messages_metadata(

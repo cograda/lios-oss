@@ -9,7 +9,13 @@ import pytest
 
 from app.auth.context import _current_user_id, use_user
 from app.services import embedding as emb
-from app.services.embedding import Embedding, EmbeddingQueue, EmbeddingService
+from app.services.embedding import (
+    Embedding,
+    EmbeddingQueue,
+    EmbeddingService,
+    EmbeddingVecBgeSmall384,
+    EmbeddingVecGemini1536,
+)
 
 pytestmark = pytest.mark.db
 
@@ -20,6 +26,24 @@ def _vec(x: float = 1.0) -> list[float]:
     v[0] = x
     v[1] = 1.0 - abs(x)
     return v
+
+
+def _seed(session, source, source_id, user_id, text, vec, content_hash):
+    """Insert a chunk plus its vector in the local space.
+
+    Since Phase 2 the vector lives in a per-space table rather than on
+    `embeddings`, so seeding takes two rows and a flush to get the id.
+    """
+    row = Embedding(
+        source=source, source_id=source_id, user_id=user_id,
+        chunk_text=text, content_hash=content_hash,
+    )
+    session.add(row)
+    session.flush()
+    session.add(EmbeddingVecBgeSmall384(
+        embedding_id=row.id, embedding=vec, model_name=emb.MODEL_NAME,
+    ))
+    return row
 
 
 @pytest.fixture
@@ -110,6 +134,57 @@ def test_reembed_replaces_old_vector(db_session, fake_embedder):
     assert rows[0].chunk_text == "v2"
 
 
+def test_reembed_batch_only_replaces_matching_rows(db_session, fake_embedder):
+    """P5 (hardening-2026-08.md): the supersede-delete pass batches every
+    item in a `_embed_and_store` call into one statement (a composite
+    `tuple_(source, source_id).in_(...)` DELETE) instead of one DELETE per
+    item. Prove the batching didn't turn into "delete everything in the
+    batch's tables" — each of three sources gets re-embedded in the same
+    `process_queue` call, and only the row matching its own (source,
+    source_id) should be replaced; the other two must survive untouched.
+    """
+    for sid, text in [("a.md", "v1"), ("b.md", "v1"), ("c.md", "v1")]:
+        EmbeddingService.enqueue(db_session, "vault", sid, text)
+    assert EmbeddingService.process_queue(db_session) == 3
+
+    # Re-embed all three as a single batch (one process_queue call = one
+    # _embed_and_store call over all pending rows).
+    for sid, text in [("a.md", "v2"), ("b.md", "v2"), ("c.md", "v2")]:
+        EmbeddingService.enqueue(db_session, "vault", sid, text)
+    assert EmbeddingService.process_queue(db_session) == 3
+
+    rows = db_session.query(Embedding).filter_by(source="vault").all()
+    by_id = {r.source_id: r.chunk_text for r in rows}
+    assert by_id == {"a.md": "v2", "b.md": "v2", "c.md": "v2"}
+    assert len(rows) == 3  # no duplicates, no cross-item deletion
+
+
+def test_reembed_replaces_only_the_same_users_row(db_session, fake_embedder):
+    """Identity is (source, source_id, user_id) — two users' vaults both hold
+    `Inbox/note.md`. The supersede-delete keyed on (source, source_id) alone,
+    so re-embedding Alex's note deleted Sam's row for the same path
+    (2026-09-06 scoping audit). The household-shared row (user_id NULL) must
+    still be superseded by its own re-embed: SQL NULL never equals NULL, so
+    a naive third tuple member would have left it duplicated forever."""
+    EmbeddingService.enqueue(db_session, "vault", "Inbox/note.md", "alex v1", user_id=1)
+    EmbeddingService.enqueue(db_session, "vault", "Inbox/note.md", "sam v1", user_id=2)
+    EmbeddingService.enqueue(db_session, "vault", "Shared.md", "shared v1")
+    assert EmbeddingService.process_queue(db_session) == 3
+
+    EmbeddingService.enqueue(db_session, "vault", "Inbox/note.md", "alex v2", user_id=1)
+    EmbeddingService.enqueue(db_session, "vault", "Shared.md", "shared v2")
+    assert EmbeddingService.process_queue(db_session) == 2
+
+    rows = db_session.query(Embedding).filter_by(source="vault").all()
+    by_key = {(r.source_id, r.user_id): r.chunk_text for r in rows}
+    assert by_key == {
+        ("Inbox/note.md", 1): "alex v2",
+        ("Inbox/note.md", 2): "sam v1",  # survives a neighbour's re-embed
+        ("Shared.md", None): "shared v2",  # replaced, not duplicated
+    }
+    assert len(rows) == 3
+
+
 def test_orphaned_processing_items_are_reclaimed(db_session, fake_embedder):
     EmbeddingService.enqueue(db_session, "vault", "a.md", "abandoned")
     db_session.query(EmbeddingQueue).update({"status": "processing"})
@@ -169,17 +244,9 @@ def seeded_search(db_session, monkeypatch):
 
     monkeypatch.setattr(emb, "get_model", lambda: _FakeModel())
 
-    db_session.add_all([
-        Embedding(source="email", source_id="u1-mail", user_id=1,
-                  chunk_text="user one secret", embedding=_vec(1.0),
-                  content_hash="h1"),
-        Embedding(source="email", source_id="u2-mail", user_id=2,
-                  chunk_text="user two secret", embedding=_vec(0.95),
-                  content_hash="h2"),
-        Embedding(source="vault", source_id="shared.md", user_id=None,
-                  chunk_text="household note", embedding=_vec(0.9),
-                  content_hash="h3"),
-    ])
+    _seed(db_session, "email", "u1-mail", 1, "user one secret", _vec(1.0), "h1")
+    _seed(db_session, "email", "u2-mail", 2, "user two secret", _vec(0.95), "h2")
+    _seed(db_session, "vault", "shared.md", None, "household note", _vec(0.9), "h3")
     db_session.commit()
     return db_session
 
@@ -236,3 +303,566 @@ def test_delete_source_removes_vector_and_pending(db_session, fake_embedder):
         db_session.query(EmbeddingQueue)
         .filter_by(source_id="a.md", status="pending").count() == 0
     )
+
+
+def test_stats_reports_per_space_coverage(db_session, fake_embedder):
+    """Phase 2: coverage is per space, and `missing` is the backfill's worklist."""
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    EmbeddingService.process_queue(db_session)
+
+    stats = EmbeddingService.stats(db_session)
+    spaces = {s["provider"]: s for s in stats["spaces"]}
+
+    # The configured local space has the row...
+    local = spaces["fastembed-bge-small"]
+    assert local["vectors"] == 1
+    assert local["missing"] == 0
+    assert local["by_model"] == {emb.MODEL_NAME: 1}
+    assert local["active"] is True
+
+    # ...and the unconfigured one is reported as an empty, inactive gap rather
+    # than omitted — a space you can't see is a backfill you never run.
+    remote = spaces["gemini-embedding-2"]
+    assert remote["vectors"] == 0
+    assert remote["missing"] == 1
+    assert remote["active"] is False
+
+
+def test_same_source_id_for_two_users_stays_separate(db_session, fake_embedder):
+    """Two vaults both holding `Inbox/note.md` must not collide.
+
+    Identity is (source, source_id, user_id): the second enqueue is a
+    different item, not a duplicate of the first, and deleting one owner's
+    copy must leave the other's intact.
+    """
+    assert EmbeddingService.enqueue(
+        db_session, "vault", "Inbox/note.md", "alex's note", user_id=1,
+    )
+    assert EmbeddingService.enqueue(
+        db_session, "vault", "Inbox/note.md", "sam's note", user_id=2,
+    )
+    EmbeddingService.process_queue(db_session)
+    db_session.commit()
+
+    owners = {
+        e.user_id
+        for e in db_session.query(Embedding).filter_by(source_id="Inbox/note.md").all()
+    }
+    assert owners == {1, 2}
+
+    # Scoped delete removes only the named owner's copy.
+    EmbeddingService.delete_source(
+        db_session, "vault", "Inbox/note.md", 1, scope_user=True,
+    )
+    db_session.commit()
+
+    survivors = db_session.query(Embedding).filter_by(source_id="Inbox/note.md").all()
+    assert [e.user_id for e in survivors] == [2]
+
+
+def test_vault_search_does_not_cross_vaults(db_session, fake_embedder, monkeypatch):
+    """Regression: vault chunks were enqueued with no owner (NULL = shared),
+    so a second user's vault_search returned the first user's whole vault."""
+    class _FakeModel:
+        def embed(self, texts):
+            import numpy as np
+            return [np.array(_vec(1.0), dtype=np.float32) for _ in texts]
+
+    monkeypatch.setattr(emb, "get_model", lambda: _FakeModel())
+
+    EmbeddingService.enqueue(
+        db_session, "vault", "Health/MRI.md", "private knee report", user_id=1,
+    )
+    EmbeddingService.enqueue(
+        db_session, "vault", "Notes/greenhouse.md", "greenhouse plan", user_id=2,
+    )
+    EmbeddingService.process_queue(db_session)
+    db_session.commit()
+
+    with use_user(2):
+        ids = {
+            r["source_id"]
+            for r in EmbeddingService.search(db_session, "anything", sources=["vault"])
+        }
+    assert ids == {"Notes/greenhouse.md"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — multiple vector spaces
+# ---------------------------------------------------------------------------
+
+class _FakeRemoteProvider:
+    """Stands in for GeminiEmbeddingProvider: a 1536-dim remote space.
+
+    Deliberately NOT a FastEmbedProvider subclass, so it exercises the other
+    branch of `_embed_with`/`_embed_query_with` — the one that calls the
+    provider directly instead of shelling out to the subprocess.
+    """
+
+    provider_id = "gemini-embedding-2"
+    model_name = "gemini-embedding-2"
+    dim = 1536
+
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.queries: list[str] = []
+
+    def available(self) -> bool:
+        return True
+
+    def _v(self, x: float = 1.0) -> list[float]:
+        v = [0.0] * self.dim
+        v[0] = x
+        return v
+
+    def embed(self, texts):
+        if self.fail:
+            raise RuntimeError("remote space is down")
+        return [self._v() for _ in texts]
+
+    def embed_query(self, text):
+        self.queries.append(text)
+        if self.fail:
+            raise RuntimeError("remote space is down")
+        return self._v()
+
+
+@pytest.fixture
+def two_spaces(monkeypatch, fake_embedder):
+    """Configure both spaces, remote first (the production ordering)."""
+    from app.plugin.embedding_provider import FastEmbedProvider
+
+    remote = _FakeRemoteProvider()
+    monkeypatch.setattr(emb, "_active_spaces", lambda: [
+        (remote, EmbeddingVecGemini1536),
+        (FastEmbedProvider(), EmbeddingVecBgeSmall384),
+    ])
+    return remote
+
+
+def test_processor_writes_primary_space_only(db_session, two_spaces):
+    """process_queue's own default is "primary" (2026-09-07): only the
+    first-configured (search-default) space is written; the other is left
+    for the nightly `embedding_space_backfill` job."""
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    assert EmbeddingService.process_queue(db_session) == 1
+
+    row = db_session.query(Embedding).filter_by(source_id="a.md").one()
+    assert db_session.query(EmbeddingVecGemini1536).filter_by(
+        embedding_id=row.id).count() == 1
+    assert db_session.query(EmbeddingVecBgeSmall384).filter_by(
+        embedding_id=row.id).count() == 0
+
+    spaces = {s["provider"]: s for s in EmbeddingService.stats(db_session)["spaces"]}
+    assert spaces["fastembed-bge-small"]["missing"] == 1
+
+
+def test_primary_failure_falls_back_and_is_counted(db_session, monkeypatch, fake_embedder):
+    """Primary space down for a batch -> falls back to the next available
+    space so the item is searchable today, and the fallback is counted in
+    the `stats` dict a caller passes in (this is what the run summary reads)."""
+    from app.plugin.embedding_provider import FastEmbedProvider
+
+    monkeypatch.setattr(emb, "_active_spaces", lambda: [
+        (_FakeRemoteProvider(fail=True), EmbeddingVecGemini1536),
+        (FastEmbedProvider(), EmbeddingVecBgeSmall384),
+    ])
+
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    stats: dict = {}
+    assert EmbeddingService.process_queue(db_session, stats=stats) == 1
+    assert stats["fallback"] == 1
+
+    row = db_session.query(Embedding).filter_by(source_id="a.md").one()
+    assert db_session.query(EmbeddingVecBgeSmall384).filter_by(
+        embedding_id=row.id).count() == 1
+    assert db_session.query(EmbeddingVecGemini1536).count() == 0
+
+
+def test_rate_limited_primary_does_not_fall_back(db_session, monkeypatch, fake_embedder):
+    """A GeminiRateLimitError (a 429 that outlasted its own wait budget) must
+    NOT fall back to the local space — see `GeminiRateLimitError`'s docstring:
+    falling back to the ~1s/item CPU model for a per-minute quota is what made
+    the 2026-09-07 run slower than simply waiting. The item is left pending
+    for the next tick instead, same as any other failed batch."""
+    from app.plugin.embedding_provider import FastEmbedProvider, GeminiRateLimitError
+
+    class _RateLimited(_FakeRemoteProvider):
+        def embed(self, texts):
+            raise GeminiRateLimitError("still rate-limited after 240s")
+
+    monkeypatch.setattr(emb, "_active_spaces", lambda: [
+        (_RateLimited(), EmbeddingVecGemini1536),
+        (FastEmbedProvider(), EmbeddingVecBgeSmall384),
+    ])
+
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    stats: dict = {}
+    assert EmbeddingService.process_queue(db_session, stats=stats) == 0
+    assert "fallback" not in stats
+
+    assert db_session.query(Embedding).count() == 0
+    assert db_session.query(EmbeddingVecBgeSmall384).count() == 0
+    row = db_session.query(EmbeddingQueue).filter_by(source_id="a.md").one()
+    assert row.status == "pending"
+    assert row.attempts == 1
+
+
+def test_both_spaces_are_written(db_session, two_spaces):
+    """`spaces="all"` still writes every active space (process_queue's own
+    default became "primary" 2026-09-07 — see test_processor_writes_primary_
+    space_only above for that default)."""
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    assert EmbeddingService.process_queue(db_session, spaces="all") == 1
+
+    row = db_session.query(Embedding).filter_by(source_id="a.md").one()
+    assert db_session.query(EmbeddingVecGemini1536).filter_by(
+        embedding_id=row.id).count() == 1
+    assert db_session.query(EmbeddingVecBgeSmall384).filter_by(
+        embedding_id=row.id).count() == 1
+
+
+def test_one_space_failing_does_not_block_the_other(db_session, monkeypatch, fake_embedder):
+    """A remote outage must not stop the local space embedding.
+
+    This is the whole point of keeping a local fallback — requiring every
+    space would make the remote provider a single point of failure for the
+    thing that exists to survive it.
+    """
+    from app.plugin.embedding_provider import FastEmbedProvider
+
+    monkeypatch.setattr(emb, "_active_spaces", lambda: [
+        (_FakeRemoteProvider(fail=True), EmbeddingVecGemini1536),
+        (FastEmbedProvider(), EmbeddingVecBgeSmall384),
+    ])
+
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    assert EmbeddingService.process_queue(db_session) == 1
+
+    row = db_session.query(Embedding).filter_by(source_id="a.md").one()
+    assert db_session.query(EmbeddingVecBgeSmall384).filter_by(
+        embedding_id=row.id).count() == 1
+    assert db_session.query(EmbeddingVecGemini1536).count() == 0
+
+    # The gap is visible and sized, not silent.
+    spaces = {s["provider"]: s for s in EmbeddingService.stats(db_session)["spaces"]}
+    assert spaces["gemini-embedding-2"]["missing"] == 1
+
+
+def test_all_spaces_failing_still_errors_the_item(db_session, monkeypatch):
+    """With no space succeeding, the old bisect/retry semantics must hold."""
+    monkeypatch.setattr(emb, "_active_spaces", lambda: [
+        (_FakeRemoteProvider(fail=True), EmbeddingVecGemini1536),
+    ])
+
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    for _ in range(emb.MAX_EMBED_ATTEMPTS):
+        EmbeddingService.process_queue(db_session)
+
+    assert db_session.query(EmbeddingQueue).filter_by(status="error").count() == 1
+    assert db_session.query(Embedding).count() == 0
+
+
+def test_search_answers_from_the_first_space_and_names_it(db_session, two_spaces):
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    EmbeddingService.process_queue(db_session)
+
+    results = EmbeddingService.search(db_session, "anything", sources=["vault"])
+
+    assert [r["source_id"] for r in results] == ["a.md"]
+    # Answered by the remote space, and says so — a fallback that doesn't
+    # announce itself reads as the primary model quietly degrading.
+    assert results[0]["space"] == "gemini-embedding-2"
+    assert two_spaces.queries == ["anything"]
+
+
+def test_search_falls_through_to_the_local_space(db_session, monkeypatch, fake_embedder):
+    """Primary configured but broken → answer from the fallback, and say so."""
+    from app.plugin.embedding_provider import FastEmbedProvider
+
+    class _FakeModel:
+        def embed(self, texts):
+            import numpy as np
+            return [np.array(_vec(1.0), dtype=np.float32) for _ in texts]
+
+    monkeypatch.setattr(emb, "get_model", lambda: _FakeModel())
+
+    working = _FakeRemoteProvider()
+    monkeypatch.setattr(emb, "_active_spaces", lambda: [
+        (working, EmbeddingVecGemini1536),
+        (FastEmbedProvider(), EmbeddingVecBgeSmall384),
+    ])
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    # spaces="all": this test needs the local space already backfilled so
+    # search can fall through to it below — process_queue's own default is
+    # "primary" only (2026-09-07), which would leave the local space empty.
+    EmbeddingService.process_queue(db_session, spaces="all")
+
+    # Now the remote provider goes down for querying only.
+    working.fail = True
+    results = EmbeddingService.search(db_session, "anything", sources=["vault"])
+
+    assert [r["source_id"] for r in results] == ["a.md"]
+    assert results[0]["space"] == emb.MODEL_NAME
+
+
+def test_search_skips_a_configured_but_unbackfilled_space(db_session, monkeypatch, fake_embedder):
+    """A space with zero vectors must not answer every query with nothing.
+
+    This is the state right after adding a provider and before the backfill
+    runs — the most likely moment for search to silently go blank.
+    """
+    from app.plugin.embedding_provider import FastEmbedProvider
+
+    class _FakeModel:
+        def embed(self, texts):
+            import numpy as np
+            return [np.array(_vec(1.0), dtype=np.float32) for _ in texts]
+
+    monkeypatch.setattr(emb, "get_model", lambda: _FakeModel())
+
+    # Write to the local space only...
+    monkeypatch.setattr(emb, "_active_spaces", lambda: [
+        (FastEmbedProvider(), EmbeddingVecBgeSmall384),
+    ])
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    EmbeddingService.process_queue(db_session)
+
+    # ...then bring an empty remote space online ahead of it.
+    remote = _FakeRemoteProvider()
+    monkeypatch.setattr(emb, "_active_spaces", lambda: [
+        (remote, EmbeddingVecGemini1536),
+        (FastEmbedProvider(), EmbeddingVecBgeSmall384),
+    ])
+
+    results = EmbeddingService.search(db_session, "anything", sources=["vault"])
+    assert [r["source_id"] for r in results] == ["a.md"]
+    assert results[0]["space"] == emb.MODEL_NAME
+    assert remote.queries == []  # never even embedded the query
+
+
+def test_deleting_a_chunk_cascades_to_every_space(db_session, two_spaces):
+    """Vector rows go with their chunk via ON DELETE CASCADE.
+
+    Structural on purpose: a third space must not require remembering to add
+    another cleanup call to delete_source().
+    """
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    EmbeddingService.process_queue(db_session, spaces="all")
+
+    EmbeddingService.delete_source(db_session, "vault", "a.md")
+    db_session.commit()
+
+    assert db_session.query(EmbeddingVecGemini1536).count() == 0
+    assert db_session.query(EmbeddingVecBgeSmall384).count() == 0
+
+
+def test_reembed_leaves_exactly_one_vector_per_space(db_session, two_spaces):
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "v1")
+    EmbeddingService.process_queue(db_session, spaces="all")
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "v2")
+    EmbeddingService.process_queue(db_session, spaces="all")
+
+    assert db_session.query(Embedding).filter_by(source_id="a.md").count() == 1
+    assert db_session.query(EmbeddingVecGemini1536).count() == 1
+    assert db_session.query(EmbeddingVecBgeSmall384).count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Single-flight
+# ---------------------------------------------------------------------------
+
+def test_process_queue_is_single_flight_across_connections(db_session, fake_embedder, pg_url):
+    """Two concurrent fastembed subprocesses take the 7.8 GB server to ~350 MB
+    available and it thrashes to a standstill, with Postgres on the same box.
+    Observed twice: the scheduled cron racing a manual drain.
+
+    The old code claimed to be single-flight because the scheduler runs it with
+    `max_instances=1` — a property of one APScheduler job, not of this function.
+    """
+    from sqlalchemy import create_engine, text
+
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    db_session.commit()
+
+    # A separate connection holds the lock, standing in for the other process.
+    other = create_engine(pg_url)
+    with other.connect() as conn:
+        held = conn.execute(
+            text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": emb._QUEUE_LOCK_KEY}
+        ).scalar()
+        assert held is True
+
+        assert EmbeddingService.process_queue(db_session) == 0
+        # The item is untouched, not consumed or half-processed.
+        assert db_session.query(EmbeddingQueue).filter_by(status="pending").count() == 1
+
+    other.dispose()
+
+    # Lock released with that connection — normal service resumes.
+    assert EmbeddingService.process_queue(db_session) == 1
+
+
+def test_process_queue_releases_its_lock(db_session, fake_embedder, pg_url):
+    from sqlalchemy import create_engine, text
+
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    db_session.commit()
+    EmbeddingService.process_queue(db_session)
+
+    other = create_engine(pg_url)
+    with other.connect() as conn:
+        assert conn.execute(
+            text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": emb._QUEUE_LOCK_KEY}
+        ).scalar() is True
+    other.dispose()
+
+
+def test_lock_is_released_even_when_a_batch_raises(db_session, monkeypatch, pg_url):
+    from sqlalchemy import create_engine, text
+
+    def boom(_texts):
+        raise MemoryError("simulating the actual failure mode")
+
+    monkeypatch.setattr(emb, "_embed_via_subprocess", boom)
+    EmbeddingService.enqueue(db_session, "vault", "a.md", "hello")
+    db_session.commit()
+
+    EmbeddingService.process_queue(db_session)  # swallowed by the bisect path
+
+    other = create_engine(pg_url)
+    with other.connect() as conn:
+        assert conn.execute(
+            text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": emb._QUEUE_LOCK_KEY}
+        ).scalar() is True
+    other.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Provider config access
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("key,expected", [("a-real-key", True), (None, False), ("", False)])
+def test_gemini_available_reads_the_typed_config_model(monkeypatch, key, expected):
+    """`plugin_config()` returns a typed pydantic model, not a dict.
+
+    The original code called `.get("gemini_api_key")` on it, which raises
+    AttributeError — and a broad `except Exception: return False` turned that
+    into a quiet "not configured". The bug's failure mode and the correct answer
+    for an unconfigured deployment were identical, which is why it shipped.
+    """
+    from pydantic import BaseModel
+
+    from app.plugin import embedding_provider as ep
+
+    class _Cfg(BaseModel):
+        gemini_api_key: str | None = None
+
+    monkeypatch.setattr(ep, "plugin_config", lambda name: _Cfg(gemini_api_key=key),
+                        raising=False)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "app.plugin.config_store",
+        type("m", (), {"plugin_config": staticmethod(lambda name: _Cfg(gemini_api_key=key))}),
+    )
+    assert ep.GeminiEmbeddingProvider().available() is expected
+
+
+def test_gemini_available_is_false_without_a_database(monkeypatch):
+    """Boot and unit-test contexts have no DB; that must read as unavailable
+    rather than exploding — but ONLY database errors are swallowed."""
+    from sqlalchemy.exc import OperationalError
+
+    def boom(_name):
+        raise OperationalError("select 1", {}, Exception("no db"))
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "app.plugin.config_store",
+        type("m", (), {"plugin_config": staticmethod(boom)}),
+    )
+    from app.plugin.embedding_provider import GeminiEmbeddingProvider
+
+    assert GeminiEmbeddingProvider().available() is False
+
+
+# ---------------------------------------------------------------------------
+# Retry classification
+# ---------------------------------------------------------------------------
+
+class _ApiError(Exception):
+    """Shape of google.genai's error: carries an HTTP `code`."""
+
+    def __init__(self, code, message="boom"):
+        super().__init__(message)
+        self.code = code
+
+
+@pytest.mark.parametrize("code,attempts", [
+    (400, 1),   # INVALID_ARGUMENT — the request is wrong; asking again won't fix it
+    (404, 1),   # wrong model name
+    (503, 3),   # server side
+])
+def test_gemini_retries_only_what_retrying_can_fix(monkeypatch, code, attempts):
+    """A permanent 4xx spent two minutes of backoff reaching a foregone answer.
+
+    Worse, it buried the cause under seven identical warnings: the real message
+    ("contains an empty Part") appeared eight times and read like flakiness.
+
+    429 is deliberately not in this table any more (2026-09-07) — it no
+    longer shares `max_retries` with these at all, see
+    `test_gemini_429_waits_and_never_falls_back_here` below.
+    """
+    from app.plugin.embedding_provider import GeminiEmbeddingProvider
+
+    p = GeminiEmbeddingProvider()
+    p.max_retries = 3
+    calls = []
+
+    class _Models:
+        def embed_content(self, **kw):
+            calls.append(kw)
+            raise _ApiError(code)
+
+    monkeypatch.setattr(p, "_get_client",
+                        lambda: type("C", (), {"models": _Models()})())
+    monkeypatch.setattr(p._limiter, "acquire", lambda n: None)
+    monkeypatch.setattr(p._limiter, "penalize", lambda s: None)
+
+    with pytest.raises(RuntimeError):
+        p._embed_batch(["hello"])
+
+    assert len(calls) == attempts
+
+
+def test_gemini_429_waits_and_never_falls_back_here(monkeypatch):
+    """429 no longer shares `max_retries`/exponential backoff with a genuine
+    failure (2026-09-07) — it waits, bounded by
+    `rate_limit_max_wait_seconds`, and raises `GeminiRateLimitError`
+    (a `RuntimeError` subclass) rather than the plain `RuntimeError` a
+    permanent 4xx or an exhausted 5xx raises. See
+    `test_rate_limited_primary_does_not_fall_back` above for the
+    no-fallback behaviour this exists to protect, and
+    `tests/test_gemini_embedding_provider.py` for the backoff/Retry-After
+    mechanics in detail.
+    """
+    from app.plugin.embedding_provider import GeminiEmbeddingProvider, GeminiRateLimitError
+
+    p = GeminiEmbeddingProvider()
+    p.rate_limit_max_wait_seconds = 0.01  # bounded, but real-clock fast
+    calls = []
+
+    class _Models:
+        def embed_content(self, **kw):
+            calls.append(kw)
+            raise _ApiError(429)
+
+    monkeypatch.setattr(p, "_get_client",
+                        lambda: type("C", (), {"models": _Models()})())
+    monkeypatch.setattr(p._limiter, "acquire", lambda n: None)
+    monkeypatch.setattr(p._limiter, "penalize", lambda s: None)
+
+    with pytest.raises(GeminiRateLimitError):
+        p._embed_batch(["hello"])
+
+    assert len(calls) >= 1

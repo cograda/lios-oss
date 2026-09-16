@@ -1,0 +1,146 @@
+<!-- GENERATED from server/backend/app/prompts/templates/youdoit.md.j2 via app.prompts.commands — do not hand-edit. Edit the template and run scripts/render_commands.py (or refetch GET /api/v1/commands). -->
+
+# You do it
+
+Find the tasks an agent session could take most of the way, and write the prompt that does each one.
+Usage: `/youdoit [program | project | "week" | "focus" | N]`
+
+Two ways in. **Flagged first:** Alex marks tasks in the loops app with one of three tags
+(the ⚡ menu on a row, or `y` to cycle), and the tag says *what kind* of taking he means:
+
+| tag | what he is asking for | what you produce |
+|---|---|---|
+| `#claude/do` | do the work | a prompt for the right session (Step 5), or the work itself if this is the right session |
+| `#claude/investigate` | find out, do not act | research the question and **append the findings as a note** (`tasks_note_add`), then say what decision it leaves him |
+| `#claude/fix` | the task line itself is the problem | rewrite it into a next action: `tasks_update` (title, description, project), `tasks_split` if it holds several actions, or say why it should be dropped |
+
+Those are not candidates to score — they are the queue, and the role is the instruction.
+(`#youdoit` was the single flag until 2026-09-03; existing rows became `#claude/do`.)
+**Then the scan**, scoped by the argument or over the open backlog, for tasks he has not
+flagged but that fit — those get scored as candidates for `do`.
+
+Ported from the work `taskdb` tool on 2026-09-02; the substance is unchanged, the tools are
+comar's (`tasks_query`, `tasks_update`, `tasks_history`) and the notes are a task's
+`description`, not a sidecar.
+
+## What this is for
+
+The backlog holds two kinds of work mixed together. Some of it needs Alex in the room,
+because the substance is a conversation, a decision, or a judgement about a person. The rest
+only needs someone to sit down and do it, and a lot of that is work an agent session can take
+most of the way.
+
+**This skill does not do the work.** The work lives in other repos — `lios/`, `hardware/`,
+the vault. It triages the backlog and writes the prompt to run in the right place. Alex pastes
+it into a session opened there. If the right place *is* this session (a vault note to draft,
+a `tasks_*` change), say so and offer to start.
+
+## Step 1: Gather
+
+1. `tasks_query(tag_prefix="#claude/", limit=100)` — the flagged queue, all three roles.
+   Handle each by its role (table above): `do` gets a prompt (Step 5) unless it is blocked,
+   in which case say what blocks it; `investigate` gets researched now and a note appended;
+   `fix` gets rewritten now. Read `tasks_notes(uid)` as well as the description — the dated
+   notes carry what has already happened.
+2. Then the scan: `tasks_query(...)` scoped to the argument (`program=`, `project=`,
+   `queue="week"|"focus"`), or unscoped with `limit=300`. Skip anything already flagged.
+3. `tasks_block(action="list")` once — a blocked task is not a candidate.
+
+**Read the description.** It carries the constraints, the half-decisions and the "what already
+exists" that a prompt needs to be worth anything. A task line alone is not enough to write
+from. Where a task's description is empty and the task looks promising, say the prompt would
+be a guess and ask for two lines of context rather than inventing them.
+
+## Step 2: Score each scanned task
+
+Two questions per task, in this order:
+
+1. How much of it could an agent session in the right repo actually finish?
+2. What does it need from Alex that the agent cannot supply?
+
+Sort into four buckets. Only the first two get presented.
+
+- **Most of it.** The output is a query, an analysis, a document draft, a verification result
+  or a code change, and everything needed to produce it already exists. Alex reviews the output.
+- **The first half.** The agent can produce the material, but the call at the end is his.
+  Pulling the numbers is the work; deciding what to do about them is not.
+- **The scaffolding only.** The agent can set up the file, the query skeleton or the doc
+  structure, and no more. Mention these as a group; do not write prompts unless asked.
+- **None of it.** Do not list these at all.
+
+**Shapes that score well:** a question answerable from comar's data with a tool call and a
+short write-up. Verification — is something true, who has access, is a field populated. Bug
+fixes and additions to code that already exists. Drafting a document where the source material
+is already written down. Pulling and preparing a dataset for someone else to use.
+
+**Shapes that score badly:** anything whose verb is schedule, ask, tell, push, chase, agree or
+decide. Anything gated on another person's answer. Anything where the hard part is knowing
+what Alex wants rather than doing the work.
+
+`energy` is a first filter, not the ruling: `deep` often qualifies; `quick` is usually faster
+to do by hand than to write a prompt for — leave those alone. A `context` of `errand` never
+qualifies.
+
+## Step 3: Route
+
+Name the target for each candidate:
+
+| work | goes to |
+|---|---|
+| comar/lios code, integrations, the apps, deploys | `Code/lios/` (dev session, or `lios-dev` on the agent host) |
+| ESPHome, Pi, HA automations | `Code/hardware/` |
+| a vault note, a plan, a draft, a daily-note edit | this session (`lios/vault/`) |
+| finance analysis | `Code/lios/finance/` |
+| a reverse-engineering question | `Code/teardown/` |
+
+Two failure modes to watch: the obvious repo is often the wrong one (work built *on top of*
+a thing lives beside it, not in it), and some work has no repo at all because it lives in a
+running system. Check before routing; if nothing is on disk, say so and do not write a prompt
+against a path you guessed.
+
+## Step 4: Present
+
+One numbered list, flagged tasks first, then scanned candidates best-first. Each line carries
+the task text in italics, the program · project, the bucket, the target, and one sentence on
+what the agent would produce and what it would still need from Alex.
+
+Give the ratio at the end for the scanned set: how many of the tasks scanned are worth doing
+this way. On a backlog of 170 the honest number is 10 to 20, and saying so stops the list
+reading as though everything else is stuck.
+
+Ask for answers by number, and say plainly that silence is a no.
+
+## Step 5: Write the prompts
+
+One fenced block per approved task, ready to paste into a session opened in the named place.
+Each prompt states:
+
+- **The task**, in full, with its uid and the constraints from its description. The receiving
+  session has no access to these notes, so anything it needs has to be in the prompt.
+- **What already exists.** Files, tables, tools, prior analyses. Check each one with `ls`,
+  `rg` or a tool call before naming it.
+- **What the output is and where it goes.** A path, a filename, a format.
+- **The acceptance test.** How the person reading the result knows it worked.
+- **What to do when an assumption turns out wrong:** stop and report, never guess around it.
+
+Prompts are read by a person before they are run. Plain, no preamble.
+
+## Step 6: Record
+
+For each approved task, `tasks_note_add(uid=..., body=...)` — a dated note, never an edit to
+the description: the target, one line on what the prompt covers, one line on what it
+deliberately leaves to Alex. Leave the role tag on; Alex removes it when the output is in.
+For `investigate`, the note *is* the output; for `fix`, the rewrite is, and a short note says
+what changed and why.
+
+**Never change status.** Producing an output is not the task being done, and doneness is the
+owner's call. The note is the record that a prompt exists.
+
+## Rules
+
+- Never mark a task done, and never on the strength of a prompt having been written.
+- Never invent a file path, a table name, a tool or a prior analysis. Check it exists, or say
+  the prompt has a gap for Alex to fill.
+- If a task needs Alex's judgement before the work can even start, it is not a candidate. Say
+  so and drop it rather than writing a prompt that opens with a question.
+- Do not create tasks. If the work surfaces a new one, name it and leave it to `/add-task`.

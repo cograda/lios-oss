@@ -1,13 +1,33 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useParams, Link } from 'react-router'
-import { ArrowLeft, RefreshCw, Clock, Timer, AlertCircle, ChevronDown, ChevronUp } from 'lucide-react'
+import * as LucideIcons from 'lucide-react'
+import {
+  ArrowLeft, RefreshCw, Clock, Timer, AlertCircle, ChevronDown, ChevronUp,
+  Blocks, ExternalLink, CheckCircle, XCircle, Save,
+} from 'lucide-react'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { StatusDot } from '@/components/ui/status-dot'
+import { Toggle } from '@/components/ui/toggle'
+import { useAuth } from '@/lib/auth'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
-import { useIntegrationDetail, useTriggerSync } from '@/hooks/use-api'
-import type { SyncHistoryEntry } from '@/lib/api'
+import {
+  useIntegrationDetail, useTriggerSync, useIntegrationConfig, usePutIntegrationConfig,
+  useIntegrationTools, useSetIntegrationEnabled, useTokens,
+} from '@/hooks/use-api'
+import { api } from '@/lib/api'
+import type { SyncHistoryEntry, ConfigField, IntegrationDetail as IntegrationDetailData } from '@/lib/api'
+
+// Icon names come from the manifest (`icon` field, chunk 1.3) — same
+// dynamic lookup as components/dashboard/integration-grid.tsx.
+function resolveIcon(name: string | null | undefined): React.ElementType {
+  if (!name) return Blocks
+  const icon = (LucideIcons as unknown as Record<string, React.ElementType>)[name]
+  return icon ?? Blocks
+}
 
 function statusVariant(status: string): 'success' | 'error' | 'warning' | 'default' {
   if (status === 'ok') return 'success'
@@ -75,7 +95,258 @@ function computeStats(history: SyncHistoryEntry[]) {
   }
 }
 
+// ─── Flows panel ───
+
+function ChipList({ label, values }: { label: string; values: string[] }) {
+  if (values.length === 0) return null
+  return (
+    <div>
+      <p className="text-xs uppercase tracking-wide text-muted-foreground mb-1.5">{label}</p>
+      <div className="flex flex-wrap gap-1.5">
+        {values.map((v) => (
+          <Badge key={v} variant="outline" className="font-mono normal-case">{v}</Badge>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function FlowsPanel({ data }: { data: IntegrationDetailData }) {
+  const hasAny = [data.reads_from, data.writes_to, data.embedding_sources, data.depends_on, data.provides]
+    .some((l) => l.length > 0)
+  if (!hasAny) return null
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Flows</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <ChipList label="Reads from" values={data.reads_from} />
+        <ChipList label="Writes to" values={data.writes_to} />
+        <ChipList label="Embedding sources" values={data.embedding_sources} />
+        <ChipList label="Depends on (capabilities)" values={data.depends_on} />
+        <ChipList label="Provides (capabilities)" values={data.provides} />
+      </CardContent>
+    </Card>
+  )
+}
+
+// ─── Config panel ───
+
+function ConfigPanel({ name }: { name: string }) {
+  const { data, isLoading } = useIntegrationConfig(name)
+  const putMutation = usePutIntegrationConfig(name)
+  const [edits, setEdits] = useState<Record<string, string>>({})
+
+  const fields = data?.config ?? {}
+  const keys = Object.keys(fields)
+
+  if (!isLoading && keys.length === 0) return null
+
+  function fieldValue(key: string, field: ConfigField): string {
+    if (key in edits) return edits[key]
+    if (field.secret) return '' // write-only — never pre-fill a masked value into an editable input
+    if (field.type === 'list_str' || field.type === 'dict_str_str') {
+      return typeof field.value === 'string' ? field.value : JSON.stringify(field.value ?? '')
+    }
+    return field.value == null ? '' : String(field.value)
+  }
+
+  function coerce(raw: string, type: ConfigField['type']): unknown {
+    if (type === 'bool') return raw === 'true'
+    if (type === 'int') return Number(raw)
+    if (type === 'list_str' || type === 'dict_str_str') {
+      try { return JSON.parse(raw) } catch { return type === 'list_str' ? [] : {} }
+    }
+    return raw
+  }
+
+  function handleSave() {
+    if (Object.keys(edits).length === 0) return
+    const body: Record<string, unknown> = {}
+    for (const [key, raw] of Object.entries(edits)) {
+      const field = fields[key]
+      if (!field) continue
+      if (field.secret && raw === '') continue // don't overwrite a set secret with a blank edit
+      body[key] = coerce(raw, field.type)
+    }
+    putMutation.mutate(body, { onSuccess: () => setEdits({}) })
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between">
+        <CardTitle>Config</CardTitle>
+        <Button size="sm" onClick={handleSave} disabled={Object.keys(edits).length === 0 || putMutation.isPending}>
+          <Save className="h-3.5 w-3.5 mr-1.5" />
+          {putMutation.isPending ? 'Saving...' : 'Save'}
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {isLoading && <p className="text-sm text-muted-foreground">Loading...</p>}
+        {keys.map((key) => {
+          const field = fields[key]
+          return (
+            <div key={key} className="space-y-1.5">
+              <div className="flex items-center gap-2">
+                <Label htmlFor={`cfg-${key}`} className="font-mono text-xs">{key}</Label>
+                {field.required && <Badge variant="outline" className="text-[10px]">required</Badge>}
+                {field.secret && <Badge variant="default" className="text-[10px]">secret</Badge>}
+                {field.configured === false && <Badge variant="destructive" className="text-[10px]">not set</Badge>}
+              </div>
+              {field.description && (
+                <p className="text-xs text-muted-foreground">{field.description}</p>
+              )}
+              {field.type === 'bool' ? (
+                <Toggle
+                  checked={fieldValue(key, field) === 'true' || field.value === true}
+                  onChange={(checked) => setEdits((e) => ({ ...e, [key]: checked ? 'true' : 'false' }))}
+                />
+              ) : (
+                <Input
+                  id={`cfg-${key}`}
+                  type={field.secret ? 'password' : 'text'}
+                  placeholder={field.secret ? String(field.value ?? '(not set)') : undefined}
+                  value={fieldValue(key, field)}
+                  onChange={(e) => setEdits((prev) => ({ ...prev, [key]: e.target.value }))}
+                />
+              )}
+            </div>
+          )
+        })}
+        {putMutation.isSuccess && (
+          <p className="text-xs text-success">Saved.</p>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// ─── Credentials panel ───
+
+function CredentialsPanel({ data }: { data: IntegrationDetailData }) {
+  const { data: tokenData } = useTokens()
+  if (!data.oauth) return null
+
+  const tokens = (tokenData?.tokens ?? []).filter((t) => t.provider === data.oauth!.provider)
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Credentials</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-xs text-muted-foreground">
+          Requires {data.oauth.provider} OAuth — scopes: {data.oauth.scopes.join(', ')}
+        </p>
+        {tokens.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No connected accounts yet.</p>
+        ) : (
+          <div className="space-y-2">
+            {tokens.map((t) => (
+              <div key={`${t.provider}-${t.account}`} className="flex items-center justify-between text-sm py-1.5 border-b border-border last:border-0">
+                <div className="flex items-center gap-2">
+                  {t.expired ? (
+                    <XCircle className="h-4 w-4 text-destructive" />
+                  ) : (
+                    <CheckCircle className="h-4 w-4 text-success" />
+                  )}
+                  <span className="font-mono text-xs">{t.account}</span>
+                  {t.expired && <Badge variant="destructive" className="text-[10px]">reauth needed</Badge>}
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={async () => {
+                    // google/login needs a signed `start`; ask the server for the URL.
+                    const { url } = await api.getGoogleLoginUrl(t.account, t.user)
+                    window.location.href = url
+                  }}
+                >
+                  <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
+                  Reconnect
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// ─── Tools panel ───
+
+function ToolsPanel({ name }: { name: string }) {
+  const { data, isLoading } = useIntegrationTools(name)
+  const tools = data?.tools ?? []
+
+  if (!isLoading && tools.length === 0) return null
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Tools {data && `(${data.window_hours}h window)`}</CardTitle>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? (
+          <p className="text-sm text-muted-foreground">Loading...</p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead>Annotations</TableHead>
+                <TableHead>Calls</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {tools.map((tool) => (
+                <TableRow key={tool.name}>
+                  <TableCell className="font-mono text-xs">{tool.name}</TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap gap-1">
+                      {tool.annotations.readOnlyHint && <Badge variant="outline" className="text-[10px]">read-only</Badge>}
+                      {tool.annotations.destructiveHint && <Badge variant="destructive" className="text-[10px]">destructive</Badge>}
+                      {tool.annotations.idempotentHint && <Badge variant="outline" className="text-[10px]">idempotent</Badge>}
+                      {tool.annotations.openWorldHint && <Badge variant="outline" className="text-[10px]">open-world</Badge>}
+                    </div>
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">{tool.calls}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// ─── Enable/disable switch ───
+
+function EnabledSwitch({ data }: { data: IntegrationDetailData }) {
+  const setEnabled = useSetIntegrationEnabled(data.name)
+  const [optimistic, setOptimistic] = useState(data.enabled)
+
+  useEffect(() => setOptimistic(data.enabled), [data.enabled])
+
+  return (
+    <Toggle
+      checked={optimistic}
+      disabled={setEnabled.isPending}
+      label={optimistic ? 'Enabled' : 'Disabled'}
+      onChange={(checked) => {
+        setOptimistic(checked)
+        setEnabled.mutate(checked, { onError: () => setOptimistic(!checked) })
+      }}
+    />
+  )
+}
+
 export default function IntegrationDetail() {
+  const { isAdmin } = useAuth()
   const { name } = useParams<{ name: string }>()
   const { data, error, isLoading } = useIntegrationDetail(name!)
   const syncMutation = useTriggerSync()
@@ -117,6 +388,7 @@ export default function IntegrationDetail() {
 
   const stats = computeStats(data.history)
   const nextSync = nextSyncIn(data.next_sync_at)
+  const Icon = resolveIcon(data.icon)
 
   return (
     <div className="space-y-6">
@@ -126,8 +398,12 @@ export default function IntegrationDetail() {
           <Link to="/integrations" className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1 mb-2">
             <ArrowLeft className="h-3.5 w-3.5" /> Integrations
           </Link>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <Icon className="h-6 w-6 text-muted-foreground" />
             <h1 className="text-2xl font-semibold">{data.display_name}</h1>
+            {data.type && <Badge variant="default">{data.type}</Badge>}
+            {data.version && <Badge variant="default" className="font-mono">v{data.version}</Badge>}
+            {!data.enabled && <Badge variant="default">Disabled</Badge>}
             {data.configured ? (
               <Badge variant="success">Connected</Badge>
             ) : (
@@ -137,12 +413,20 @@ export default function IntegrationDetail() {
               <Badge variant="destructive">Failing ({data.consecutive_failures}x)</Badge>
             )}
           </div>
+          {data.description && (
+            <p className="text-sm text-muted-foreground mt-1">{data.description}</p>
+          )}
         </div>
-        {data.configured && (
-          <Button onClick={handleSync} disabled={syncing}>
-            <RefreshCw className={`h-4 w-4 mr-1.5 ${syncing ? 'animate-spin' : ''}`} />
-            Sync Now
-          </Button>
+        {isAdmin && (
+          <div className="flex items-center gap-3">
+            <EnabledSwitch data={data} />
+            {data.configured && data.enabled && (
+              <Button onClick={handleSync} disabled={syncing}>
+                <RefreshCw className={`h-4 w-4 mr-1.5 ${syncing ? 'animate-spin' : ''}`} />
+                Sync Now
+              </Button>
+            )}
+          </div>
         )}
       </div>
 
@@ -207,6 +491,44 @@ export default function IntegrationDetail() {
             </CardContent>
           </Card>
         </div>
+      )}
+
+      {/* Flows + Config + Credentials — the manifest-driven hub (V4 chunk 5.1) */}
+      <div className="grid gap-4 lg:grid-cols-2">
+        <FlowsPanel data={data} />
+        <CredentialsPanel data={data} />
+      </div>
+      {isAdmin && <ConfigPanel name={data.name} />}
+      <ToolsPanel name={data.name} />
+
+      {/* Runtime: schedule, freshness threshold, background tasks */}
+      {(data.freshness_threshold_minutes != null || data.background_tasks.length > 0) && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Runtime</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {data.freshness_threshold_minutes != null && (
+              <p className="text-sm text-muted-foreground">
+                Freshness threshold: <span className="font-mono text-foreground">{data.freshness_threshold_minutes}min</span>
+              </p>
+            )}
+            {data.background_tasks.length > 0 && (
+              <div className="space-y-1.5">
+                <p className="text-xs uppercase tracking-wide text-muted-foreground">Background tasks</p>
+                {data.background_tasks.map((t) => (
+                  <div key={t.name} className="flex items-center justify-between text-sm py-1 border-b border-border last:border-0">
+                    <span className="font-mono text-xs">{t.name}</span>
+                    <div className="flex items-center gap-2">
+                      <Badge variant="outline" className="text-[10px]">{t.kind}</Badge>
+                      {t.cron && <span className="text-xs text-muted-foreground font-mono">{t.cron}</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
       )}
 
       {/* Sync History */}

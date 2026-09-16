@@ -33,7 +33,7 @@ def upgrade() -> None:
         sa.Column("document_date", sa.Date, nullable=True),
         sa.Column(
             "project_tags", postgresql.ARRAY(sa.String()),
-            server_default="{renovation}", nullable=False,
+            server_default="{riverside}", nullable=False,
         ),
         sa.Column("body_chars", sa.Integer, nullable=True),
         sa.Column("content_hash", sa.String(64), nullable=False),

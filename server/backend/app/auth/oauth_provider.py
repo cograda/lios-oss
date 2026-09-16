@@ -7,10 +7,11 @@ we supply only persistence + the human-login funnel. See vault Plans/mcp-oauth.m
 PKCE (S256) is verified inside the SDK's token handler against the `code_challenge`
 we persist and return from `load_authorization_code`; we don't implement it here.
 
-Phase 0: the human-login step is a throwaway UI-token gate (see `oauth_wire.py`).
-Phase 1 swaps that for Google federation + email→user mapping. Everything below
-(token minting, code exchange, refresh rotation, revocation) is already
-production-shaped and survives that swap.
+The human-login step lives in `oauth_wire.py`: since 2026-09-06 it takes the
+person's own per-user bearer and completes the login as that user (the
+earlier Phase-0 form minted a session as user_id=1 from a shared UI token).
+Everything below (token minting, code exchange, refresh rotation,
+revocation) is unchanged by that swap.
 """
 
 import json
@@ -28,6 +29,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
+from app.auth.hashing import hash_token
 from app.db import get_db
 from app.models.oauth_clients import (
     McpAccessToken,
@@ -63,11 +65,23 @@ class ComarRefreshToken(RefreshToken):
     user_id: int
 
 
+class TokenExpiredError(Exception):
+    """Raised by `resolve_oauth_token_to_user` so callers can log a distinct
+    401 reason ("expired" vs "invalid/unknown").
+
+    See `app/mcp/server.py::_authenticate_request`, which catches this,
+    logs it, and then treats it the same as any other auth failure (401,
+    no user).
+    """
+
+
 def resolve_oauth_token_to_user(token: str) -> User | None:
     """Sync resolver for the MCP bearer path (`_authenticate_request`).
 
     Mirrors `app.auth.client_token.resolve_token_to_user`: returns a detached
-    `User` for a valid, unexpired, unrevoked OAuth access token, else None.
+    `User` for a valid, unrevoked OAuth access token, else None. Raises
+    `TokenExpiredError` (still resulting in a 401) if the token is otherwise
+    valid but past `expires_at`, so the caller can log a distinct reason.
     """
     if not token:
         return None
@@ -76,11 +90,13 @@ def resolve_oauth_token_to_user(token: str) -> User | None:
     with db.session() as session:
         row = (
             session.query(McpAccessToken)
-            .filter_by(access_token=token, revoked=False)
+            .filter_by(access_token_hash=hash_token(token), revoked=False)
             .first()
         )
-        if not row or row.expires_at <= now:
+        if not row:
             return None
+        if row.expires_at <= now:
+            raise TokenExpiredError()
         user = session.query(User).filter_by(id=row.user_id).first()
         if not user:
             return None
@@ -130,7 +146,8 @@ class ComarOAuthProvider:
         """Park the request and send the human to our login funnel.
 
         Returns a redirect URL (the SDK's AuthorizationHandler 302s the browser
-        there). Phase 0 → the UI-token gate at /oauth/login; Phase 1 → Google.
+        there) at /oauth/login — see `oauth_wire.py` for what that route
+        currently does.
         """
         session_id = secrets.token_urlsafe(32)
         db = get_db()
@@ -225,19 +242,16 @@ class ComarOAuthProvider:
             if not row or row.expires_at <= now:
                 raise TokenError("invalid_grant", "Authorization code invalid or expired")
             row.consumed = True
-            access = secrets.token_urlsafe(32)
-            refresh = secrets.token_urlsafe(32)
             scopes = row.scopes
-            session.add(McpAccessToken(
-                access_token=access,
-                refresh_token=refresh,
+            new_row, access, refresh = McpAccessToken.mint(
                 client_id=row.client_id,
                 user_id=row.user_id,
                 scopes=scopes,
                 resource=row.resource,
                 expires_at=now + ACCESS_TTL,
                 refresh_expires_at=now + REFRESH_TTL,
-            ))
+            )
+            session.add(new_row)
             session.commit()
         scope_str = " ".join(json.loads(scopes))
         return OAuthToken(
@@ -258,7 +272,10 @@ class ComarOAuthProvider:
         with db.session() as session:
             row = (
                 session.query(McpAccessToken)
-                .filter_by(refresh_token=refresh_token, client_id=client.client_id, revoked=False)
+                .filter_by(
+                    refresh_token_hash=hash_token(refresh_token),
+                    client_id=client.client_id, revoked=False,
+                )
                 .first()
             )
             if not row:
@@ -266,7 +283,7 @@ class ComarOAuthProvider:
             if row.refresh_expires_at and row.refresh_expires_at <= now:
                 return None
             return ComarRefreshToken(
-                token=row.refresh_token,
+                token=refresh_token,
                 client_id=row.client_id,
                 scopes=json.loads(row.scopes),
                 expires_at=int(row.refresh_expires_at.timestamp()) if row.refresh_expires_at else None,
@@ -284,7 +301,10 @@ class ComarOAuthProvider:
         with db.session() as session:
             row = (
                 session.query(McpAccessToken)
-                .filter_by(refresh_token=refresh_token.token, client_id=client.client_id, revoked=False)
+                .filter_by(
+                    refresh_token_hash=hash_token(refresh_token.token),
+                    client_id=client.client_id, revoked=False,
+                )
                 .first()
             )
             if not row or (row.refresh_expires_at and row.refresh_expires_at <= now):
@@ -292,18 +312,15 @@ class ComarOAuthProvider:
             # Rotate both tokens (SDK guidance): revoke the old row, mint a new one.
             row.revoked = True
             new_scopes = json.dumps(scopes) if scopes else row.scopes
-            access = secrets.token_urlsafe(32)
-            refresh = secrets.token_urlsafe(32)
-            session.add(McpAccessToken(
-                access_token=access,
-                refresh_token=refresh,
+            new_row, access, refresh = McpAccessToken.mint(
                 client_id=row.client_id,
                 user_id=row.user_id,
                 scopes=new_scopes,
                 resource=row.resource,
                 expires_at=now + ACCESS_TTL,
                 refresh_expires_at=now + REFRESH_TTL,
-            ))
+            )
+            session.add(new_row)
             session.commit()
         scope_str = " ".join(json.loads(new_scopes))
         return OAuthToken(
@@ -322,13 +339,13 @@ class ComarOAuthProvider:
         with db.session() as session:
             row = (
                 session.query(McpAccessToken)
-                .filter_by(access_token=token, revoked=False)
+                .filter_by(access_token_hash=hash_token(token), revoked=False)
                 .first()
             )
             if not row or row.expires_at <= now:
                 return None
             return ComarAccessToken(
-                token=row.access_token,
+                token=token,
                 client_id=row.client_id,
                 scopes=json.loads(row.scopes),
                 expires_at=int(row.expires_at.timestamp()),
@@ -340,14 +357,14 @@ class ComarOAuthProvider:
         self, token: ComarAccessToken | ComarRefreshToken
     ) -> None:
         # Revoke the whole row regardless of which token (access/refresh) we hold.
-        value = token.token
+        value_hash = hash_token(token.token)
         db = get_db()
         with db.session() as session:
             row = (
                 session.query(McpAccessToken)
                 .filter(
-                    (McpAccessToken.access_token == value)
-                    | (McpAccessToken.refresh_token == value)
+                    (McpAccessToken.access_token_hash == value_hash)
+                    | (McpAccessToken.refresh_token_hash == value_hash)
                 )
                 .first()
             )

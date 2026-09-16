@@ -2,6 +2,11 @@
 
 Loads watcher.py directly via spec_from_file_location to bypass the
 obsidian/__init__.py chain (which imports app.config, app.db, etc.).
+
+`SKIP_DIRS` moved out of watcher.py on 2026-08-14: the set and its membership
+test were duplicated across three modules, and the copy that mattered most —
+`POST /api/v1/vault/push` — had no copy at all. The watcher now defers to
+`sync.is_indexable()`, so this file sources the set from there.
 """
 
 import importlib
@@ -21,9 +26,15 @@ try:
 except ImportError as e:
     pytest.skip(f"Cannot import watcher.py (missing dep: {e})", allow_module_level=True)
 
-SKIP_DIRS = _watcher.SKIP_DIRS
+from app.integrations.obsidian.sync import SKIP_DIRS  # noqa: E402
 MAX_CONCURRENT_INDEX = _watcher.MAX_CONCURRENT_INDEX
 _VaultHandler = _watcher._VaultHandler
+
+
+def _cancel_all(handler) -> None:
+    """Cancel any debounce timers a test left armed."""
+    for t in handler._pending.values():
+        t.cancel()
 
 
 class TestPathFiltering:
@@ -31,79 +42,97 @@ class TestPathFiltering:
         assert ".obsidian" in SKIP_DIRS
         assert ".claude" in SKIP_DIRS
         assert ".tools" in SKIP_DIRS
+        assert ".stversions" in SKIP_DIRS  # Syncthing version history
         assert "Attachments" in SKIP_DIRS
         assert "Templates" in SKIP_DIRS
 
-    def test_md_file_in_valid_path_is_handled(self, tmp_path):
+    def test_stversions_file_is_not_queued_for_indexing(self, tmp_path):
+        """End-to-end through the handler, not just the set."""
         handler = _VaultHandler(tmp_path)
-        # Create a .md file
-        md_file = tmp_path / "Daily Notes" / "test.md"
-        md_file.parent.mkdir(parents=True)
-        md_file.touch()
+        snapshot = self._touch(
+            tmp_path, "alex/.stversions/Task Backlog~20260801-112211.md"
+        )
 
-        # _handle should not skip this (we can't easily test the timer fires,
-        # but we can verify it doesn't get filtered out by checking _pending)
+        handler._handle(str(snapshot))
+        assert handler._pending == {}
+        _cancel_all(handler)
+
+    @staticmethod
+    def _touch(root, rel: str):
+        """Create `<root>/<rel>` (parents included) and return the path."""
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.touch()
+        return p
+
+    def test_md_file_in_valid_path_is_handled(self, tmp_path):
+        # The handler watches the vault ROOT; paths are `<root>/<user>/<rel>`
+        # and the pending key is `<user>/<rel>`.
+        handler = _VaultHandler(tmp_path)
+        md_file = self._touch(tmp_path, "alex/Daily Notes/test.md")
+
         handler._handle(str(md_file))
-        assert "Daily Notes/test.md" in handler._pending
+        assert "alex/Daily Notes/test.md" in handler._pending
+        _cancel_all(handler)
 
     def test_non_md_file_is_ignored(self, tmp_path):
         handler = _VaultHandler(tmp_path)
-        txt_file = tmp_path / "notes.txt"
-        txt_file.touch()
-        handler._handle(str(txt_file))
+        handler._handle(str(self._touch(tmp_path, "alex/notes.txt")))
+        assert len(handler._pending) == 0
+
+    def test_file_directly_in_vault_root_is_ignored(self, tmp_path):
+        """A file not inside any user's vault has no owner — skip it."""
+        handler = _VaultHandler(tmp_path)
+        handler._handle(str(self._touch(tmp_path, "stray.md")))
         assert len(handler._pending) == 0
 
     def test_file_in_skip_dir_is_ignored(self, tmp_path):
         handler = _VaultHandler(tmp_path)
-        hidden = tmp_path / ".obsidian" / "config.md"
-        hidden.parent.mkdir(parents=True)
-        hidden.touch()
-        handler._handle(str(hidden))
+        handler._handle(str(self._touch(tmp_path, "alex/.obsidian/config.md")))
         assert len(handler._pending) == 0
 
     def test_file_in_nested_skip_dir_is_ignored(self, tmp_path):
         handler = _VaultHandler(tmp_path)
-        hidden = tmp_path / "some" / ".claude" / "note.md"
-        hidden.parent.mkdir(parents=True)
-        hidden.touch()
-        handler._handle(str(hidden))
+        handler._handle(str(self._touch(tmp_path, "alex/some/.claude/note.md")))
         assert len(handler._pending) == 0
 
     def test_file_outside_vault_is_ignored(self, tmp_path):
-        handler = _VaultHandler(tmp_path / "vault")
-        (tmp_path / "vault").mkdir()
-        outside = tmp_path / "other" / "note.md"
-        outside.parent.mkdir(parents=True)
-        outside.touch()
-        handler._handle(str(outside))
+        handler = _VaultHandler(tmp_path / "vaults")
+        (tmp_path / "vaults").mkdir()
+        handler._handle(str(self._touch(tmp_path, "other/alex/note.md")))
         assert len(handler._pending) == 0
 
     def test_attachments_dir_is_skipped(self, tmp_path):
         handler = _VaultHandler(tmp_path)
-        att = tmp_path / "Attachments" / "readme.md"
-        att.parent.mkdir(parents=True)
-        att.touch()
-        handler._handle(str(att))
+        handler._handle(str(self._touch(tmp_path, "alex/Attachments/readme.md")))
         assert len(handler._pending) == 0
 
     def test_debounce_replaces_timer(self, tmp_path):
         """Multiple rapid changes to the same file should result in one timer."""
         handler = _VaultHandler(tmp_path)
-        md_file = tmp_path / "note.md"
-        md_file.touch()
+        md_file = self._touch(tmp_path, "alex/note.md")
 
         handler._handle(str(md_file))
-        timer_1 = handler._pending.get("note.md")
+        timer_1 = handler._pending.get("alex/note.md")
         handler._handle(str(md_file))
-        timer_2 = handler._pending.get("note.md")
+        timer_2 = handler._pending.get("alex/note.md")
 
         # Timer should have been replaced
         assert timer_1 is not timer_2
         assert len(handler._pending) == 1
+        _cancel_all(handler)
 
-        # Clean up timers
-        for t in handler._pending.values():
-            t.cancel()
+    def test_same_relative_path_in_two_vaults_debounces_separately(self, tmp_path):
+        """Both vaults hold `Inbox/note.md` — one must not cancel the other."""
+        handler = _VaultHandler(tmp_path)
+        alex = self._touch(tmp_path, "alex/Inbox/note.md")
+        sam = self._touch(tmp_path, "sam/Inbox/note.md")
+
+        handler._handle(str(alex))
+        handler._handle(str(sam))
+
+        assert set(handler._pending) == {"alex/Inbox/note.md", "sam/Inbox/note.md"}
+        _cancel_all(handler)
 
 
 class TestConcurrencyLimit:

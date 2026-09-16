@@ -1,7 +1,7 @@
 """Backfill historical_documents.document_date from filename date patterns.
 
 Most ingested BoQ/recommendation-for-payment xlsx files, Gemini meeting notes, and
-builder invoices carry a date in the filename. The parsers missed those because
+Cameron-Lee invoices carry a date in the filename. The parsers missed those because
 they only look at file metadata (PDF /CreationDate, xlsx core properties). This
 one-shot script walks null-date rows and fills in the latest date it can extract
 from source_path.

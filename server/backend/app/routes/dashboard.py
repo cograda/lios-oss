@@ -49,19 +49,30 @@ async def dashboard_summary():
     # key (not nested under any single integration) because one revoked token
     # typically breaks multiple syncs — calendar and mail share an account.
     try:
+        from app.auth.oauth import google_login_url
         from app.db import get_db
         from app.models.tokens import OAuthToken
+        from app.models.users import User
         db = get_db()
         with db.session() as session:
+            rows = (
+                session.query(OAuthToken, User)
+                .join(User, OAuthToken.user_id == User.id)
+                .filter(OAuthToken.needs_reauth_at.isnot(None))
+                .all()
+            )
             data["reauth_needed"] = [
                 {
                     "provider": t.provider,
                     "account_email": t.account_email,
                     "flagged_at": t.needs_reauth_at.isoformat() if t.needs_reauth_at else None,
                     "reason": t.needs_reauth_reason,
-                    "reauth_url": f"/api/auth/google/login?account={t.account_email}",
+                    # Built by the one helper that also mints the signed
+                    # `start` the session-exempt login route requires; this
+                    # route is session-gated, so minting here is authorised.
+                    "reauth_url": google_login_url(t.account_email, u.name),
                 }
-                for t in session.query(OAuthToken).filter(OAuthToken.needs_reauth_at.isnot(None)).all()
+                for t, u in rows
             ]
     except Exception:
         logger.exception("Failed to load reauth_needed list")

@@ -10,8 +10,13 @@ class UserOwnedMixin:
     """Standard multi-tenancy column for per-user data.
 
     Every per-user table must include this mixin. Cross-user / shared tables
-    (finance, vault, historical_corpus, weather, irish_rail) deliberately do
-    NOT include it — they are household-scoped or fully shared.
+    (finance, historical_corpus, weather, calendar, home assistant, tasks,
+    snags, irish_rail — see `app/privacy.py::HOUSEHOLD_SHARED_TABLES` for the
+    full, reasoned list) deliberately do NOT include it — they are
+    household-scoped or fully shared. NOTE: this docstring previously listed
+    "vault" here too, which was wrong — `VaultChunk` (`app/integrations/
+    obsidian/models.py`) IS `UserOwnedMixin`; each user's vault is entirely
+    their own (see the root instructions block).
 
     Composite uniqueness on user-scoped tables MUST start with user_id, e.g.
     UniqueConstraint("user_id", "uid"). Bare `uid` constraints will collide

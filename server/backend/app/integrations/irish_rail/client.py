@@ -16,6 +16,25 @@ BASE_URL = "http://api.irishrail.ie/realtime/realtime.asmx"
 TIMEOUT = 15.0
 
 
+def default_station() -> str:
+    """This deployment's configured default station code.
+
+    Read per call, not at import — config lives in the DB. Was a `GSTNS`
+    constant duplicated in `__init__.py` and `tools.py`.
+    """
+    from app.plugin.config_store import plugin_config
+
+    return plugin_config("irish_rail").rail_station_code
+
+
+def default_station_name() -> str:
+    """Display name for the configured station; falls back to its code."""
+    from app.plugin.config_store import plugin_config
+
+    cfg = plugin_config("irish_rail")
+    return cfg.rail_station_name or cfg.rail_station_code
+
+
 def fetch_station_data(station_code: str, num_mins: int = 90) -> list[dict[str, Any]]:
     """Fetch real-time departure data for a station.
 

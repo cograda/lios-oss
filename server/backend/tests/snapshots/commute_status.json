@@ -1,0 +1,26 @@
+{
+  "decision": {
+    "bus_count": 3,
+    "bus_feed_ts": "2026-01-15T09:59:00+00:00",
+    "confidence": "live",
+    "dart_count": 2,
+    "dart_feed_ts": "2026-01-15T09:59:00+00:00",
+    "decided_at": "2026-01-15T09:59:00+00:00",
+    "degraded": false,
+    "ha_pushed": true,
+    "interchange_delay_min": 1.5,
+    "leave_in_min": 5,
+    "reason": null,
+    "state": "comfortable",
+    "status_text": "Leave in 5 min \u2014 08:12 L2 \u2192 Central 08:54 \u2014 comfortable",
+    "target_bus_arr_interchange": "2026-01-15T08:27:00",
+    "target_bus_dep_home": "2026-01-15T08:12:00",
+    "target_bus_route": "L2",
+    "target_bus_trip_id": "L2_0812",
+    "target_train_code": "E123",
+    "target_train_dest_arr": "2026-01-15T08:54:00",
+    "target_train_interchange_dep": "2026-01-15T08:35:00"
+  },
+  "stale": false,
+  "window_active": true
+}

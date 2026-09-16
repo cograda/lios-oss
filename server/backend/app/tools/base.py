@@ -10,6 +10,8 @@ from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
+from app.services.text import ILIKE_ESCAPE_CHAR, escape_ilike
+
 
 def parse_iso_date(value: str | None) -> datetime | None:
     """Parse an ISO date string, returning None on failure."""
@@ -64,7 +66,9 @@ class ExtraFilter:
 
         col = getattr(model, self.column)
         if self.match_mode == "ilike":
-            return query.filter(col.ilike(f"%{value}%"))
+            return query.filter(
+                col.ilike(f"%{escape_ilike(value)}%", escape=ILIKE_ESCAPE_CHAR)
+            )
         else:  # exact
             return query.filter(col == value)
 

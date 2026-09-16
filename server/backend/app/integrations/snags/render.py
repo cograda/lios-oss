@@ -15,24 +15,21 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from app.integrations.media.models import MediaItem
-from app.integrations.media import store as media_store
 from app.integrations.snags.models import Snag, SnagMedia
+from app.integrations.snags.vocab import label_for_trade
+from app.plugin.capabilities import get_capability
+
+_media = get_capability("media.store")
+MediaItem = _media.Item
 
 logger = logging.getLogger(__name__)
 
 SNAGS_NOTE_PATH = "Household/Renovation/Snags.md"
 EVIDENCE_DIR = "Attachments/Snags"
 
-TRADE_LABELS = {
-    "windowco": "WindowCo (windows & doors)",
-    "painter": "Painter",
-    "ken-fergal": "Ken / Fergal",
-    "plumber": "Plumber",
-    "electrician": "Electrician (Pat)",
-    "other": "Other contractor",
-    "unknown": "Unassigned",
-}
+# Trade display labels are deployment config (contractor names) — see
+# vocab.trade_labels(). Use vocab.label_for_trade(slug) rather than a dict
+# lookup so a trade no longer in config still renders.
 STATUS_BADGES = {
     "open": "⚪ open",
     "reported": "📨 reported",
@@ -53,7 +50,14 @@ LOCAL_TZ_OFFSET = timedelta(hours=1)
 
 def _ensure_evidence_exported(session: Session, snag: Snag, evidence_abs: Path) -> list[str]:
     """Export any un-exported evidence for this snag into Attachments/Snags/,
-    named <UID>-<n>.<ext>. Returns vault-relative paths for all evidence."""
+    named <UID>-<n>.<ext>. Returns vault-relative paths for all evidence.
+
+    Deliberately unscoped by user (F5): MediaItem is UserOwnedMixin, but
+    rendering only ever walks `snag_media` rows that were already vetted at
+    attach time (`snags/tools.py::snag_update_handler`, `snags/capture.py`) —
+    the ownership check belongs there, not here. Once evidence is attached
+    to a shared snag, both household members are meant to see it.
+    """
     links: list[str] = []
     rows = (
         session.query(SnagMedia, MediaItem)
@@ -69,7 +73,7 @@ def _ensure_evidence_exported(session: Session, snag: Snag, evidence_abs: Path) 
             links.append(sm.vault_path)
             continue
         if item.status != "stored":
-            if not media_store.download_item(session, item):
+            if not _media.download_item(session, item):
                 continue
         dest_dir = evidence_abs
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -148,7 +152,7 @@ def render_snags_note(session: Session, user_id: int | None = None) -> str:
         trade_open = sum(
             1 for room in rooms.values() for s in room if s.status in OPEN_STATUSES
         )
-        lines += ["", f"## {TRADE_LABELS.get(trade, trade)} ({trade_open} open)"]
+        lines += ["", f"## {label_for_trade(trade)} ({trade_open} open)"]
         for room in sorted(rooms):
             lines += ["", f"### {room}", ""]
             for s in rooms[room]:

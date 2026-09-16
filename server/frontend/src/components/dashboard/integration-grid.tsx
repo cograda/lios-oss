@@ -1,25 +1,19 @@
 import { Link } from 'react-router'
-import {
-  Calendar, Mail, CheckSquare, Wallet, BookOpen, MessageCircle,
-  Cloud, Music, Train, Heart, Activity,
-} from 'lucide-react'
+import * as LucideIcons from 'lucide-react'
+import { Blocks } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { StatusDot } from '@/components/ui/status-dot'
 import { cn } from '@/lib/utils'
 import type { IntegrationStatus } from '@/lib/api'
 
-const ICONS: Record<string, React.ElementType> = {
-  google_calendar: Calendar,
-  google_mail: Mail,
-  apple_reminders: CheckSquare,
-  apple_health: Heart,
-  finance: Wallet,
-  obsidian: BookOpen,
-  whatsapp: MessageCircle,
-  weather: Cloud,
-  lastfm: Music,
-  irish_rail: Train,
-  system: Activity,
+// Icon names come from each integration's manifest (`icon` field, chunk 1.3)
+// and are looked up dynamically against lucide-react's export table — no
+// more hand-maintained per-integration map to keep in sync as integrations
+// are added. `Blocks` is the fallback for a missing/unrecognized name.
+function resolveIcon(name: string | null | undefined): React.ElementType {
+  if (!name) return Blocks
+  const icon = (LucideIcons as unknown as Record<string, React.ElementType>)[name]
+  return icon ?? Blocks
 }
 
 function statusVariant(int: IntegrationStatus): 'success' | 'error' | 'warning' | 'default' {
@@ -55,7 +49,7 @@ export function IntegrationGrid({ integrations }: IntegrationGridProps) {
   return (
     <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
       {integrations.map((int) => {
-        const Icon = ICONS[int.name] || Activity
+        const Icon = resolveIcon(int.icon)
         const variant = statusVariant(int)
         const duration = formatDuration(int.last_sync_duration_ms)
 

@@ -1,22 +1,34 @@
-"""Apple Health integration — push-based sync from Mac agent."""
+"""Apple Health integration — push-based sync from Mac agent.
+
+`PushSourceIntegration` conversion (V4 chunk 4.3, batch B). Data arrives
+exclusively via the ingest route declared in the manifest (`routes.py`'s
+`/health/push`, chunk 3.1) — there is nothing for the kernel to schedule, so
+`sync()` is fully inherited from `PushSourceIntegration` (raises
+`NotImplementedError` — the old hand-rolled `sync()` here just logged and
+returned, since the manifest's `schedule=None` means the scheduler never
+called it and no test exercised the manual-trigger path for this
+integration; see chunk file "Batch progress" for the full note on this
+judgment call). No `probe()` — no separate liveness check is declared for
+this integration in the manifest's `background_tasks`.
+"""
 
 import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.db import get_db
-from app.integrations.base import BaseIntegration
 from app.integrations.apple_health.models import (
     HealthDailyMetric,
     HealthSleepSession,
     HealthWorkout,
 )
 from app.integrations.apple_health.tools import get_mcp_tools
+from app.plugin.bases import PushSourceIntegration
 
 logger = logging.getLogger(__name__)
 
 
-class AppleHealthIntegration(BaseIntegration):
+class AppleHealthIntegration(PushSourceIntegration):
     @property
     def name(self) -> str:
         return "apple_health"
@@ -24,10 +36,6 @@ class AppleHealthIntegration(BaseIntegration):
     @property
     def display_name(self) -> str:
         return "Apple Health"
-
-    def sync(self) -> None:
-        """Sync is push-based — the Mac client pushes via gRPC PushHealth."""
-        logger.info("Apple Health sync is push-based (Mac client → server)")
 
     def mcp_tools(self) -> list[dict[str, Any]]:
         return get_mcp_tools()
@@ -76,8 +84,5 @@ class AppleHealthIntegration(BaseIntegration):
                 "workouts_this_week": workout_count,
             }
 
-    def sync_schedule(self) -> str | None:
-        return None
-
-    def is_configured(self) -> bool:
-        return True
+    # is_configured(): default — True iff health_push_token is set (required
+    # in this integration's config_schema).

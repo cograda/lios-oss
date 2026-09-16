@@ -1,4 +1,12 @@
-"""Sync logic: poll Google Calendar API → upsert into Postgres."""
+"""Pull/store split for Google Calendar — V4 chunk 4.1.
+
+Collapses the old hand-rolled `sync_calendar()` (poll -> dedup -> upsert ->
+prune-stale, all in one function) into the two pieces
+`app.plugin.bases.SourceIntegration.sync()` calls separately: `pull_calendar_events`
+(fetch + dedup only, no DB writes) and `store_calendar_events` (persist only, no
+outbound I/O). `GoogleCalendarIntegration.pull`/`.store` in `__init__.py` are
+thin one-line adapters onto these.
+"""
 
 import logging
 from datetime import datetime, timedelta, timezone
@@ -8,16 +16,18 @@ from sqlalchemy.orm import Session
 
 from app.integrations.google_calendar.client import list_events
 from app.integrations.google_calendar.models import CalendarEvent
+from app.plugin.bases import PullResult
 
 logger = logging.getLogger(__name__)
 
+DAYS_AHEAD = 30
 
-def sync_calendar(
-    account_email: str, session: Session, *, user_id: int, days_ahead: int = 30
-) -> int:
-    """Fetch events for the next N days and upsert into the DB.
 
-    Returns the number of events synced.
+def pull_calendar_events(
+    account_email: str, session: Session, *, user_id: int, days_ahead: int = DAYS_AHEAD,
+) -> PullResult:
+    """Fetch events for the next N days for one account and dedup cross-calendar
+    copies of the same event. No DB writes — see `store_calendar_events`.
     """
     now = datetime.now(timezone.utc)
     time_max = now + timedelta(days=days_ahead)
@@ -27,15 +37,48 @@ def sync_calendar(
     )
     if not events:
         logger.info(f"No events found for {account_email}")
-        return 0
+        return PullResult(records=[])
 
-    synced = 0
-    seen_ids = set()
+    # Google reuses the same event id across every calendar an event appears on
+    # (organizer's calendar, every invitee's calendar). When the same id shows up
+    # more than once below, keep only one copy — but always prefer the copy from
+    # the account's own primary calendar (calendar_id == account_email) over a
+    # subscribed/shared calendar, regardless of calendarList() iteration order.
+    # Otherwise an invite Sam sends Alex could get filed under her calendar
+    # name and silently disappear behind her calendar's visibility rule.
+    events = sorted(events, key=lambda e: e.get("calendar_id") != account_email)
 
+    deduped: list[dict] = []
+    seen_ids: set[str] = set()
     for event_data in events:
         google_id = event_data["google_event_id"]
         if google_id in seen_ids:
             continue  # Same event from a different calendar — skip duplicate
+        seen_ids.add(google_id)
+        deduped.append(event_data)
+
+    return PullResult(records=deduped)
+
+
+def store_calendar_events(session: Session, records: list[dict]) -> int:
+    """Upsert `records` (one account's deduped events) and prune events that
+    no longer exist upstream, within the same account/date-range scope the
+    old `sync_calendar()` used. A `records` of `[]` is a no-op — matches the
+    old "no events found -> skip deletion too" short-circuit, rather than
+    wiping every future event for the account.
+    """
+    if not records:
+        return 0
+
+    account_email = records[0]["calendar_account"]
+    now = datetime.now(timezone.utc)
+    time_max = now + timedelta(days=DAYS_AHEAD)
+
+    synced = 0
+    seen_ids: set[str] = set()
+
+    for event_data in records:
+        google_id = event_data["google_event_id"]
         seen_ids.add(google_id)
 
         # Parse datetimes

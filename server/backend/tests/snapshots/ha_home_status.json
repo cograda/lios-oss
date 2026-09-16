@@ -1,8 +1,15 @@
 {
   "attention": {
+    "churn": {
+      "added_count": 0,
+      "hours": 24,
+      "removed": [],
+      "removed_count": 0
+    },
     "low_battery": [],
     "offline": [],
-    "offline_count": 0
+    "offline_count": 0,
+    "personal_device_battery": []
   },
   "entity_count": 2,
   "sections": {

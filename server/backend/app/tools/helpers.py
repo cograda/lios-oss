@@ -17,6 +17,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
+from sqlalchemy import or_
 from sqlalchemy import func as sa_func
 from sqlalchemy.orm import Query, Session
 
@@ -31,18 +32,29 @@ from app.auth.context import current_user_id
 def scoped_query(session: Session, model: type) -> Query:
     """THE blessed query entry point for per-user-owned models.
 
-    Starts `session.query(model)` and, if `model` carries a `user_id` column
-    (i.e. it uses `UserOwnedMixin`), filters to the requesting user via
-    `current_user_id()`. Household-shared models (no `user_id` column) come
-    back unscoped.
+    Starts `session.query(model)` and, if `model` carries any of its
+    per-user column(s) (`app.privacy.user_columns_for` — `("user_id",)` for
+    a plain `UserOwnedMixin` model, or a table-specific tuple such as
+    `vault_read_grants`'s `("grantee_user_id", "owner_user_id")`), filters
+    to rows where the requesting user matches ANY of them. A table with
+    none of those columns (household-shared) comes back unscoped.
+
+    The OR-across-columns shape is deliberate, not an accident of iterating
+    a tuple: `vault_read_grants` needs a row visible to BOTH the grantee and
+    the owner, which is not "the row has one owner" — a single-column
+    scoping rule cannot express it.
 
     `app/tools/list_tool.py` and `app/tools/search_tool.py` route their
     auto-scoping through this same function, so there is exactly one
     scoping implementation across the DSL and hand-written handlers.
     """
+    from app.privacy import user_columns_for
+
     query = session.query(model)
-    if hasattr(model, "user_id"):
-        query = query.filter(model.user_id == current_user_id())
+    cols = [name for name in user_columns_for(model) if hasattr(model, name)]
+    if cols:
+        uid = current_user_id()
+        query = query.filter(or_(*(getattr(model, name) == uid for name in cols)))
     return query
 
 
@@ -159,6 +171,43 @@ def make_enrich(
 
 
 # ---------------------------------------------------------------------------
+# Timestamp / age
+# ---------------------------------------------------------------------------
+
+
+def ensure_utc(dt: datetime | None) -> datetime | None:
+    """Normalise a datetime to tz-aware UTC.
+
+    Replaces the copy-pasted "attach tzinfo if naive, then diff against
+    now-UTC" dance seen in commute/tools.py, system/tools.py's morning
+    briefing, and elsewhere. A naive `dt` is assumed to already be UTC (true
+    for every table in this codebase that stores naive timestamps at all —
+    verify per call site before routing through this; Dublin-local naive
+    values, e.g. commute's solver-internal fields, must NOT go through here)
+    and gets UTC attached; an aware `dt` is converted to UTC. `None` passes
+    through as `None`.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def age_seconds(dt: datetime | None, *, now: datetime | None = None) -> float | None:
+    """Seconds elapsed between `dt` and `now` (default: current UTC time).
+
+    `dt` is normalised via `ensure_utc()` first, so naive values are treated
+    as UTC. Returns `None` if `dt` is `None`.
+    """
+    normalised = ensure_utc(dt)
+    if normalised is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return (now - normalised).total_seconds()
+
+
+# ---------------------------------------------------------------------------
 # Stats primitives
 # ---------------------------------------------------------------------------
 
@@ -216,3 +265,23 @@ def top_n_group_by(
         .limit(limit)
         .all()
     )
+
+
+def handler_for(tools: Iterable[dict], name: str) -> Callable[[Session, dict], str]:
+    """Return the handler callable of a built tool dict, by tool name.
+
+    Hand-written handlers (`handle_foo`) are module-level functions a facade
+    can just import. DSL-built ones are not: `ListTool(...).build()` closes
+    over the builder's config and stores the result under `"handler"`, so the
+    built dict is the *only* place that callable exists. A facade wrapping a
+    DSL tool therefore looks it up from its own package's `get_mcp_tools()`
+    rather than importing a function that was never defined.
+
+    Resolving by name (not list position) matters — tool order in
+    `get_mcp_tools()` is presentational and has been reordered before; an
+    index would silently return the wrong tool instead of failing.
+    """
+    for tool in tools:
+        if tool.get("name") == name:
+            return tool["handler"]
+    raise KeyError(f"No tool named {name!r} in the supplied tool list")

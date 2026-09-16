@@ -3,6 +3,7 @@
 Endpoints:
   GET  /api/v1/tools                  — list registered MCP tools
   POST /api/v1/tools/{name}           — invoke a registered MCP tool
+  POST /api/v1/batch                  — invoke several tools in one request
   POST /api/v1/vault/push             — push a single vault file (write + index)
   POST /api/v1/reminders/push         — push reminders snapshot
   GET  /api/v1/events                 — Server-Sent Events stream (server→client)
@@ -10,31 +11,111 @@ Endpoints:
 All endpoints require an `Authorization: Bearer <client_token>` header
 validated against the `client_tokens` table. The authenticated user is
 exposed to handlers via `Depends(get_current_user)`.
+
+## The envelope, and why `/tools/{name}` has two shapes
+
+Per the "one data layer" plan (`vault/Projects/lios/Plans/2026-09-11 One
+data layer…md`, §4.2/§5 step 1): every projection response is meant to
+converge on one envelope — `{"ok": true, "result": …, "warnings": [...]?}`
+or `{"ok": false, "error": {"code", "message", "retryable"}}`.
+
+`POST /api/v1/batch` speaks it unconditionally — it's new, so there's no
+deployed contract to protect. `POST /api/v1/tools/{name}` is not new: the
+lios-sync daemon (`core/client/src/lios_sync/server_client.py::call_tool`)
+and `apps/loops` (`apps/loops/backend/app/core_api.py::call_tool`) are both
+deployed today reading its *current* shape — `{"ok": false, "error": "<str>"}`
+on failure, no `warnings` key — and neither is part of this change. Breaking
+either is worse than a second code path, so the richer shape is opt-in on
+this route: send `X-Lios-Envelope: 1` (or `Accept:
+application/vnd.lios.envelope+json`) to get `error` as an object, and a
+`warnings` array whenever a tool result carries one.
+
+⚠️ **The `warnings` array's only populator was the tasks tools'
+`render_skipped`/`render_error` pattern (#204), and that pattern is gone**
+(lios, 2026-09-14 — `Task Backlog.md`'s render became unconditional, so it
+never reports a skipped render any more; see `app/integrations/tasks/render.py`'s
+module docstring). `_warnings_from_result`-the-folder was removed with it.
+`warnings` stays part of the envelope shape for any future tool that wants
+to report a partial-success condition the same way — there is simply no
+current producer.
 """
 
 import asyncio
 import json
 import logging
-import secrets
-import time
+from hashlib import sha256
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+from app.api.error_codes import error_obj
+from app.api.freshness_hints import freshness_seconds
 from app.auth.client_token import get_current_user
 from app.config import settings
 from app.db import get_db
-from app.errors import PermanentError
 from app.models.users import User
-from app.services.tool_calls import record_tool_call
-from app.stream_manager import stream_manager
+from app.stream_manager import DASHBOARD_CHANNEL_USER, stream_manager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["v1"])
+
+# ---------------------------------------------------------------------------
+# Envelope negotiation + shared helpers (batch, and opt-in on /tools/{name})
+# ---------------------------------------------------------------------------
+
+_ENVELOPE_HEADER = "x-lios-envelope"
+_ENVELOPE_ACCEPT_SUFFIX = "application/vnd.lios.envelope+json"
+
+
+def _envelope_requested(request: Request) -> bool:
+    """Whether the caller opted into the richer envelope on `/tools/{name}`.
+
+    Batch always speaks the envelope; this is only consulted by the single-
+    tool route. See the module docstring for why it's opt-in there.
+    """
+    if request.headers.get(_ENVELOPE_HEADER) == "1":
+        return True
+    return _ENVELOPE_ACCEPT_SUFFIX in request.headers.get("accept", "")
+
+
+def _parse_tool_result(content: str) -> Any:
+    """Tool handlers conventionally return a JSON-encoded string. Parse it
+    so the HTTP response carries structured data, not a string-of-JSON."""
+    try:
+        return json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return content  # leave as raw string if not JSON
+
+
+def _classify_dispatch_error(outcome: "ToolResult") -> tuple[str, str]:
+    """Best-effort (code, message) from a dispatch `ToolResult`'s failure.
+
+    `dispatch_tool()` collapses every handler failure — bad args, a
+    `PermanentError`, a bare exception, a timeout — into one string (see
+    `app/plugin/dispatch.py::ToolResult`). This is therefore pattern
+    matching on the handful of messages that already have real structure
+    (an unknown-tool 404, a timeout, the read-only-scope refusal); anything
+    else is `internal`, which is the honest answer for a message this layer
+    can't further classify without dispatch itself carrying a typed error
+    (a bigger change than this step).
+    """
+    try:
+        message = json.loads(outcome.content).get("error", outcome.content)
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        message = str(outcome.content)
+    if not isinstance(message, str):
+        message = str(message)
+    if outcome.status == "timeout":
+        return "timeout", message
+    if message.startswith("Unknown tool:"):
+        return "unknown_tool", message
+    if "read-only token" in message or "not read-only" in message:
+        return "forbidden", message
+    return "internal", message
 
 
 # ---------------------------------------------------------------------------
@@ -47,40 +128,55 @@ def heartbeat(
     task_health: str = "",
     user: User = Depends(get_current_user),
 ) -> dict:
-    """Lightweight liveness probe with two-tier sync hashes.
+    """Lightweight liveness probe.
 
-    Returns the latest client wheel version + checksum and the prompt set
-    hash so the client can detect updates with a single poll.
+    Returns the latest client wheel version + checksum so the client can
+    detect updates with a single poll.
     """
     from datetime import datetime, timezone
+    from app.auth.client_token import client_token_id_of
     from app.models.clients import ClientToken
-    from app.prompts.registry import get_prompt_set_hash
 
-    # Update client_version on this user's most recently active token.
-    # last_seen_at was already touched by get_current_user.
-    db = get_db()
-    with db.session() as session:
-        row = (
-            session.query(ClientToken)
-            .filter_by(user_id=user.id, is_active=True)
-            .order_by(ClientToken.last_seen_at.desc().nullslast())
-            .first()
-        )
-        if row and client_version:
-            row.client_version = client_version
-        if row and task_health:
-            row.task_health = task_health[:4000]
-        if row and (client_version or task_health):
-            session.commit()
+    # F11a: write onto the token that authenticated THIS request, not the
+    # user's most-recently-seen active token — the old query raced with the
+    # user's other tokens (e.g. a phone's Health Auto Export push bumping
+    # last_seen_at between this request and the write below), so a daemon's
+    # heartbeat could silently land on a different device's row.
+    #
+    # OAuth-authenticated sessions have no `client_tokens` row at all —
+    # `client_token_id_of` returns None there, and heartbeat is daemon-only
+    # in practice, so we just skip the write rather than 500 or guess.
+    token_id = client_token_id_of(user)
+    if token_id is not None and (client_version or task_health):
+        db = get_db()
+        with db.session() as session:
+            row = session.query(ClientToken).filter_by(id=token_id).first()
+            if row:
+                if client_version:
+                    row.client_version = client_version
+                if task_health:
+                    row.task_health = task_health[:4000]
+                session.commit()
+        # Best-effort push so the dashboard's daemon-status card updates on
+        # the next heartbeat rather than waiting out its own poll interval
+        # (issue #141). This is a "something changed, go refetch" nudge —
+        # `daemon_status`'s actual shape still comes from `/api/system/alerts`.
+        _notify_dashboard_from_thread("daemon_heartbeat", user=user.name)
 
     latest_version, latest_checksum = _latest_client_info()
+    if client_is_legacy(client_version):
+        # Freeze the old channel. A 2.x `comar` daemon told about a `lios_sync`
+        # wheel would pipx-install it BESIDE itself, restart its own launchd
+        # agent, still report 2.6.3, and repeat every five minutes. Reporting no
+        # newer version keeps it quietly on what it has until the machine is
+        # re-installed under the new name (Sam's Mac, 2026-09-03).
+        latest_version, latest_checksum = "", ""
 
     return {
         "ok": True,
         "server_time": datetime.now(timezone.utc).isoformat(),
         "latest_client_version": latest_version,
         "latest_client_checksum": latest_checksum,
-        "prompt_set_hash": get_prompt_set_hash(),
     }
 
 
@@ -106,38 +202,81 @@ def reminders_verified(user: User = Depends(get_current_user)) -> dict:
     return {"ok": True, "verified_at": now.isoformat()}
 
 
-def _latest_client_info() -> tuple[str, str]:
-    """Read latest client wheel version + SHA256. Returns ('', '') if none."""
-    import hashlib
-    import re
-    from pathlib import Path
+def client_is_legacy(client_version: str) -> bool:
+    """True for a pre-rename `comar` daemon (major version < 3). Unknown or
+    unparsable versions are NOT legacy: a brand-new client that fails to
+    report should still be offered the update."""
+    if not client_version:
+        return False
+    try:
+        return int(str(client_version).split(".", 1)[0]) < 3
+    except ValueError:
+        return False
 
-    for base in [Path("/app/client-dist"), Path(__file__).resolve().parents[3] / "client-dist"]:
+
+def _latest_client_info() -> tuple[str, str]:
+    """Read latest client wheel version + SHA256. Returns ('', '') if none.
+
+    Shares its wheel-picking logic (version-aware, not a lexical filename
+    sort) with `routes/client_dist.py`, which serves the same directory
+    over HTTP for daemon auto-update.
+    """
+    from app.routes.client_dist import _DIST_DIRS, VERSION_RE, _compute_sha256, pick_latest_wheel
+
+    for base in _DIST_DIRS:
         if not base.is_dir():
             continue
-        wheels = sorted(base.glob("comar_client-*.whl"), reverse=True)
-        if not wheels:
+        wheel_path = pick_latest_wheel(base.glob("lios_sync-*.whl"))
+        if wheel_path is None:
             continue
-        m = re.search(r"comar_client-([^-]+)-", wheels[0].name)
+        m = VERSION_RE.search(wheel_path.name)
         if not m:
             continue
-        h = hashlib.sha256()
-        with open(wheels[0], "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return m.group(1), h.hexdigest()
+        return m.group(1), _compute_sha256(wheel_path)
     return "", ""
 
 
 # ---------------------------------------------------------------------------
-# Prompts
+# Per-user curated slash-command set (sam-rollout Phase B2)
 # ---------------------------------------------------------------------------
 
-@router.get("/prompts")
-def list_prompts(_user: User = Depends(get_current_user)) -> list[dict]:
-    """Return all server-side prompt definitions for client mirroring."""
-    from app.prompts.registry import get_all_prompts
-    return get_all_prompts()
+@router.get("/commands")
+def get_commands(user: User = Depends(get_current_user)) -> dict:
+    """Return the caller's curated `.claude/commands/*.md` set + CLAUDE.md.
+
+    Rendered per user from `app.prompts.commands`, whose `COMMAND_TABLE`
+    says which user gets which command — the single source of truth for
+    this command set. Used by the installer to populate a new machine's
+    `~/lios/.claude/commands/` and by the daemon's optional startup
+    refresh. Alex's copies are delivered to `vault/.claude/commands/` from
+    the same templates by `scripts/render_commands.py` rather than by this
+    endpoint, because his machine has the repo checked out.
+    """
+    from app.prompts.commands import (
+        RETIRED_COMMANDS,
+        render_claude_md,
+        render_command_set,
+    )
+    from app.services import preferences as prefs_service
+
+    # Rendered against the caller's preferences, so a section they've switched
+    # off is absent from the delivered file rather than merely suppressed at
+    # runtime — see `render_command`'s docstring for why that distinction
+    # matters for how long their morning takes.
+    db = get_db()
+    with db.session() as session:
+        prefs = prefs_service.get_all(session, user.id)
+
+    return {
+        "user": user.name,
+        "claude_md": render_claude_md(user.name, user.display_name),
+        "commands": render_command_set(user.name, user.display_name, prefs),
+        # Filenames a client may have written under a now-retired slug
+        # (`daily-note.md`, `triage.md` as of 2026-09-07) — see
+        # `app.prompts.commands`'s docstring. The client deletes any of
+        # these it finds and never anything else.
+        "retired": list(RETIRED_COMMANDS),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -145,15 +284,25 @@ def list_prompts(_user: User = Depends(get_current_user)) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 @router.get("/instructions")
-def get_instructions(_user: User = Depends(get_current_user)) -> dict:
-    """Return the canonical MCP instructions block.
+def get_instructions(user: User = Depends(get_current_user)) -> dict:
+    """Return the MCP instructions block, personalized for the caller.
 
-    Single source of truth, mirrored to the local client so both
-    server-side (/mcp/sse) and client-side (localhost:9400) MCP servers
-    advertise the same preamble.
+    The household-shared core is a single source of truth
+    (`app.mcp.instructions.COMAR_INSTRUCTIONS`) mirrored here and at the MCP
+    handshake itself. This endpoint additionally knows who's asking (the
+    bearer already resolved a `User`), so it appends that user's own
+    section — display name, vault paths, only the private integrations they
+    actually have data for, and their voice-profile guidance (sam-rollout
+    D1 + D2) — via `render_instructions_for_user`. The bare MCP-handshake
+    `instructions` field stays the static shared core; see that module's
+    docstring for why.
     """
-    from app.mcp.instructions import COMAR_INSTRUCTIONS
-    return {"instructions": COMAR_INSTRUCTIONS}
+    from app.mcp.instructions import render_instructions_for_user
+
+    db = get_db()
+    with db.session() as session:
+        rendered = render_instructions_for_user(session, user)
+    return {"instructions": rendered}
 
 
 # ---------------------------------------------------------------------------
@@ -185,84 +334,229 @@ async def call_tool(
     name: str,
     request: Request,
     user: User = Depends(get_current_user),
-) -> JSONResponse:
+) -> Response:
     """Invoke a tool by name. Body is the raw JSON arguments object.
 
-    Response shape mirrors the gRPC `CallToolResponse`: `{"ok": true, "result": ...}`
-    or `{"ok": false, "error": "..."}`. The tool's own JSON return is
-    embedded as `result` (parsed) so callers don't double-decode.
-    """
-    from app.mcp.server import _tool_handlers
-    from app.services.freshness import ensure_fresh
+    Default response shape mirrors the gRPC `CallToolResponse`: `{"ok":
+    true, "result": ...}` or `{"ok": false, "error": "<str>"}` — unchanged
+    from before this route grew an envelope, and this is the shape every
+    deployed consumer (lios-sync, apps/loops) still gets. Send
+    `X-Lios-Envelope: 1` to receive the richer envelope (`error` as an
+    object, `warnings` array) instead — see the module docstring.
 
-    if name not in _tool_handlers:
+    Thin adapter over the shared `dispatch_tool()` chokepoint (V4 chunk
+    2.1) — auth is resolved above via `Depends(get_current_user)`
+    (transport-specific), then handed to `dispatch_tool` as an
+    already-authenticated `User`.
+
+    Read-only tools (per `readOnlyHint` — see `app/plugin/dispatch.py`'s use
+    of the same annotation) additionally carry `ETag` + `Cache-Control` on
+    success, and honour `If-None-Match` with a 304. Freshness (the
+    `max-age`) comes from `app.api.freshness_hints`; 0 means `no-store`.
+    """
+    from app.plugin.dispatch import dispatch_tool
+    from app.plugin.registry import get_tool_annotations, get_tool_handler
+
+    envelope = _envelope_requested(request)
+
+    if get_tool_handler(name) is None:
+        if envelope:
+            return JSONResponse(
+                {"ok": False, "error": error_obj("unknown_tool", f"Unknown tool: {name}")},
+                status_code=404,
+            )
         raise HTTPException(status_code=404, detail=f"Unknown tool: {name}")
 
     try:
         body = await request.body()
         arguments: dict[str, Any] = json.loads(body) if body else {}
     except json.JSONDecodeError as e:
+        if envelope:
+            return JSONResponse(
+                {"ok": False, "error": error_obj("invalid_args", f"Invalid JSON body: {e}")},
+                status_code=400,
+            )
         raise HTTPException(status_code=400, detail=f"Invalid JSON body: {e}")
 
-    handler_fn, integration_name = _tool_handlers[name]
+    outcome = await dispatch_tool(
+        name, arguments, user,
+        transport="http",
+        source_ip=request.client.host if request.client else None,
+    )
 
-    # Pin user_id for the duration of this tool call so handlers can scope
-    # reads to the authenticated user via current_user_id().
-    from app.auth.context import use_user
-    from app.mcp.server import bind_tool_call_id
+    if outcome.status == "timeout" or outcome.is_error:
+        status_code = 504 if outcome.status == "timeout" else 500
+        if envelope:
+            code, message = _classify_dispatch_error(outcome)
+            return JSONResponse({"ok": False, "error": error_obj(code, message)}, status_code=status_code)
+        return JSONResponse({"ok": False, "error": json.loads(outcome.content)["error"]}, status_code=status_code)
 
-    def _run() -> str:
-        db = get_db()
-        with db.session() as session, use_user(user.id):
-            ensure_fresh(integration_name, session)
-            return handler_fn(session, arguments)
+    parsed = _parse_tool_result(outcome.content)
 
-    call_id = secrets.token_hex(4)
-    start = time.monotonic()
-    status = "ok"
-    error_text: str | None = None
-    with bind_tool_call_id(call_id):
+    resp_body: dict[str, Any] = {"ok": True, "result": parsed}
+
+    annotations = get_tool_annotations(name) or {}
+    if not annotations.get("readOnlyHint"):
+        return JSONResponse(resp_body)
+
+    # Read-only: cacheable. ETag is a hash of the body that would be sent,
+    # so it changes exactly when the response would.
+    body_bytes = json.dumps(resp_body, sort_keys=True, default=str).encode("utf-8")
+    etag = '"' + sha256(body_bytes).hexdigest()[:32] + '"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+
+    max_age = freshness_seconds(name)
+    cache_control = f"private, max-age={max_age}" if max_age > 0 else "no-store"
+    return JSONResponse(resp_body, headers={"ETag": etag, "Cache-Control": cache_control})
+
+
+# ---------------------------------------------------------------------------
+# Batch
+# ---------------------------------------------------------------------------
+
+class BatchItem(BaseModel):
+    id: str | None = None
+    tool: str
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+class BatchRequest(BaseModel):
+    items: list[BatchItem]
+
+
+async def _dispatch_batch_item(
+    item_id: str, tool_name: str, args: dict[str, Any], user: User, source_ip: str | None,
+) -> dict:
+    """Dispatch one batch item and return its envelope entry.
+
+    Never raises — every failure mode (unknown tool, dispatch error,
+    timeout) is folded into `{"id", "ok": False, "error": {...}}` so one
+    bad item can never take down the rest of the batch. Reuses
+    `dispatch_tool()` — the exact same chokepoint the single-tool route
+    calls, with the exact same `user`, so a batch item is scoped identically
+    to that same call made on its own: it cannot see or touch more than the
+    caller already could.
+    """
+    from app.plugin.dispatch import dispatch_tool
+    from app.plugin.registry import get_tool_handler
+
+    if get_tool_handler(tool_name) is None:
+        return {"id": item_id, "ok": False, "error": error_obj("unknown_tool", f"Unknown tool: {tool_name}")}
+
+    outcome = await dispatch_tool(tool_name, args, user, transport="http", source_ip=source_ip)
+
+    if outcome.status == "timeout" or outcome.is_error:
+        code, message = _classify_dispatch_error(outcome)
+        return {"id": item_id, "ok": False, "error": error_obj(code, message)}
+
+    parsed = _parse_tool_result(outcome.content)
+    entry: dict[str, Any] = {"id": item_id, "ok": True, "result": parsed}
+    return entry
+
+
+@router.post("/batch")
+async def batch(request: Request, user: User = Depends(get_current_user)) -> JSONResponse:
+    """Run several tool calls in one request, concurrently, under one caller.
+
+    Body is `{"items": [{"id", "tool", "args"}, ...]}` — a bare JSON list is
+    also accepted as shorthand for `items`. Every item is dispatched through
+    the same `dispatch_tool()` chokepoint the single-tool route uses (no
+    forked auth/scoping logic), under the same already-authenticated `user`
+    — a batch item is exactly as scoped as the same call made on its own,
+    so it cannot widen what the caller's own bearer already permits.
+
+    Response is always the envelope: `{"ok": true, "results": [...]}` in
+    input order, one entry per item — `{"id", "ok": true, "result": ...,
+    "warnings": [...]?}` or `{"id", "ok": false, "error": {"code",
+    "message", "retryable"}}`. A per-item failure — an unknown tool, a
+    capability/auth refusal, a handler error, a per-item timeout — never
+    fails the batch as a whole; only a malformed request (bad JSON, no
+    `items`, too many items) returns a top-level `{"ok": false, "error":
+    ...}` with a 4xx status.
+
+    `settings.batch_max_items` (default 25) caps items per request.
+    `settings.batch_timeout_seconds` (default 30) is the wall-clock budget
+    for the *whole* batch — an item still running when it expires is
+    reported as its own per-item `timeout`, not a failure of the batch.
+    """
+    try:
+        raw_body = await request.body()
+        payload = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError as e:
+        return JSONResponse(
+            {"ok": False, "error": error_obj("invalid_args", f"Invalid JSON body: {e}")},
+            status_code=400,
+        )
+
+    items_payload = payload if isinstance(payload, list) else (
+        payload.get("items") if isinstance(payload, dict) else None
+    )
+    if not isinstance(items_payload, list):
+        return JSONResponse(
+            {"ok": False, "error": error_obj(
+                "invalid_args", 'body must be a JSON list, or an object with an "items" list',
+            )},
+            status_code=400,
+        )
+    if not items_payload:
+        return JSONResponse({"ok": True, "results": []})
+
+    max_items = settings.batch_max_items
+    if len(items_payload) > max_items:
+        return JSONResponse(
+            {"ok": False, "error": error_obj(
+                "invalid_args",
+                f"batch has {len(items_payload)} items, max is {max_items}",
+            )},
+            status_code=400,
+        )
+
+    parsed_items: list[BatchItem] = []
+    for idx, raw in enumerate(items_payload):
         try:
-            result = await asyncio.wait_for(asyncio.to_thread(_run), timeout=60)
-        except asyncio.TimeoutError:
-            status = "timeout"
-            error_text = f"Tool {name} timed out"
-            logger.warning("Tool %s timed out (user=%s)", name, user.name)
-            return JSONResponse({"ok": False, "error": error_text}, status_code=504)
-        except PermanentError as e:
-            # Bad credentials / config, not a bug worth a stack trace every
-            # call — warn (no traceback spam) and return a structured error.
-            status = "error"
-            error_text = str(e)
-            logger.warning("Tool %s failed (permanent, user=%s): %s", name, user.name, e)
-            return JSONResponse({"ok": False, "error": error_text}, status_code=500)
-        except Exception as e:  # noqa: BLE001
-            status = "error"
-            error_text = str(e)
-            logger.exception("Tool %s failed (user=%s)", name, user.name)
-            return JSONResponse({"ok": False, "error": error_text}, status_code=500)
-        finally:
-            duration_ms = int((time.monotonic() - start) * 1000)
-            logger.info(
-                "tool=%s user=%s tool_call_id=%s duration_ms=%d status=%s",
-                name, user.id, call_id, duration_ms, status,
+            item = raw if isinstance(raw, BatchItem) else BatchItem.model_validate(raw)
+        except Exception as e:  # noqa: BLE001 — pydantic ValidationError, any shape
+            return JSONResponse(
+                {"ok": False, "error": error_obj("invalid_args", f"item {idx}: {e}")},
+                status_code=400,
             )
-            await asyncio.to_thread(
-                record_tool_call,
-                name=name, user_id=user.id, duration_ms=duration_ms,
-                status=status, error=error_text, tool_call_id=call_id,
-            )
+        if not item.id:
+            item = item.model_copy(update={"id": f"item-{idx}"})
+        parsed_items.append(item)
 
-    # Tool handlers conventionally return a JSON-encoded string. Parse it
-    # so the HTTP response carries structured data, not a string-of-JSON.
-    parsed: Any = result
-    if isinstance(result, str):
-        try:
-            parsed = json.loads(result)
-        except (json.JSONDecodeError, TypeError):
-            parsed = result  # leave as raw string if not JSON
+    source_ip = request.client.host if request.client else None
+    tasks = {
+        asyncio.ensure_future(
+            _dispatch_batch_item(item.id, item.tool, item.args, user, source_ip),
+        ): item.id
+        for item in parsed_items
+    }
 
-    return JSONResponse({"ok": True, "result": parsed})
+    budget = settings.batch_timeout_seconds
+    done, pending = await asyncio.wait(tasks.keys(), timeout=budget)
+
+    results_by_id: dict[str, dict] = {}
+    for task in done:
+        entry = task.result()
+        results_by_id[entry["id"]] = entry
+    if pending:
+        for task in pending:
+            task.cancel()
+        # Let cancellation actually land before returning, so a pending
+        # dispatch doesn't keep running (and keep touching the DB session
+        # it opened) after this request has already answered.
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in pending:
+            item_id = tasks[task]
+            results_by_id[item_id] = {
+                "id": item_id,
+                "ok": False,
+                "error": error_obj("timeout", f"batch timeout budget ({budget}s) exceeded"),
+            }
+
+    ordered_results = [results_by_id[item.id] for item in parsed_items]
+    return JSONResponse({"ok": True, "results": ordered_results})
 
 
 # ---------------------------------------------------------------------------
@@ -280,24 +574,56 @@ def vault_push(
     payload: VaultPushRequest,
     user: User = Depends(get_current_user),
 ) -> dict:
-    """Write a single vault file to disk and re-index it."""
+    """Write a single vault file to the caller's own vault and re-index it."""
+    from pathlib import Path
     from app.integrations.obsidian.sync import index_single_file
-    from app.services.vault_paths import resolve as resolve_vault_path
+    from app.services import vault_paths
 
-    # resolve() scopes the write to this user's own vault (/vaults/<user>/...)
-    # and rejects paths that escape it (e.g. "../../../app/main.py"), which
-    # would otherwise be RCE-equivalent on the next reload.
-    try:
-        full = resolve_vault_path(payload.path, user_id_override=user.id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    # The target is the *caller's* vault, not the legacy single-vault mount —
+    # otherwise Sam's daemon would write files into Alex's vault.
+    vault_root = vault_paths.user_vault_path(user.name).resolve()
+    if not vault_root.is_dir():
+        raise HTTPException(status_code=503, detail="Vault not provisioned for user")
+
+    # Containment check — payload.path is bearer-authenticated input but a
+    # value like "../../../app/main.py" would otherwise let any client overwrite
+    # arbitrary container files (RCE-equivalent on the next reload).
+    rel = payload.path.lstrip("/")
+    if Path(rel).is_absolute() or ".." in Path(rel).parts:
+        raise HTTPException(status_code=400, detail="path escapes vault")
+    full = (vault_root / rel).resolve()
+    if not str(full).startswith(str(vault_root) + "/") and full != vault_root:
+        raise HTTPException(status_code=400, detail="path escapes vault")
 
     full.parent.mkdir(parents=True, exist_ok=True)
-    full.write_text(payload.content, encoding="utf-8")
+
+    # Only write when the bytes actually differ. An unconditional write here
+    # was an infinite loop, because two transports own this tree at once:
+    # Syncthing replicates the vault laptop<->server, and this endpoint writes
+    # to the same files. Rewriting identical content still bumps mtime, so —
+    #   daemon pushes X -> we rewrite X -> Syncthing carries the new mtime to
+    #   the Mac -> fsevents fires -> daemon pushes X -> ...
+    # — ran forever at roughly one lap per 8-10s over every file that had ever
+    # been pushed (17 of them when this was found on 2026-08-14, live since at
+    # least 09 Aug). It cost no embeddings, since index_single_file dedups on
+    # file_hash, but it manufactured Syncthing conflict files (two writers, one
+    # file) and left mtime meaningless, which is what `vault_recent` reads.
+    #
+    # The client now also skips no-op pushes; this guard is the backstop, and
+    # the one that holds for any other client. Compare content, not hashes: we
+    # are already holding both strings, and it cannot disagree with itself.
+    try:
+        unchanged = full.read_text(encoding="utf-8") == payload.content
+    except (OSError, UnicodeDecodeError):
+        unchanged = False  # unreadable or not yet there — write it
+    if not unchanged:
+        full.write_text(payload.content, encoding="utf-8")
 
     db = get_db()
     with db.session() as session:
-        index_single_file(session, payload.path, payload.content, payload.file_hash)
+        index_single_file(
+            session, payload.path, payload.content, payload.file_hash, user.id,
+        )
 
     logger.info("vault/push from %s: %s (%d chars)", user.name, payload.path, len(payload.content))
     return {"ok": True, "path": payload.path, "indexed": True}
@@ -355,9 +681,11 @@ def reminders_push(
 
     changes = result["newly_completed"] + result["newly_added"] + result["edited"]
     if changes > 0:
-        # Reactive backlog sync — pinned to the pushing user. Threads do not
-        # propagate ContextVars, so we must rebind inside the worker.
-        _trigger_backlog_sync(user.id)
+        # Reactive reminders-inlet tick, so a reminder completed on the phone
+        # reaches the ledger within seconds rather than waiting for the next
+        # 15-minute `reminders_inlet_tick`. Threads do not propagate
+        # ContextVars, so we must rebind inside the worker.
+        _trigger_reminders_inlet(user.id)
 
     logger.info(
         "reminders/push from %s: %d items (%d changes)",
@@ -405,13 +733,17 @@ def reminders_command_done(
     return {"ok": True, "command_id": command_id}
 
 
-def _trigger_backlog_sync(user_id: int) -> None:
-    """Fire-and-forget vault↔Reminders backlog sync after meaningful changes.
+def _trigger_reminders_inlet(user_id: int) -> None:
+    """Fire-and-forget reminders-inlet tick after a push that changed something.
 
-    `user_id` is the pushing user's id, snapshotted before spawning the thread.
-    `sync_backlogs` queries reminders/vault scoped to this user, so binding the
-    ContextVar inside the worker is required (threading.Thread does not
-    propagate ContextVars).
+    `user_id` is the pushing user's id, snapshotted before spawning the
+    thread — threading.Thread does not propagate ContextVars, so anything
+    the tick needs bound has to be rebound inside the worker. `tick_once`
+    itself iterates every active user and binds `use_user` per-user
+    internally (same as its own cron entry, `reminders_inlet.run_tick`,
+    which calls it unwrapped) — the rebind here exists only in case a
+    future rule needs the *pushing* user as ambient context, not because
+    today's rules read it.
     """
     import threading
 
@@ -419,26 +751,20 @@ def _trigger_backlog_sync(user_id: int) -> None:
 
     def _run() -> None:
         try:
-            from app.integrations.apple_reminders.backlog_sync import sync_backlogs
+            from app.integrations.tasks.reminders_inlet import tick_once
 
-            vault_path = settings.obsidian_vault_path
-            if not vault_path:
-                return
             db = get_db()
             with db.session() as session, use_user(user_id):
-                # sync_backlogs is a plain blocking function; we're already
-                # off the event loop in this dedicated worker thread, so
-                # call it directly (no asyncio.run() needed).
-                result = sync_backlogs(session, vault_path)
-                if result.get("completed_in_vault"):
+                result = tick_once(session)
+                if result.get("completed") or result.get("captured") or result.get("pushed"):
                     logger.info(
-                        "Reactive backlog sync (user_id=%d): %d tasks marked done in vault",
-                        user_id, result["completed_in_vault"],
+                        "Reactive reminders-inlet tick (user_id=%d): %s",
+                        user_id, result,
                     )
         except Exception:
-            logger.exception("Reactive backlog sync failed (user_id=%d)", user_id)
+            logger.exception("Reactive reminders-inlet tick failed (user_id=%d)", user_id)
 
-    threading.Thread(target=_run, name="backlog-sync-reactive", daemon=True).start()
+    threading.Thread(target=_run, name="reminders-inlet-reactive", daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -554,8 +880,121 @@ def logs_push(
 
 
 # ---------------------------------------------------------------------------
+# AI usage ledger ingest (lios W2 chunk 1)
+# ---------------------------------------------------------------------------
+#
+# "One place to see all the cloud and local AI usage" (the AI Broker plan)
+# means callers outside this process — comar-hub's speech bridge, scribe,
+# eventually Home Assistant — need a way to report a call in without a
+# database dependency of their own. This is that route. Nothing in this repo
+# calls it yet (in-process callers use app.services.ai_ledger.record()
+# directly, which is cheaper than a round-trip HTTP call to yourself); it
+# exists now so the later chunks that DO call it (comar-hub, scribe) have a
+# stable contract to build against.
+#
+# Bearer-authenticated like every other v1 route — a stray unauthenticated
+# usage-ingest endpoint would let anyone inflate (or deflate, by never
+# calling it) the one number this whole design exists to make trustworthy.
+
+class AiUsagePush(BaseModel):
+    provider: str
+    model: str
+    kind: str = Field(..., description="chat | embedding | stt | tts | vision | prediction")
+    caller: str
+    role: str | None = None
+    units_in: int = 0
+    units_out: int = 0
+    reasoning_units: int = 0
+    seconds: float | None = None
+    latency_ms: int | None = None
+    cost_usd: float | None = Field(
+        default=None,
+        description="NULL means unknown, never free — a local call should send 0.0 explicitly.",
+    )
+    input_rate: float | None = None
+    output_rate: float | None = None
+    ok: bool = True
+    error: str | None = None
+
+
+@router.post("/ai/usage")
+def ai_usage_push(
+    payload: AiUsagePush,
+    _user: User = Depends(get_current_user),
+) -> dict:
+    """Ingest one AI usage row from an external reporter (comar-hub, scribe, HA).
+
+    Validates `kind` against the closed set rather than accepting anything —
+    an unknown kind here is almost always a caller-side typo, and rejecting
+    it loudly at ingest is cheaper to debug than a silently uncategorised
+    row discovered later. Delegates to `app.services.ai_ledger.record()`,
+    which is itself fire-and-forget — so this endpoint's own latency is just
+    validation plus an in-memory enqueue, not a database round-trip.
+    """
+    from app.services import ai_ledger
+
+    if payload.kind not in ai_ledger.VALID_KINDS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"unknown kind {payload.kind!r} — "
+                f"must be one of {sorted(ai_ledger.VALID_KINDS)}"
+            ),
+        )
+
+    ai_ledger.record(
+        provider=payload.provider,
+        model=payload.model,
+        kind=payload.kind,
+        caller=payload.caller,
+        role=payload.role,
+        units_in=payload.units_in,
+        units_out=payload.units_out,
+        reasoning_units=payload.reasoning_units,
+        seconds=payload.seconds,
+        latency_ms=payload.latency_ms,
+        cost_usd=payload.cost_usd,
+        input_rate=payload.input_rate,
+        output_rate=payload.output_rate,
+        ok=payload.ok,
+        error=payload.error,
+    )
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Events (SSE)
 # ---------------------------------------------------------------------------
+
+async def _notify_dashboard(kind: str, **fields: Any) -> None:
+    """Best-effort push to the dashboard's own SSE stream (issue #141).
+
+    Never raises into a daemon-facing code path — a browser tab that isn't
+    open, or isn't listening, must not affect the bearer-authenticated
+    stream this rides alongside. Async — call directly from a coroutine
+    (e.g. `events_stream`, itself already on the event loop).
+    """
+    try:
+        await stream_manager.publish(
+            {"type": kind, **fields}, target_user=DASHBOARD_CHANNEL_USER,
+        )
+    except Exception:
+        logger.exception("dashboard notify failed for %s", kind)
+
+
+def _notify_dashboard_from_thread(kind: str, **fields: Any) -> None:
+    """Same as `_notify_dashboard`, callable from a sync route (FastAPI runs
+    a plain `def` endpoint in a worker thread — see `heartbeat` below —
+    so publishing has to hop back onto the loop `stream_manager.loop` holds,
+    the same pattern `apple_reminders/commands.py::dispatch_command` uses.
+    Fire-and-forget: unlike that dispatch path this isn't waiting on an ack,
+    so it doesn't block on the future's result.
+    """
+    loop = stream_manager.loop
+    if loop is None:
+        return
+    asyncio.run_coroutine_threadsafe(_notify_dashboard(kind, **fields), loop)
+
 
 @router.get("/events")
 async def events_stream(user: User = Depends(get_current_user)) -> EventSourceResponse:
@@ -567,14 +1006,48 @@ async def events_stream(user: User = Depends(get_current_user)) -> EventSourceRe
 
     Event shape: `data: <json>\\n\\n` where `<json>` is the dict published
     via `stream_manager.publish(...)`.
+
+    Connect/disconnect here also pushes a `daemon_connection` event onto
+    the dashboard's own stream (`DASHBOARD_CHANNEL_USER`, consumed by
+    `GET /api/system/events`) — this IS the "is a daemon live right now"
+    signal `system_alerts`' `daemon_status.sse_connected` already reads via
+    `stream_manager.connected_users()`, just pushed instead of polled.
     """
     queue = await stream_manager.subscribe(user.name, channel="sse")
     logger.info("SSE: subscriber %s connected", user.name)
+    await _notify_dashboard("daemon_connection", user=user.name, connected=True)
 
     async def _generator():
         try:
             # Send a hello event so the client knows the stream is live.
             yield {"event": "hello", "data": json.dumps({"user": user.name})}
+
+            # Drain any command queued while nobody was subscribed. THIS is the
+            # moment "no client connected" stops being true, so it is the right
+            # place — a periodic cron would work too but would leave a write
+            # sitting for up to its interval after the fix arrived.
+            #
+            # After the hello, not before: the drain re-dispatches over this very
+            # stream, and publishing into a queue whose consumer hasn't started
+            # yielding yet is how you lose the replay you just did.
+            #
+            # Bounded and best-effort by design — see `commands.drain_pending`.
+            # A drain that raised here would break the subscribe it is attached
+            # to, turning a lost write into a client that cannot connect at all.
+            try:
+                from app.plugin.capabilities import get_capability
+
+                reminders = get_capability("reminders.query")
+                drained = await asyncio.to_thread(
+                    reminders.drain_pending_commands,
+                    user_id=user.id,
+                    user_name=user.name,
+                )
+                if drained.get("replayed") or drained.get("expired"):
+                    logger.info("SSE: drained for %s: %s", user.name, drained)
+            except Exception:
+                logger.exception("SSE: pending-command drain failed for %s", user.name)
+
             while True:
                 event = await queue.get()
                 yield {"event": event.get("type", "message"), "data": json.dumps(event)}
@@ -583,6 +1056,11 @@ async def events_stream(user: User = Depends(get_current_user)) -> EventSourceRe
         finally:
             await stream_manager.unsubscribe(user.name, channel="sse", queue=queue)
             logger.info("SSE: subscriber %s disconnected", user.name)
+            # Another tab/token for the same user may still be subscribed
+            # (multi-subscriber-per-key, see stream_manager's own
+            # docstring) — only announce "gone" once nothing is left.
+            if user.name not in stream_manager.connected_users():
+                await _notify_dashboard("daemon_connection", user=user.name, connected=False)
 
     return EventSourceResponse(_generator())
 
@@ -713,5 +1191,5 @@ async def syncthing_server_id(user: User = Depends(get_current_user)) -> dict:
         return {
             "device_id": r.json()["myID"],
             "folders": _user_folder_ids(user.name),
-            "sync_address": "tcp://your-server.your-tailnet.ts.net:22000",
+            "sync_address": "tcp://ubuntudockerbox.tail78010b.ts.net:22000",
         }

@@ -1,5 +1,22 @@
 {
   "count": 1,
+  "counts": {
+    "by_status": {
+      "failed": 0,
+      "ingested": 1,
+      "pending": 1,
+      "skipped": 0,
+      "unsupported": 0
+    },
+    "top_reasons": {
+      "ingested": [
+        {
+          "count": 1,
+          "reason": "(no reason recorded)"
+        }
+      ]
+    }
+  },
   "results": [
     {
       "chat": "Snags",
@@ -7,7 +24,7 @@
       "filename": "BoQ.pdf",
       "id": 1,
       "mime_type": "application/pdf",
-      "sender": "WindowCo",
+      "sender": "Northgate",
       "size": "200 KB",
       "size_bytes": 204800,
       "skip_reason": null,
